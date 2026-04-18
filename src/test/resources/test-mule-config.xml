@@ -1,0 +1,19 @@
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:agent-composer="http://www.mulesoft.org/schema/mule/agent-composer"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+          http://www.mulesoft.org/schema/mule/agent-composer http://www.mulesoft.org/schema/mule/agent-composer/current/mule-agent-composer.xsd">
+
+    <agent-composer:config name="config" configId="configId">
+        <agent-composer:connection requiredParameter="aValue" />
+    </agent-composer:config>
+
+    <flow name="sayHiFlow">
+        <agent-composer:say-hi person="Mariano Gonzalez"/>
+    </flow>
+
+    <flow name="retrieveInfoFlow">
+        <agent-composer:retrieve-info config-ref="config"/>
+    </flow>
+
+</mule>
