@@ -17,6 +17,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -152,5 +153,29 @@ public class AnthropicLlmClient implements LlmClient {
 
         String content = textContent.length() > 0 ? textContent.toString() : null;
         return new LlmResponse(content, toolCall, stopReason);
+    }
+
+    public List<String> listModels() throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://api.anthropic.com/v1/models"))
+                .header("x-api-key", config.getApiKey())
+                .header("anthropic-version", config.getAnthropicVersion())
+                .GET()
+                .build();
+
+        HttpResponse<String> httpResponse = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        if (httpResponse.statusCode() < 200 || httpResponse.statusCode() >= 300) {
+            throw new RuntimeException("Anthropic list models failed [" + httpResponse.statusCode() + "]: " + httpResponse.body());
+        }
+
+        JsonObject root = JsonParser.parseString(httpResponse.body()).getAsJsonObject();
+        JsonArray data = root.getAsJsonArray("data");
+        List<String> models = new ArrayList<>();
+        if (data != null) {
+            for (JsonElement el : data) {
+                models.add(el.getAsJsonObject().get("id").getAsString());
+            }
+        }
+        return models;
     }
 }

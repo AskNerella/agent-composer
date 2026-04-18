@@ -2,6 +2,7 @@ package org.mule.extension.agent.composer.internal;
 
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 import org.mule.extension.agent.composer.internal.operations.AgentComposerOperations;
+import org.mule.extension.agent.composer.internal.values.ModelNameValueProvider;
 import org.mule.runtime.api.meta.ExpressionSupport;
 import org.mule.runtime.extension.api.annotation.Expression;
 import org.mule.runtime.extension.api.annotation.param.Optional;
@@ -9,6 +10,7 @@ import org.mule.runtime.extension.api.annotation.param.display.DisplayName;
 import org.mule.runtime.extension.api.annotation.param.display.Password;
 import org.mule.runtime.extension.api.annotation.param.display.Placement;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
+import org.mule.runtime.extension.api.annotation.values.OfValues;
 import org.mule.sdk.api.annotation.Operations;
 import org.mule.sdk.api.annotation.connectivity.ConnectionProviders;
 import org.mule.sdk.api.annotation.param.Parameter;
@@ -29,6 +31,7 @@ public class AgentComposerConfiguration {
   @DisplayName("Model Name")
   @Expression(ExpressionSupport.SUPPORTED)
   @Summary("Model identifier, e.g. gpt-4o, claude-3-5-sonnet-20241022.")
+  @OfValues(ModelNameValueProvider.class)
   @Optional(defaultValue = "gpt-4o")
   @Placement(order = 2)
   private String modelName;
@@ -60,7 +63,7 @@ public class AgentComposerConfiguration {
   @DisplayName("Anthropic API Version")
   @Summary("Anthropic-Version header value (only used when provider is ANTHROPIC).")
   @Optional(defaultValue = "2023-06-01")
-  @Placement(order = 6)
+  @Placement(tab = "Anthropic", order = 1)
   private String anthropicVersion;
 
   public LlmProvider getProvider() { return provider; }

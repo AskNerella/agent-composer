@@ -15,7 +15,6 @@ import org.mule.runtime.api.artifact.Registry;
 import org.mule.runtime.api.message.Message;
 import org.mule.runtime.api.store.ObjectStore;
 import org.mule.runtime.api.store.ObjectStoreManager;
-import org.mule.runtime.api.store.ObjectStoreSettings;
 import org.mule.runtime.core.api.construct.Flow;
 import org.mule.runtime.core.api.construct.FlowConstruct;
 import org.mule.runtime.core.api.event.CoreEvent;
@@ -78,9 +77,8 @@ public class ReactEngine {
      * @param config              LLM configuration (provider, model, key, etc.)
      * @param instructions        system prompt
      * @param userMessage         the user's input for this turn
-     * @param mcpServers          MCP servers to discover tools from
-     * @param contextFilter       tool name whitelist (empty = all tools)
-     * @param memoryStoreName     Object Store name for conversation history
+     * @param mcpServers          MCP servers to discover tools from (each carries its own tool filter)
+     * @param objectStoreName     name of the Object Store used to persist conversation history
      * @param conversationId      key scoping this conversation in the Object Store
      * @param maxIterations       maximum Reason-Act cycles before forced exit
      * @param beforeIterationFlow Mule flow executed before each LLM call (null = skip)
@@ -90,8 +88,7 @@ public class ReactEngine {
                       String instructions,
                       String userMessage,
                       List<McpServerConfig> mcpServers,
-                      List<String> contextFilter,
-                      String memoryStoreName,
+                      String objectStoreName,
                       String conversationId,
                       int maxIterations,
                       String beforeIterationFlow,
@@ -99,11 +96,11 @@ public class ReactEngine {
 
         LlmClient llmClient = LlmClientFactory.create(config);
 
-        List<ToolDefinition> tools = discoverTools(mcpServers, contextFilter);
-        LOGGER.debug("Tools available: {}", tools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
+        List<ToolDefinition> tools = discoverTools(mcpServers);
+        LOGGER.info("Tools available ({}): {}", tools.size(),
+                tools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
 
-        ObjectStore<Serializable> store = objectStoreManager.getOrCreateObjectStore(
-                memoryStoreName, ObjectStoreSettings.builder().persistent(true).build());
+        ObjectStore<Serializable> store = objectStoreManager.getObjectStore(objectStoreName);
 
         List<LlmMessage> messages = loadHistory(store, conversationId);
         messages.add(new LlmMessage("user", userMessage));
@@ -112,31 +109,44 @@ public class ReactEngine {
         String finalAnswer = null;
 
         for (int iteration = 0; iteration < maxIterations; iteration++) {
-            LOGGER.debug("ReAct iteration {}/{}", iteration + 1, maxIterations);
+            LOGGER.info("--- ReAct Iteration {}/{} | conversationId='{}' ---", iteration + 1, maxIterations, conversationId);
+            LOGGER.info("[Iteration {}] What am I trying to do? {}", iteration + 1, currentThought);
 
             executeHookFlow(beforeIterationFlow, currentThought);
 
+            LOGGER.info("[Iteration {}] Sending request to LLM | provider={} model={}", iteration + 1, config.getProvider(), config.getModelName());
+            LOGGER.info("[Iteration {}] Instructions: {}", iteration + 1, instructions);
+            LOGGER.info("[Iteration {}] User prompt: {}", iteration + 1, userMessage);
+            LOGGER.info("[Iteration {}] Tools in use ({}): {}", iteration + 1, tools.size(),
+                    tools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
+
             LlmResponse response = llmClient.chat(instructions, messages, tools);
             currentThought = response.getContent() != null ? response.getContent() : "";
-            LOGGER.debug("LLM stop_reason='{}' hasToolCall={}", response.getStopReason(), response.hasToolCall());
+
+            LOGGER.info("[Iteration {}] LLM response | stop_reason='{}' hasToolCall={}", iteration + 1, response.getStopReason(), response.hasToolCall());
+            if (!currentThought.isEmpty()) {
+                LOGGER.info("[Iteration {}] LLM content: {}", iteration + 1, currentThought);
+            }
 
             if (response.hasFinalAnswer()) {
                 finalAnswer = currentThought;
+                LOGGER.info("[Iteration {}] Final answer received.", iteration + 1);
                 messages.add(new LlmMessage("assistant", finalAnswer));
                 saveHistory(store, conversationId, messages);
                 break;
             }
 
             ToolCall toolCall = response.getToolCall();
+            LOGGER.info("[Iteration {}] Tool call requested: name='{}' args={}", iteration + 1, toolCall.getName(), toolCall.getArguments());
             messages.add(new LlmMessage("assistant", currentThought, Collections.singletonList(toolCall)));
 
             String observation;
             try {
                 observation = executeTool(toolCall, tools, mcpServers);
-                LOGGER.debug("Tool '{}' observation: {}", toolCall.getName(), observation);
+                LOGGER.info("[Iteration {}] Tool '{}' observation: {}", iteration + 1, toolCall.getName(), observation);
             } catch (Exception e) {
                 observation = "Tool execution failed: " + e.getMessage();
-                LOGGER.warn("Tool '{}' failed: {}", toolCall.getName(), e.getMessage(), e);
+                LOGGER.warn("[Iteration {}] Tool '{}' failed: {}", iteration + 1, toolCall.getName(), e.getMessage(), e);
             }
 
             executeHookFlow(afterIterationFlow, observation);
@@ -155,15 +165,24 @@ public class ReactEngine {
 
     // ── tool discovery ────────────────────────────────────────────────────────
 
-    private List<ToolDefinition> discoverTools(List<McpServerConfig> mcpServers, List<String> contextFilter) {
+    private List<ToolDefinition> discoverTools(List<McpServerConfig> mcpServers) {
         if (mcpServers == null || mcpServers.isEmpty()) return Collections.emptyList();
 
         List<ToolDefinition> all = new ArrayList<>();
         for (McpServerConfig server : mcpServers) {
-            all.addAll(mcpClient.listTools(server));
+            LOGGER.info("Fetching MCP tools for client '{}' from {}", server.getName(), server.getServerUrl());
+            List<ToolDefinition> serverTools = mcpClient.listTools(server);
+            List<String> filter = server.getToolFilters();
+            if (filter != null && !filter.isEmpty()) {
+                serverTools = serverTools.stream()
+                        .filter(t -> filter.contains(t.getName()))
+                        .collect(Collectors.toList());
+            }
+            LOGGER.info("Fetched {} tool(s) for client '{}': {}", serverTools.size(), server.getName(),
+                    serverTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
+            all.addAll(serverTools);
         }
-        if (contextFilter == null || contextFilter.isEmpty()) return all;
-        return all.stream().filter(t -> contextFilter.contains(t.getName())).collect(Collectors.toList());
+        return all;
     }
 
     // ── tool execution ────────────────────────────────────────────────────────

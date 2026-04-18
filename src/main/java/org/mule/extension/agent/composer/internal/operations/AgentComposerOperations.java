@@ -3,11 +3,11 @@ package org.mule.extension.agent.composer.internal.operations;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.engine.ReactEngine;
-import org.mule.extension.agent.composer.internal.enums.LlmProvider;
-import org.mule.extension.agent.composer.internal.llm.OpenAiLlmClient;
 import org.mule.runtime.api.artifact.Registry;
 import org.mule.runtime.api.store.ObjectStoreManager;
 import org.mule.runtime.core.api.event.EventContextService;
+import org.mule.sdk.api.annotation.param.reference.FlowReference;
+import org.mule.sdk.api.annotation.param.reference.ObjectStoreReference;
 import org.mule.runtime.extension.api.annotation.param.Optional;
 import org.mule.runtime.extension.api.annotation.param.display.DisplayName;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
@@ -52,19 +52,15 @@ public class AgentComposerOperations {
             @Optional
             List<McpServerConfig> mcpServers,
 
-            @DisplayName("Context Filter (Tool Whitelist)")
-            @Summary("Tool names to include. Leave empty to allow all discovered tools.")
-            @Optional
-            List<String> contextFilters,
-
-            @DisplayName("Memory Store Name")
-            @Summary("Name of the Mule Object Store used to persist conversation history.")
-            @Optional(defaultValue = "agent-memory")
-            String memoryStoreName,
+            @DisplayName("Object Store")
+            @Summary("Reference to a Mule Object Store used to persist conversation history.")
+            @ObjectStoreReference
+            @Optional(defaultValue = "_defaultPersistentObjectStore")
+            String objectStore,
 
             @DisplayName("Conversation ID")
-            @Summary("Key that scopes this conversation within the Object Store.")
-            @Optional(defaultValue = "default")
+            @Summary("Key that scopes this conversation within the Object Store. Defaults to the Mule correlation ID.")
+            @Optional(defaultValue = "#[correlationId]")
             String conversationId,
 
             @DisplayName("Max Iterations")
@@ -73,30 +69,20 @@ public class AgentComposerOperations {
             Integer maxIterations,
 
             @DisplayName("Before Iteration Flow")
-            @Summary("Name of a Mule flow executed before each LLM call. Receives the current Thought as payload.")
+            @Summary("Flow executed before each LLM call. Receives the current Thought as payload.")
+            @FlowReference
             @Optional
             String beforeIterationFlow,
 
             @DisplayName("After Iteration Flow")
-            @Summary("Name of a Mule flow executed after each tool observation. Receives the Observation as payload.")
+            @Summary("Flow executed after each tool observation. Receives the Observation as payload.")
+            @FlowReference
             @Optional
             String afterIterationFlow) throws Exception {
 
         ReactEngine engine = new ReactEngine(registry, objectStoreManager, eventContextService);
-        return engine.run(config, instructions, userMessage, mcpServers, contextFilters,
-                memoryStoreName, conversationId, maxIterations, beforeIterationFlow, afterIterationFlow);
-    }
-
-    /**
-     * Returns the list of model IDs available from the OpenAI API.
-     * Only applicable when the configured provider is OPENAI.
-     */
-    @MediaType(ANY)
-    public List<String> listModels(@Config AgentComposerConfiguration config) throws Exception {
-        if (config.getProvider() != LlmProvider.OPENAI) {
-            throw new UnsupportedOperationException("listModels is only supported for the OPENAI provider.");
-        }
-        return new OpenAiLlmClient(config).listModels();
+        return engine.run(config, instructions, userMessage, mcpServers,
+                objectStore, conversationId, maxIterations, beforeIterationFlow, afterIterationFlow);
     }
 }
 

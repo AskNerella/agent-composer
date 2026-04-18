@@ -7,6 +7,8 @@ import org.mule.runtime.extension.api.annotation.param.display.Summary;
 import org.mule.runtime.extension.api.annotation.param.display.Placement;
 import org.mule.runtime.extension.api.annotation.param.Optional;
 
+import java.util.List;
+
 public class McpServerConfig {
     @Parameter
     @DisplayName("Client Name")
@@ -28,9 +30,15 @@ public class McpServerConfig {
     @Placement(order = 3)
     private String authToken;
 
+    @Parameter
+    @DisplayName("Tool Filter (Whitelist)")
+    @Summary("Tool names to include from this server. Leave empty to allow all tools.")
+    @Optional
+    @Placement(order = 4)
+    private List<String> toolFilters;
+
     public String getName() { return name; }
-
     public String getServerUrl() { return serverUrl; }
-
     public String getAuthToken() { return authToken; }
+    public List<String> getToolFilters() { return toolFilters; }
 }
