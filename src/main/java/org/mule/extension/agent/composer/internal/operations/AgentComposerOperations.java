@@ -3,9 +3,12 @@ package org.mule.extension.agent.composer.internal.operations;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.engine.ReactEngine;
+import org.mule.extension.agent.composer.internal.error.AgentComposerErrors;
+import org.mule.extension.agent.composer.internal.error.AgentComposerErrorTypeProvider;
 import org.mule.runtime.api.artifact.Registry;
 import org.mule.runtime.api.store.ObjectStoreManager;
 import org.mule.runtime.core.api.event.EventContextService;
+import org.mule.sdk.api.annotation.error.Throws;
 import org.mule.sdk.api.annotation.param.reference.FlowReference;
 import org.mule.sdk.api.annotation.param.reference.ObjectStoreReference;
 import org.mule.runtime.extension.api.annotation.param.Optional;
@@ -35,6 +38,7 @@ public class AgentComposerOperations {
      * Runs a ReAct agent loop: Reason, call tools via MCP, and return the final answer.
      */
     @MediaType(ANY)
+    @Throws(AgentComposerErrorTypeProvider.class)
     public String executeAgent(
             @Config AgentComposerConfiguration config,
 

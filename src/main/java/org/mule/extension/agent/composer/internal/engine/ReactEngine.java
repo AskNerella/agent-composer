@@ -165,7 +165,7 @@ public class ReactEngine {
 
     // ── tool discovery ────────────────────────────────────────────────────────
 
-    private List<ToolDefinition> discoverTools(List<McpServerConfig> mcpServers) {
+    private List<ToolDefinition> discoverTools(List<McpServerConfig> mcpServers) throws Exception {
         if (mcpServers == null || mcpServers.isEmpty()) return Collections.emptyList();
 
         List<ToolDefinition> all = new ArrayList<>();

@@ -7,6 +7,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
+import org.mule.extension.agent.composer.internal.error.AgentComposerErrors;
+import org.mule.sdk.api.exception.ModuleException;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -44,13 +47,16 @@ public class McpClient {
     /** Monotonically increasing JSON-RPC request id. */
     private final AtomicLong idCounter = new AtomicLong(1);
 
+    /** Session IDs cached per server URL, obtained during MCP initialization handshake. */
+    private final ConcurrentHashMap<String, String> sessionIds = new ConcurrentHashMap<>();
+
     // ── public API ────────────────────────────────────────────────────────────
 
     /**
      * Calls {@code tools/list} on the given MCP server and returns all tool
      * definitions, each stamped with the server URL for later routing.
      */
-    public List<ToolDefinition> listTools(McpServerConfig server) {
+    public List<ToolDefinition> listTools(McpServerConfig server) throws ModuleException {
         try {
             JsonObject params = new JsonObject();
             String responseBody = sendRpc(server, "tools/list", params);
@@ -79,9 +85,15 @@ public class McpClient {
             }
             return definitions;
 
+        } catch (ModuleException e) {
+            throw e;
         } catch (Exception e) {
-            LOGGER.error("Failed to list tools from MCP server {}: {}", server.getServerUrl(), e.getMessage(), e);
-            return Collections.emptyList();
+            LOGGER.error("Failed to list tools from MCP server {} (client '{}'): {}",
+                    server.getServerUrl(), server.getName(), e.getMessage(), e);
+            throw new ModuleException(
+                    "Unable to fetch tools from MCP server '" + server.getName() + "' at " + server.getServerUrl() + ": " + e.getMessage(),
+                    AgentComposerErrors.UNABLE_TO_FETCH_TOOLS,
+                    e);
         }
     }
 
@@ -137,7 +149,67 @@ public class McpClient {
 
     // ── private helpers ───────────────────────────────────────────────────────
 
+    /**
+     * Ensures a session exists for the server (lazy initialization).
+     * Sends the MCP {@code initialize} handshake and caches the returned
+     * {@code Mcp-Session-Id} response header.
+     */
+    private String getOrInitSession(McpServerConfig server) throws Exception {
+        return sessionIds.computeIfAbsent(server.getServerUrl(), url -> {
+            try {
+                return initializeSession(server);
+            } catch (Exception e) {
+                throw new RuntimeException("MCP session initialization failed for '" + server.getName() + "': " + e.getMessage(), e);
+            }
+        });
+    }
+
+    private String initializeSession(McpServerConfig server) throws Exception {
+        JsonObject params = new JsonObject();
+        params.addProperty("protocolVersion", "2024-11-05");
+
+        JsonObject clientInfo = new JsonObject();
+        clientInfo.addProperty("name", "agent-composer");
+        clientInfo.addProperty("version", "1.0");
+        params.add("clientInfo", clientInfo);
+
+        JsonObject capabilities = new JsonObject();
+        params.add("capabilities", capabilities);
+
+        JsonObject payload = new JsonObject();
+        payload.addProperty("jsonrpc", "2.0");
+        payload.addProperty("id", idCounter.getAndIncrement());
+        payload.addProperty("method", "initialize");
+        payload.add("params", params);
+
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(server.getServerUrl()))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(payload)));
+
+        if (server.getAuthToken() != null && !server.getAuthToken().isEmpty()) {
+            builder.header("Authorization", "Bearer " + server.getAuthToken());
+        }
+
+        HttpResponse<String> response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new RuntimeException("MCP initialize error " + response.statusCode() + ": " + response.body());
+        }
+
+        String sessionId = response.headers().firstValue("Mcp-Session-Id").orElse(null);
+        if (sessionId != null) {
+            LOGGER.info("MCP session established for '{}': sessionId={}", server.getName(), sessionId);
+        } else {
+            LOGGER.info("MCP server '{}' did not return a session ID — proceeding without one.", server.getName());
+        }
+        return sessionId != null ? sessionId : "";
+    }
+
     private String sendRpc(McpServerConfig server, String method, JsonObject params) throws Exception {
+        String sessionId = getOrInitSession(server);
+
         JsonObject payload = new JsonObject();
         payload.addProperty("jsonrpc", "2.0");
         payload.addProperty("id", idCounter.getAndIncrement());
@@ -149,19 +221,74 @@ public class McpClient {
         HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(server.getServerUrl()))
                 .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
                 .POST(HttpRequest.BodyPublishers.ofString(body));
 
+        if (!sessionId.isEmpty()) {
+            builder.header("Mcp-Session-Id", sessionId);
+        }
         if (server.getAuthToken() != null && !server.getAuthToken().isEmpty()) {
             builder.header("Authorization", "Bearer " + server.getAuthToken());
         }
 
         HttpResponse<String> response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
 
+        // Session expired or missing — evict and retry once with a fresh session
+        if (response.statusCode() == 400) {
+            String responseBody = response.body();
+            if (responseBody.contains("session")) {
+                LOGGER.warn("MCP session invalid for '{}', re-initializing...", server.getName());
+                sessionIds.remove(server.getServerUrl());
+                sessionId = getOrInitSession(server);
+
+                builder = HttpRequest.newBuilder()
+                        .uri(URI.create(server.getServerUrl()))
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "application/json, text/event-stream")
+                        .POST(HttpRequest.BodyPublishers.ofString(body));
+                if (!sessionId.isEmpty()) {
+                    builder.header("Mcp-Session-Id", sessionId);
+                }
+                if (server.getAuthToken() != null && !server.getAuthToken().isEmpty()) {
+                    builder.header("Authorization", "Bearer " + server.getAuthToken());
+                }
+                response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+            }
+        }
+
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new RuntimeException(
                     "MCP HTTP error " + response.statusCode() + " from " + server.getServerUrl()
                     + ": " + response.body());
         }
-        return response.body();
+        return extractJson(response.body());
+    }
+
+    /**
+     * MCP Streamable HTTP servers may respond with SSE-formatted bodies:
+     * <pre>
+     *   event: message
+     *   data: {"jsonrpc":"2.0","id":1,"result":{...}}
+     * </pre>
+     * This method extracts the first {@code data:} payload so the rest of the
+     * code always receives plain JSON regardless of transport encoding.
+     */
+    private static String extractJson(String raw) {
+        if (raw == null || raw.isBlank()) return raw;
+        String trimmed = raw.trim();
+        // Fast-path: already plain JSON
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
+        // SSE format: look for the first "data: " line that carries a JSON object/array
+        for (String line : trimmed.split("\n")) {
+            String stripped = line.stripLeading();
+            if (stripped.startsWith("data:")) {
+                String json = stripped.substring(5).stripLeading();
+                if (json.startsWith("{") || json.startsWith("[")) {
+                    return json;
+                }
+            }
+        }
+        // Return as-is and let the caller's JsonParser produce a descriptive error
+        return raw;
     }
 }
