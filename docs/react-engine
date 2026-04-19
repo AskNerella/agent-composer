@@ -1,0 +1,55 @@
+# React Engine Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    actor U as Caller
+    participant O as Agent Composer
+    participant R as ReAct Engine
+    participant OS as Memory
+    participant MC as MCP
+    participant L as LLM
+    participant MS as MCP Servers
+
+    U->>O: executeAgent()
+    O->>R: run()
+
+    %% Discover tools
+    R->>MC: listTools()
+    MC->>MS: tools/list
+    MS-->>MC: tools
+    MC-->>R: tool catalog
+
+    %% Cache check
+    R->>OS: check cache
+    alt cache hit
+        OS-->>R: cached response
+        R-->>O: response
+        O-->>U: result
+    else cache miss
+        R->>OS: load history
+
+        %% Main loop
+        loop until done
+            R->>L: chat(messages, tools)
+            L-->>R: response
+
+            alt final answer
+                R->>OS: save history
+            else tool call
+                R->>MC: callTool()
+                MC->>MS: tools/call
+                MS-->>MC: result
+                MC-->>R: observation
+                R->>OS: save history
+            end
+        end
+
+        %% Finalize
+        R->>R: build response
+        R->>OS: save cache
+        R-->>O: response
+        O-->>U: result
+    end
+```
