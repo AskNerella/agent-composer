@@ -87,23 +87,28 @@ public class ReactEngine {
         ObjectStore<Serializable> store = objectStoreManager.getObjectStore(objectStoreName);
         toolCallRecords.clear();
 
+        boolean resumedSession = hasConversationHistory(store, conversationId);
+
         String requestSignature = buildRequestSignature(config, userMessage, mcpServers);
         String solvedCacheKeyScoped = buildSolvedCacheKey(conversationId, requestSignature);
         String solvedCacheKeyGlobal = buildSolvedCacheKey(null, requestSignature);
 
-        AgentResponse cached = loadSolvedResponse(store, solvedCacheKeyScoped);
-        if (cached == null) {
-            cached = loadSolvedResponse(store, solvedCacheKeyGlobal);
-        }
-        if (cached != null) {
-            cached.setCacheHit(true);
-            if (cached.getSessionId() == null || cached.getSessionId().trim().isEmpty()) {
-                cached.setSessionId(conversationId);
+        if (!resumedSession) {
+            AgentResponse cached = loadSolvedResponse(store, solvedCacheKeyScoped);
+            if (cached == null) {
+                cached = loadSolvedResponse(store, solvedCacheKeyGlobal);
             }
-            if (cached.getReturnReason() == null || cached.getReturnReason().trim().isEmpty()) {
-                cached.setReturnReason(cached.isComplete() ? "completed successfully" : "incomplete cached response");
+            if (cached != null) {
+                cached.setCacheHit(true);
+                cached.setResumedSession(false);
+                if (cached.getSessionId() == null || cached.getSessionId().trim().isEmpty()) {
+                    cached.setSessionId(conversationId);
+                }
+                if (cached.getReturnReason() == null || cached.getReturnReason().trim().isEmpty()) {
+                    cached.setReturnReason(cached.isComplete() ? "completed successfully" : "incomplete cached response");
+                }
+                return cached;
             }
-            return cached;
         }
 
         List<LlmMessage> messages = loadHistory(store, conversationId);
@@ -222,6 +227,7 @@ public class ReactEngine {
                 conversationId
         );
         result.setToolCalls(toolCallRecords);
+        result.setResumedSession(resumedSession);
         result.setFailureCount(toolFailureCount);
         result.setReturnReason(returnReason);
         result.setCacheHit(false);
@@ -441,6 +447,18 @@ public class ReactEngine {
             LOGGER.warn("Could not load history for '{}': {}", conversationId, e.getMessage(), e);
         }
         return new ArrayList<>();
+    }
+
+    private boolean hasConversationHistory(ObjectStore<Serializable> store, String conversationId) {
+        if (conversationId == null || conversationId.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            return store.contains(conversationId);
+        } catch (Exception e) {
+            LOGGER.warn("Could not inspect history for '{}': {}", conversationId, e.getMessage());
+            return false;
+        }
     }
 
     private void saveHistory(ObjectStore<Serializable> store, String conversationId,

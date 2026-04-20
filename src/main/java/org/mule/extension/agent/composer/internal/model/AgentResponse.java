@@ -17,6 +17,7 @@ public class AgentResponse {
     private int iterationCount;
     private boolean complete;
     private String sessionId;
+    private boolean resumedSession;
     private int failureCount;
     private String returnReason;
     private boolean cacheHit;
@@ -42,6 +43,7 @@ public class AgentResponse {
     public int getIterationCount() { return iterationCount; }
     public boolean isComplete() { return complete; }
     public String getSessionId() { return sessionId; }
+    public boolean isResumedSession() { return resumedSession; }
     public int getFailureCount() { return failureCount; }
     public String getReturnReason() { return returnReason; }
     public boolean isCacheHit() { return cacheHit; }
@@ -55,6 +57,7 @@ public class AgentResponse {
     public void setIterationCount(int iterationCount) { this.iterationCount = iterationCount; }
     public void setComplete(boolean complete) { this.complete = complete; }
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }
+    public void setResumedSession(boolean resumedSession) { this.resumedSession = resumedSession; }
     public void setFailureCount(int failureCount) { this.failureCount = failureCount; }
     public void setReturnReason(String returnReason) { this.returnReason = returnReason; }
     public void setCacheHit(boolean cacheHit) { this.cacheHit = cacheHit; }

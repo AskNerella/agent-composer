@@ -1,7 +1,6 @@
 package org.mule.extension.agent.composer.internal.values;
 
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
-import org.mule.runtime.extension.api.annotation.values.OfValues;
 import org.mule.runtime.extension.api.values.ValueBuilder;
 import org.mule.runtime.extension.api.values.ValueProvider;
 import org.mule.runtime.extension.api.values.ValueResolvingException;
