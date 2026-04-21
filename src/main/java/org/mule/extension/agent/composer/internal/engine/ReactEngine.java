@@ -470,4 +470,232 @@ public class ReactEngine {
             LOGGER.warn("Could not persist history for '{}': {}", conversationId, e.getMessage(), e);
         }
     }
+
+    // ── Public memory operations ──────────────────────────────────────────────
+
+    /**
+     * Clears all entries in the object store, resetting agent memory from scratch.
+     */
+    public java.util.Map<String, Object> resetMemory(String objectStoreName) throws Exception {
+        ObjectStore<Serializable> store = objectStoreManager.getObjectStore(objectStoreName);
+        List<String> keys = store.allKeys();
+        int count = keys.size();
+        for (String key : keys) {
+            try {
+                store.remove(key);
+            } catch (Exception e) {
+                LOGGER.warn("Could not remove key '{}' during reset: {}", key, e.getMessage());
+            }
+        }
+        java.util.Map<String, Object> result = new java.util.LinkedHashMap<>();
+        result.put("status", "success");
+        result.put("message", "Memory reset. Removed " + count + " entr" + (count == 1 ? "y" : "ies") + ".");
+        result.put("objectStore", objectStoreName);
+        result.put("entriesRemoved", count);
+        return result;
+    }
+
+    /**
+     * Searches past solved responses for tasks semantically similar to {@code userTask},
+     * using the LLM to score relevance. Returns up to {@code maxResults} matches.
+     */
+    public java.util.Map<String, Object> checkMemory(AgentComposerConfiguration config,
+                                                      String userTask,
+                                                      String objectStoreName,
+                                                      int maxResults) throws Exception {
+        ObjectStore<Serializable> store = objectStoreManager.getObjectStore(objectStoreName);
+        List<String> allKeys = store.allKeys();
+
+        List<AgentResponse> candidates = new ArrayList<>();
+        for (String key : allKeys) {
+            if (key.startsWith("resolved::")) {
+                AgentResponse response = loadSolvedResponse(store, key);
+                if (response != null && response.getUserTask() != null && !response.getUserTask().trim().isEmpty()) {
+                    candidates.add(response);
+                }
+            }
+        }
+
+        java.util.Map<String, Object> result = new java.util.LinkedHashMap<>();
+        if (candidates.isEmpty()) {
+            result.put("found", false);
+            result.put("message", "No past memories found in object store.");
+            result.put("matches", Collections.emptyList());
+            return result;
+        }
+
+        // Build a numbered list of past tasks for the LLM
+        StringBuilder memoryList = new StringBuilder();
+        for (int i = 0; i < candidates.size(); i++) {
+            AgentResponse r = candidates.get(i);
+            memoryList.append(i).append(". Task: ").append(r.getUserTask());
+            if (r.getConversationSummary() != null) {
+                memoryList.append(" | Summary: ").append(r.getConversationSummary());
+            }
+            memoryList.append("\n");
+        }
+
+        LlmClient llmClient = LlmClientFactory.create(config);
+        String systemPrompt = "You are a memory search assistant. Given a current user task and a list of past agent memories, "
+                + "identify which past memories are most relevant. Return ONLY a valid JSON object with key "
+                + "'matches' containing an array of objects, each with: index (integer), confidence (integer 0-100), reason (string). "
+                + "Return at most " + maxResults + " items, ordered by descending confidence. "
+                + "Only include items with confidence >= 40.";
+        String userContent = "Current task: " + userTask + "\n\nPast memories:\n" + memoryList;
+
+        LlmResponse llmResponse = llmClient.chat(
+                systemPrompt,
+                Collections.singletonList(new LlmMessage("user", userContent)),
+                Collections.emptyList());
+
+        // Parse the LLM response to extract matched indices
+        List<java.util.Map<String, Object>> matches = new ArrayList<>();
+        try {
+            String content = llmResponse.getContent();
+            // Strip markdown code fences if present
+            if (content != null) {
+                content = content.replaceAll("(?s)```[a-z]*\\s*", "").replaceAll("```", "").trim();
+            }
+            java.lang.reflect.Type mapType = new TypeToken<java.util.Map<String, Object>>() {}.getType();
+            java.util.Map<String, Object> parsed = GSON.fromJson(content, mapType);
+            @SuppressWarnings("unchecked")
+            List<java.util.Map<String, Object>> llmMatches = (List<java.util.Map<String, Object>>) parsed.get("matches");
+            if (llmMatches != null) {
+                for (java.util.Map<String, Object> m : llmMatches) {
+                    int idx = ((Number) m.get("index")).intValue();
+                    if (idx >= 0 && idx < candidates.size()) {
+                        AgentResponse matched = candidates.get(idx);
+                        java.util.Map<String, Object> entry = new java.util.LinkedHashMap<>();
+                        entry.put("sessionId", matched.getSessionId());
+                        entry.put("userTask", matched.getUserTask());
+                        entry.put("response", matched.getResponse());
+                        entry.put("confidence", m.get("confidence"));
+                        entry.put("reason", m.get("reason"));
+                        matches.add(entry);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Could not parse LLM memory-check response: {}", e.getMessage());
+        }
+
+        result.put("found", !matches.isEmpty());
+        result.put("userTask", userTask);
+        result.put("matches", matches);
+        result.put("totalMemoriesSearched", candidates.size());
+        return result;
+    }
+
+    /**
+     * Retrieves the conversation history and solved responses for the given session ID.
+     */
+    public java.util.Map<String, Object> retrieveConversation(String sessionId,
+                                                               String objectStoreName) throws Exception {
+        ObjectStore<Serializable> store = objectStoreManager.getObjectStore(objectStoreName);
+        java.util.Map<String, Object> result = new java.util.LinkedHashMap<>();
+        result.put("sessionId", sessionId);
+
+        // Conversation history (chat turns)
+        List<LlmMessage> history = loadHistory(store, sessionId);
+        result.put("conversationHistory", history);
+        result.put("conversationTurns", history.size());
+
+        // Solved / cached responses scoped to this session
+        List<java.util.Map<String, Object>> solvedEntries = new ArrayList<>();
+        try {
+            List<String> allKeys = store.allKeys();
+            String prefix = "resolved::" + sessionId + "::";
+            for (String key : allKeys) {
+                if (key.startsWith(prefix)) {
+                    AgentResponse response = loadSolvedResponse(store, key);
+                    if (response != null) {
+                        java.util.Map<String, Object> entry = new java.util.LinkedHashMap<>();
+                        entry.put("userTask", response.getUserTask());
+                        entry.put("response", response.getResponse());
+                        entry.put("conversationSummary", response.getConversationSummary());
+                        entry.put("toolCalls", response.getToolCalls());
+                        entry.put("iterationCount", response.getIterationCount());
+                        entry.put("complete", response.isComplete());
+                        entry.put("returnReason", response.getReturnReason());
+                        solvedEntries.add(entry);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Could not scan solved responses for session '{}': {}", sessionId, e.getMessage());
+        }
+
+        result.put("solvedResponses", solvedEntries);
+        result.put("found", !history.isEmpty() || !solvedEntries.isEmpty());
+        return result;
+    }
+
+    /**
+     * Deletes conversation entries by session ID, by user task match, or both.
+     * At least one of {@code sessionId} or {@code userTask} must be non-null.
+     */
+    public java.util.Map<String, Object> deleteConversation(String sessionId,
+                                                             String userTask,
+                                                             String objectStoreName) throws Exception {
+        ObjectStore<Serializable> store = objectStoreManager.getObjectStore(objectStoreName);
+        List<String> allKeys = store.allKeys();
+        List<String> removed = new ArrayList<>();
+
+        // Delete by session ID: remove history key + all resolved:: scoped keys
+        if (sessionId != null && !sessionId.trim().isEmpty()) {
+            if (store.contains(sessionId)) {
+                store.remove(sessionId);
+                removed.add(sessionId);
+            }
+            String scopedPrefix = "resolved::" + sessionId + "::";
+            for (String key : allKeys) {
+                if (key.startsWith(scopedPrefix)) {
+                    try {
+                        store.remove(key);
+                        removed.add(key);
+                    } catch (Exception e) {
+                        LOGGER.warn("Could not remove key '{}': {}", key, e.getMessage());
+                    }
+                }
+            }
+        }
+
+        // Delete by user task: scan all resolved:: entries and remove matching ones
+        if (userTask != null && !userTask.trim().isEmpty()) {
+            String taskLower = userTask.trim().toLowerCase();
+            for (String key : allKeys) {
+                if (removed.contains(key)) continue;
+                if (key.startsWith("resolved::")) {
+                    AgentResponse response = loadSolvedResponse(store, key);
+                    if (response != null && response.getUserTask() != null
+                            && response.getUserTask().toLowerCase().contains(taskLower)) {
+                        // Also remove the conversation history if session ID is known
+                        String linkedSession = response.getSessionId();
+                        if (linkedSession != null && !linkedSession.trim().isEmpty()
+                                && !removed.contains(linkedSession) && store.contains(linkedSession)) {
+                            try {
+                                store.remove(linkedSession);
+                                removed.add(linkedSession);
+                            } catch (Exception e) {
+                                LOGGER.warn("Could not remove history for session '{}': {}", linkedSession, e.getMessage());
+                            }
+                        }
+                        try {
+                            store.remove(key);
+                            removed.add(key);
+                        } catch (Exception e) {
+                            LOGGER.warn("Could not remove key '{}': {}", key, e.getMessage());
+                        }
+                    }
+                }
+            }
+        }
+
+        java.util.Map<String, Object> result = new java.util.LinkedHashMap<>();
+        result.put("status", "success");
+        result.put("entriesRemoved", removed.size());
+        result.put("removedKeys", removed);
+        result.put("objectStore", objectStoreName);
+        return result;
+    }
 }

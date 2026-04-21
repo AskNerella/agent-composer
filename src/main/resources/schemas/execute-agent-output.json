@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "type": "object",
+  "properties": {
+    "userTask": { "type": "string", "description": "The original user message." },
+    "response": { "type": "string", "description": "Final answer produced by the agent." },
+    "totalIterations": { "type": "integer", "description": "Hard cap on Reason-Act cycles." },
+    "iterationCount": { "type": "integer", "description": "Actual number of iterations used." },
+    "complete": { "type": "boolean", "description": "Whether the agent completed successfully." },
+    "sessionId": { "type": "string", "description": "Conversation ID used to scope this session." },
+    "resumedSession": { "type": "boolean", "description": "Whether this turn resumed an existing session." },
+    "failureCount": { "type": "integer", "description": "Number of tool execution failures." },
+    "returnReason": { "type": "string", "description": "Reason the agent loop terminated." },
+    "cacheHit": { "type": "boolean", "description": "Whether the response was served from cache." },
+    "conversationSummary": { "type": "string", "description": "Brief summary of what the agent did." },
+    "toolCalls": {
+      "type": "array",
+      "description": "Ordered list of tool calls made during execution.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "mcpClientName": { "type": "string" },
+          "toolName": { "type": "string" },
+          "toolRequest": { "type": "object" },
+          "toolResponse": { "type": "string" },
+          "iterationNumber": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

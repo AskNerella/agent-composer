@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "type": "object",
+  "properties": {
+    "status": { "type": "string", "description": "Result status (success)." },
+    "entriesRemoved": { "type": "integer", "description": "Number of object store entries that were deleted." },
+    "removedKeys": {
+      "type": "array",
+      "description": "List of object store keys that were deleted.",
+      "items": { "type": "string" }
+    },
+    "objectStore": { "type": "string", "description": "Name of the object store from which entries were deleted." }
+  }
+}

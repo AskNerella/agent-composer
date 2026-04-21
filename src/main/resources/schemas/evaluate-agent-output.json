@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "type": "object",
+  "properties": {
+    "userTask": { "type": "string", "description": "The original task or question provided by the user." },
+    "agentResponse": { "type": "string", "description": "The agent response that was evaluated." },
+    "evaluationCriteria": { "type": "string", "description": "The rubric used to score response quality." },
+    "evaluation": {
+      "type": "object",
+      "description": "LLM evaluation result.",
+      "properties": {
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL"] },
+        "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "confidence": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "reason": { "type": "string" },
+        "improvements": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "provider": { "type": "string", "description": "LLM provider used for evaluation." },
+    "modelName": { "type": "string", "description": "LLM model name used for evaluation." }
+  }
+}

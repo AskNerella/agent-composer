@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "type": "object",
+  "properties": {
+    "sessionId": { "type": "string", "description": "The session ID that was retrieved." },
+    "found": { "type": "boolean", "description": "Whether any history or solved responses were found." },
+    "conversationTurns": { "type": "integer", "description": "Number of message turns in the conversation history." },
+    "conversationHistory": {
+      "type": "array",
+      "description": "Full ordered list of LLM message turns.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string" },
+          "content": { "type": "string" }
+        }
+      }
+    },
+    "solvedResponses": {
+      "type": "array",
+      "description": "Solved/cached agent responses scoped to this session.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "userTask": { "type": "string" },
+          "response": { "type": "string" },
+          "conversationSummary": { "type": "string" },
+          "toolCalls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "mcpClientName": { "type": "string" },
+                "toolName": { "type": "string" },
+                "toolRequest": { "type": "object" },
+                "toolResponse": { "type": "string" },
+                "iterationNumber": { "type": "integer" }
+              }
+            }
+          },
+          "iterationCount": { "type": "integer" },
+          "complete": { "type": "boolean" },
+          "returnReason": { "type": "string" }
+        }
+      }
+    }
+  }
+}

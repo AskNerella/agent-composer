@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "type": "object",
+  "properties": {
+    "found": { "type": "boolean", "description": "Whether any relevant past memories were found." },
+    "userTask": { "type": "string", "description": "The user task that was searched for." },
+    "totalMemoriesSearched": { "type": "integer", "description": "Number of past memories scanned." },
+    "matches": {
+      "type": "array",
+      "description": "Past memories that are relevant to the provided user task.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sessionId": { "type": "string", "description": "Session ID of the matched past conversation." },
+          "userTask": { "type": "string", "description": "The original user task from the past conversation." },
+          "response": { "type": "string", "description": "The agent response from the past conversation." },
+          "confidence": { "type": "integer", "minimum": 0, "maximum": 100, "description": "LLM-scored relevance confidence." },
+          "reason": { "type": "string", "description": "LLM explanation of why this memory is relevant." }
+        }
+      }
+    },
+    "message": { "type": "string", "description": "Informational message when no memories are found." }
+  }
+}
