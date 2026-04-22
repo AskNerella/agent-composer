@@ -385,7 +385,8 @@ public class ReactEngine {
             return true;
         }
         if (toolCalls == null || toolCalls.isEmpty()) {
-            return false;
+            // LLM answered directly without using any tools — stop immediately
+            return true;
         }
         for (AgentResponse.ToolCallRecord call : toolCalls) {
             if (call == null) {
