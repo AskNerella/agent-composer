@@ -9,6 +9,6 @@ public class AgentComposerErrorTypeProvider implements ErrorTypeProvider {
 
     @Override
     public Set<ErrorTypeDefinition> getErrorTypes() {
-        return Set.of(AgentComposerErrors.UNABLE_TO_FETCH_TOOLS);
+        return Set.of(AgentComposerErrors.UNABLE_TO_FETCH_TOOLS, AgentComposerErrors.AGENT_LISTENER_ERROR);
     }
 }

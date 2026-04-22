@@ -60,23 +60,22 @@ public class ReactEngine {
 
     /**
      * Runs the ReAct loop and returns structured response with metrics.
+     * Instructions, MCP servers, and object store are sourced from {@code config}.
      *
-     * @param config              LLM configuration (provider, model, key, etc.)
-     * @param instructions        system prompt
-     * @param userMessage         the user's input for this turn
-     * @param mcpServers          MCP servers to discover tools from (each carries its own tool filter)
-     * @param objectStoreName     name of the Object Store used to persist conversation history
-     * @param conversationId      key scoping this conversation in the Object Store
-     * @param maxIterations       maximum Reason-Act cycles before forced exit
+     * @param config          LLM + agent configuration (provider, model, key, instructions, mcpServers, objectStore)
+     * @param userMessage     the user's input for this turn
+     * @param conversationId  key scoping this conversation in the Object Store
+     * @param maxIterations   maximum Reason-Act cycles before forced exit
      * @return AgentResponse containing final answer, metrics, and tool call history
      */
     public AgentResponse run(AgentComposerConfiguration config,
-                             String instructions,
                              String userMessage,
-                             List<McpServerConfig> mcpServers,
-                             String objectStoreName,
                              String conversationId,
                              int maxIterations) throws Exception {
+
+        String instructions = config.getInstructions();
+        List<McpServerConfig> mcpServers = config.getMcpServers();
+        String objectStoreName = config.getObjectStore();
 
         LlmClient llmClient = LlmClientFactory.create(config);
 

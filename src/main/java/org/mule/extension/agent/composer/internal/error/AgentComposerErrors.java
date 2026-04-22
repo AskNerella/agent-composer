@@ -7,7 +7,8 @@ import java.util.Optional;
 
 public enum AgentComposerErrors implements ErrorTypeDefinition<AgentComposerErrors> {
 
-    UNABLE_TO_FETCH_TOOLS;
+    UNABLE_TO_FETCH_TOOLS,
+    AGENT_LISTENER_ERROR;
 
     @Override
     public Optional<ErrorTypeDefinition<? extends Enum<?>>> getParent() {

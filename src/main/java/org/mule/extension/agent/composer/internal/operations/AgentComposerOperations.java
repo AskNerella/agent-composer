@@ -2,7 +2,6 @@ package org.mule.extension.agent.composer.internal.operations;
 
 import com.google.gson.Gson;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
-import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.engine.ReactEngine;
 import org.mule.extension.agent.composer.internal.error.AgentComposerErrorTypeProvider;
 import org.mule.extension.agent.composer.internal.llm.LlmClient;
@@ -11,31 +10,36 @@ import org.mule.extension.agent.composer.internal.model.AgentResponse;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 import org.mule.runtime.api.store.ObjectStoreManager;
-import org.mule.sdk.api.annotation.error.Throws;
-import org.mule.sdk.api.annotation.param.reference.ObjectStoreReference;
+import org.mule.runtime.extension.api.annotation.metadata.fixed.OutputJsonType;
 import org.mule.runtime.extension.api.annotation.param.Optional;
 import org.mule.runtime.extension.api.annotation.param.display.DisplayName;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
 import org.mule.runtime.extension.api.annotation.param.display.Text;
-import org.mule.runtime.extension.api.annotation.metadata.fixed.OutputJsonType;
+import org.mule.sdk.api.annotation.error.Throws;
 import org.mule.sdk.api.annotation.param.Config;
 import org.mule.sdk.api.annotation.param.MediaType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import java.util.Collections;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 import static org.mule.sdk.api.annotation.param.MediaType.APPLICATION_JSON;
 
 public class AgentComposerOperations {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(AgentComposerOperations.class);
+
     @Inject
     private ObjectStoreManager objectStoreManager;
 
+    // ── Execute Agent ─────────────────────────────────────────────────────────
+
     /**
      * Runs a ReAct agent loop: Reason, call tools via MCP, and return the final answer with metrics.
+     * Instructions, MCP Servers, and Object Store are read from the connector configuration.
      */
     @MediaType(value = APPLICATION_JSON, strict = false)
     @OutputJsonType(schema = "schemas/execute-agent-output.json")
@@ -45,23 +49,8 @@ public class AgentComposerOperations {
 
             @DisplayName("User Message")
             @Summary("The user's input message for this conversation turn.")
+            @Optional(defaultValue = "#[payload]")
             String userMessage,
-
-            @DisplayName("Instructions")
-            @Summary("System prompt / persona prepended to every LLM call.")
-            @Text
-            String instructions,
-
-            @DisplayName("MCP Servers")
-            @Summary("MCP server endpoints whose tools are offered to the LLM.")
-            @Optional
-            List<McpServerConfig> mcpServers,
-
-            @DisplayName("Object Store")
-            @Summary("Reference to a Mule Object Store used to persist conversation history.")
-            @ObjectStoreReference
-            @Optional(defaultValue = "_defaultPersistentObjectStore")
-            String objectStore,
 
             @DisplayName("Conversation ID")
             @Summary("Key that scopes this conversation within the Object Store. Defaults to the Mule correlation ID.")
@@ -74,19 +63,20 @@ public class AgentComposerOperations {
             Integer maxIterations) throws Exception {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        AgentResponse response = engine.run(config, instructions, userMessage, mcpServers,
-                objectStore, conversationId, maxIterations);
+        AgentResponse response = engine.run(config, userMessage, conversationId, maxIterations);
         return new Gson().toJson(response);
     }
 
-        /**
-         * Evaluates an agent response against the user task using the configured LLM.
-         */
-        @DisplayName("Evaulate Agent")
-        @MediaType(value = APPLICATION_JSON, strict = false)
-        @OutputJsonType(schema = "schemas/evaluate-agent-output.json")
-        @Throws(AgentComposerErrorTypeProvider.class)
-        public String evaulateAgent(
+    // ── Evaluate Agent ────────────────────────────────────────────────────────
+
+    /**
+     * Evaluates an agent response against the user task using the configured LLM.
+     */
+    @DisplayName("Evaluate Agent")
+    @MediaType(value = APPLICATION_JSON, strict = false)
+    @OutputJsonType(schema = "schemas/evaluate-agent-output.json")
+    @Throws(AgentComposerErrorTypeProvider.class)
+    public String evaluateAgent(
             @Config AgentComposerConfiguration config,
 
             @DisplayName("User Task")
@@ -108,18 +98,18 @@ public class AgentComposerOperations {
         LlmClient llmClient = LlmClientFactory.create(config);
 
         String systemPrompt = "You evaluate agent responses. Return ONLY a valid JSON object with keys: "
-            + "verdict, score, confidence, reason, improvements. "
-            + "verdict must be PASS or FAIL. score must be integer 0-100. "
-            + "confidence must be integer 0-100. improvements must be an array of strings.";
+                + "verdict, score, confidence, reason, improvements. "
+                + "verdict must be PASS or FAIL. score must be integer 0-100. "
+                + "confidence must be integer 0-100. improvements must be an array of strings.";
 
         String evaluationInput = "User Task:\n" + userTask
-            + "\n\nAgent Response:\n" + agentResponse
-            + "\n\nEvaluation Criteria:\n" + evaluationCriteria;
+                + "\n\nAgent Response:\n" + agentResponse
+                + "\n\nEvaluation Criteria:\n" + evaluationCriteria;
 
         LlmResponse llmEvaluation = llmClient.chat(
-            systemPrompt,
-            Collections.singletonList(new LlmMessage("user", evaluationInput)),
-            Collections.emptyList());
+                systemPrompt,
+                Collections.singletonList(new LlmMessage("user", evaluationInput)),
+                Collections.emptyList());
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("userTask", userTask);
@@ -130,7 +120,9 @@ public class AgentComposerOperations {
         result.put("modelName", config.getModelName());
 
         return new Gson().toJson(result);
-        }
+    }
+
+    // ── Memory Operations ─────────────────────────────────────────────────────
 
     /**
      * Clears all entries from the object store, resetting the agent memory from scratch.
@@ -140,14 +132,10 @@ public class AgentComposerOperations {
     @OutputJsonType(schema = "schemas/reset-memory-output.json")
     @Throws(AgentComposerErrorTypeProvider.class)
     public String resetMemory(
-            @DisplayName("Object Store")
-            @Summary("Reference to the Mule Object Store whose memory will be wiped.")
-            @ObjectStoreReference
-            @Optional(defaultValue = "_defaultPersistentObjectStore")
-            String objectStore) throws Exception {
+            @Config AgentComposerConfiguration config) throws Exception {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        Map<String, Object> result = engine.resetMemory(objectStore);
+        Map<String, Object> result = engine.resetMemory(config.getObjectStore());
         return new Gson().toJson(result);
     }
 
@@ -166,19 +154,13 @@ public class AgentComposerOperations {
             @Text
             String userTask,
 
-            @DisplayName("Object Store")
-            @Summary("Reference to the Mule Object Store that holds past memories.")
-            @ObjectStoreReference
-            @Optional(defaultValue = "_defaultPersistentObjectStore")
-            String objectStore,
-
             @DisplayName("Max Results")
             @Summary("Maximum number of matching memories to return.")
             @Optional(defaultValue = "3")
             Integer maxResults) throws Exception {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        Map<String, Object> result = engine.checkMemory(config, userTask, objectStore,
+        Map<String, Object> result = engine.checkMemory(config, userTask, config.getObjectStore(),
                 maxResults != null ? maxResults : 3);
         return new Gson().toJson(result);
     }
@@ -191,18 +173,14 @@ public class AgentComposerOperations {
     @OutputJsonType(schema = "schemas/retrieve-conversation-output.json")
     @Throws(AgentComposerErrorTypeProvider.class)
     public String retrieveConversation(
+            @Config AgentComposerConfiguration config,
+
             @DisplayName("Session ID")
             @Summary("The conversation / session ID whose history should be retrieved.")
-            String sessionId,
-
-            @DisplayName("Object Store")
-            @Summary("Reference to the Mule Object Store that holds the conversation history.")
-            @ObjectStoreReference
-            @Optional(defaultValue = "_defaultPersistentObjectStore")
-            String objectStore) throws Exception {
+            String sessionId) throws Exception {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        Map<String, Object> result = engine.retrieveConversation(sessionId, objectStore);
+        Map<String, Object> result = engine.retrieveConversation(sessionId, config.getObjectStore());
         return new Gson().toJson(result);
     }
 
@@ -214,6 +192,8 @@ public class AgentComposerOperations {
     @OutputJsonType(schema = "schemas/delete-conversation-output.json")
     @Throws(AgentComposerErrorTypeProvider.class)
     public String deleteConversation(
+            @Config AgentComposerConfiguration config,
+
             @DisplayName("Session ID")
             @Summary("Session ID of the conversation to delete. Provide this, User Task, or both.")
             @Optional
@@ -222,13 +202,7 @@ public class AgentComposerOperations {
             @DisplayName("User Task")
             @Summary("Deletes all solved memories whose user task contains this text (case-insensitive).")
             @Optional
-            String userTask,
-
-            @DisplayName("Object Store")
-            @Summary("Reference to the Mule Object Store from which the conversation will be deleted.")
-            @ObjectStoreReference
-            @Optional(defaultValue = "_defaultPersistentObjectStore")
-            String objectStore) throws Exception {
+            String userTask) throws Exception {
 
         if ((sessionId == null || sessionId.trim().isEmpty())
                 && (userTask == null || userTask.trim().isEmpty())) {
@@ -236,8 +210,7 @@ public class AgentComposerOperations {
         }
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        Map<String, Object> result = engine.deleteConversation(sessionId, userTask, objectStore);
+        Map<String, Object> result = engine.deleteConversation(sessionId, userTask, config.getObjectStore());
         return new Gson().toJson(result);
     }
 }
-

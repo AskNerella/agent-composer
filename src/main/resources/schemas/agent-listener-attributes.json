@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentListenerAttributes",
+  "type": "object",
+  "properties": {
+    "method": {
+      "type": "string",
+      "description": "HTTP method of the incoming request (e.g. POST)."
+    },
+    "path": {
+      "type": "string",
+      "description": "HTTP path the request was sent to."
+    },
+    "remoteAddress": {
+      "type": "string",
+      "description": "Remote address of the HTTP client."
+    },
+    "headers": {
+      "type": "object",
+      "description": "HTTP request headers (name → first value).",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Unique UUID assigned to this request. Pass to agent-listener-respond."
+    }
+  },
+  "required": ["method", "path", "requestId"]
+}
