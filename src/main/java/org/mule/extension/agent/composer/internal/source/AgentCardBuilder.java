@@ -14,8 +14,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.HashSet;
 
 /**
  * Builds an A2A-compliant agent card JSON from the connector configuration
@@ -70,10 +68,9 @@ public class AgentCardBuilder {
             for (McpServerConfig server : mcpServers) {
                 try {
                     List<ToolDefinition> tools = mcpClient.listTools(server);
-                    Set<String> whitelist = (server.getToolFilters() != null && !server.getToolFilters().isEmpty())
-                            ? new HashSet<>(server.getToolFilters()) : null;
+                    List<String> whitelist = server.getToolFilterList();
                     for (ToolDefinition tool : tools) {
-                        if (whitelist != null && !whitelist.contains(tool.getName())) {
+                        if (!whitelist.isEmpty() && !whitelist.contains(tool.getName())) {
                             continue; // skip non-whitelisted tools
                         }
                         Map<String, Object> skill = new LinkedHashMap<>();

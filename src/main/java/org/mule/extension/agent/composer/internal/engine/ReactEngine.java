@@ -250,8 +250,8 @@ public class ReactEngine {
         for (McpServerConfig server : mcpServers) {
             LOGGER.debug("Fetching MCP tools for client '{}' from {}", server.getName(), server.getServerUrl());
             List<ToolDefinition> serverTools = mcpClient.listTools(server);
-            List<String> filter = server.getToolFilters();
-            if (filter != null && !filter.isEmpty()) {
+            List<String> filter = server.getToolFilterList();
+            if (!filter.isEmpty()) {
                 serverTools = serverTools.stream()
                         .filter(t -> filter.contains(t.getName()))
                         .collect(Collectors.toList());

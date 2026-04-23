@@ -7,7 +7,10 @@ import org.mule.runtime.extension.api.annotation.param.display.Summary;
 import org.mule.runtime.extension.api.annotation.param.display.Placement;
 import org.mule.runtime.extension.api.annotation.param.Optional;
 
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class McpServerConfig {
     @Parameter
@@ -32,13 +35,26 @@ public class McpServerConfig {
 
     @Parameter
     @DisplayName("Tool Filter (Whitelist)")
-    @Summary("Tool names to include from this server. Leave empty to allow all tools.")
+    @Summary("Comma-separated list of tool names to include from this server (e.g. tool_a,tool_b). Leave empty to allow all tools.")
     @Optional
     @Placement(order = 4)
-    private List<String> toolFilters;
+    private String toolFilters;
 
     public String getName() { return name; }
     public String getServerUrl() { return serverUrl; }
     public String getAuthToken() { return authToken; }
-    public List<String> getToolFilters() { return toolFilters; }
+
+    /**
+     * Returns the tool filter as a list by splitting the comma-separated string.
+     * Returns an empty list if no filter is configured.
+     */
+    public List<String> getToolFilterList() {
+        if (toolFilters == null || toolFilters.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        return Arrays.stream(toolFilters.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toList());
+    }
 }
