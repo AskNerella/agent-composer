@@ -1,5 +1,6 @@
 package org.mule.extension.agent.composer.internal;
 
+import org.mule.extension.agent.composer.internal.configs.AgentSkillConfig;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 import org.mule.extension.agent.composer.internal.operations.AgentComposerOperations;
@@ -146,6 +147,13 @@ public class AgentComposerConfiguration {
   @Placement(tab = "Agent Card", order = 3)
   private String agentVersion;
 
+  @Parameter
+  @DisplayName("Skills")
+  @Summary("Skills exposed in the A2A agent card. Each skill has its own instructions and allowed MCP tools.")
+  @Optional
+  @Placement(tab = "Agent Card", order = 4)
+  private List<AgentSkillConfig> skills;
+
   // ── Getters ───────────────────────────────────────────────────────────────
 
   public LlmProvider getProvider()            { return provider; }
@@ -163,4 +171,5 @@ public class AgentComposerConfiguration {
   public String getAgentName()                { return agentName; }
   public String getAgentDescription()         { return agentDescription; }
   public String getAgentVersion()             { return agentVersion; }
+  public List<AgentSkillConfig> getSkills()   { return skills; }
 }

@@ -146,7 +146,13 @@ public class OpenAiLlmClient implements LlmClient {
             }
         }
 
-        return new LlmResponse(textContent, toolCall, stopReason);
+        LlmResponse llmResponse = new LlmResponse(textContent, toolCall, stopReason);
+        if (root.has("usage") && root.get("usage").isJsonObject()) {
+            JsonObject usage = root.getAsJsonObject("usage");
+            llmResponse.setInputTokens(usage.has("input_tokens") ? usage.get("input_tokens").getAsInt() : 0);
+            llmResponse.setOutputTokens(usage.has("output_tokens") ? usage.get("output_tokens").getAsInt() : 0);
+        }
+        return llmResponse;
     }
 
     /** Fetches available model IDs from the OpenAI /v1/models endpoint. */

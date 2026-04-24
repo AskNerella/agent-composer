@@ -3,6 +3,7 @@ package org.mule.extension.agent.composer.internal.source;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
+import org.mule.extension.agent.composer.internal.configs.AgentSkillConfig;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.mcp.McpClient;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
@@ -55,14 +56,27 @@ public class AgentCardBuilder {
 
         card.put("defaultInputModes", Collections.singletonList("text"));
         card.put("defaultOutputModes", Collections.singletonList("text"));
-        card.put("skills", buildSkills(config.getMcpServers()));
+        card.put("skills", buildSkills(config.getMcpServers(), config.getSkills()));
 
         return GSON.toJson(card);
     }
 
-    private static List<Map<String, Object>> buildSkills(List<McpServerConfig> mcpServers) {
+    private static List<Map<String, Object>> buildSkills(List<McpServerConfig> mcpServers,
+                                                          List<AgentSkillConfig> configuredSkills) {
         List<Map<String, Object>> skills = new ArrayList<>();
 
+        // Configured skills go first — only name + description to avoid context overflow
+        if (configuredSkills != null && !configuredSkills.isEmpty()) {
+            for (AgentSkillConfig skill : configuredSkills) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("id", skill.getName());
+                entry.put("name", skill.getName());
+                entry.put("description", nonEmpty(skill.getDescription(), ""));
+                skills.add(entry);
+            }
+        }
+
+        // MCP tool skills (auto-discovered)
         if (mcpServers != null && !mcpServers.isEmpty()) {
             McpClient mcpClient = new McpClient();
             for (McpServerConfig server : mcpServers) {

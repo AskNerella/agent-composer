@@ -4,11 +4,14 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
+import org.mule.extension.agent.composer.internal.engine.ReactEngine;
 import org.mule.runtime.api.exception.DefaultMuleException;
 import org.mule.runtime.api.exception.MuleException;
 import org.mule.runtime.api.metadata.TypedValue;
+import org.mule.runtime.api.store.ObjectStoreManager;
 import org.mule.runtime.http.api.HttpService;
 import org.mule.runtime.http.api.domain.entity.ByteArrayHttpEntity;
+import org.mule.runtime.http.api.domain.entity.InputStreamHttpEntity;
 import org.mule.runtime.http.api.domain.message.response.HttpResponse;
 import org.mule.runtime.http.api.server.HttpServer;
 import org.mule.runtime.http.api.server.RequestHandlerManager;
@@ -33,6 +36,8 @@ import org.slf4j.LoggerFactory;
 import javax.inject.Inject;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.PipedInputStream;
+import java.io.PipedOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -65,12 +70,16 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static final String RESPONSE_CALLBACK_VAR = "responseCallback";
     private static final String REQUEST_VAR = "requestId";
     private static final String TASK_ID_VAR = "taskId";
+    private static final String IS_STREAMING_VAR = "isStreaming";
 
     @Config
     private AgentComposerConfiguration config;
 
     @Inject
     private HttpService httpService;
+
+    @Inject
+    private ObjectStoreManager objectStoreManager;
 
     private HttpServer httpServer;
     private RequestHandlerManager agentHandlerManager;
@@ -98,6 +107,10 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String cardPath = normalizedPath + "/.well-known/agent.json";
         cardHandlerManager = httpServer.addRequestHandler(cardPath, (requestCtx, responseCallback) -> {
             String method = requestCtx.getRequest().getMethod();
+            if (!requestCtx.getRequest().getPath().equals(cardPath)) {
+                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
+                return;
+            }
             if (!"GET".equalsIgnoreCase(method)) {
                 sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
                 return;
@@ -108,6 +121,10 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         // ── POST {agentPath} ─────────────────────────────────────────────────
         agentHandlerManager = httpServer.addRequestHandler(normalizedPath, (requestCtx, responseCallback) -> {
             String method = requestCtx.getRequest().getMethod();
+            if (!requestCtx.getRequest().getPath().equals(normalizedPath)) {
+                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
+                return;
+            }
             if (!"POST".equalsIgnoreCase(method)) {
                 sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
                 return;
@@ -141,14 +158,25 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
                 // Store HTTP callback in context so @OnSuccess / @OnError can send the response
                 String taskId = extractTaskId(body);
+
+                // ── Streaming: message/stream or tasks/sendSubscribe ─────────
+                // These bypass the Mule flow so we can push SSE events per iteration.
+                if (isStreamingRequest(body)) {
+                    handleStreamingRequest(responseCallback, body, taskId);
+                    return;
+                }
+
+                // ── Non-streaming: tasks/send ────────────────────────────────
+                // Pass raw body to the Mule flow; @OnSuccess sends the final A2A JSON response.
                 SourceCallbackContext ctx = sourceCallback.createContext();
                 ctx.addVariable(RESPONSE_CALLBACK_VAR, responseCallback);
                 ctx.addVariable(REQUEST_VAR, requestId);
                 ctx.addVariable(TASK_ID_VAR, taskId);
+                ctx.addVariable(IS_STREAMING_VAR, false);
 
                 sourceCallback.handle(
                         Result.<String, AgentListenerAttributes>builder()
-                                .output(extractUserMessage(body))
+                                .output(body)
                                 .attributes(attributes)
                                 .build(),
                         ctx);
@@ -212,36 +240,175 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /**
+     * Returns {@code true} if the request body contains {@code "method":"tasks/sendSubscribe"},
+     * indicating an A2A streaming request that should respond with SSE.
+     */
+    /**
+     * Handles a streaming A2A request ({@code message/stream} or {@code tasks/sendSubscribe}) by
+     * running the ReAct engine directly in a background thread, writing one SSE
+     * {@code task-status-update} event after each tool/skill execution, and a final event when
+     * the agent produces its answer. This bypasses the Mule flow entirely so that events can
+     * be flushed incrementally rather than waiting for flow completion.
+     */
+    private void handleStreamingRequest(HttpResponseReadyCallback responseCallback, String body, String taskId) {
+        String userMessage = extractUserMessage(body);
+        try {
+            PipedOutputStream pipedOut = new PipedOutputStream();
+            PipedInputStream pipedIn = new PipedInputStream(pipedOut, 131072);
+
+            // Start the background thread BEFORE calling responseReady() so the PipedInputStream
+            // is never empty when the HTTP runtime tries to read it (avoids a deadlock where the
+            // read blocks on the same thread that would otherwise start the writer).
+            Thread thread = new Thread(() -> {
+                try {
+                    ReactEngine engine = new ReactEngine(objectStoreManager);
+                    ReactEngine.IterationCallback callback = (iteration, actionName, observation) -> {
+                        try {
+                            String summary = "[Step " + iteration + "] Using '" + actionName + "'";
+                            byte[] event = buildSseEvent(taskId, "working", summary, false)
+                                    .getBytes(StandardCharsets.UTF_8);
+                            pipedOut.write(event);
+                            pipedOut.flush();
+                        } catch (Exception e) {
+                            LOGGER.warn("Could not write SSE event for task {}: {}", taskId, e.getMessage());
+                        }
+                    };
+                    org.mule.extension.agent.composer.internal.model.AgentResponse result =
+                            engine.run(config, userMessage, taskId, 10, callback);
+                    byte[] finalEvent = buildSseEvent(taskId, "completed", result.getResponse(), true)
+                            .getBytes(StandardCharsets.UTF_8);
+                    pipedOut.write(finalEvent);
+                    pipedOut.flush();
+                } catch (Exception e) {
+                    LOGGER.error("Streaming agent error for task {}: {}", taskId, e.getMessage(), e);
+                    try {
+                        byte[] errEvent = buildSseEvent(taskId, "failed",
+                                "Agent execution failed: " + e.getMessage(), true)
+                                .getBytes(StandardCharsets.UTF_8);
+                        pipedOut.write(errEvent);
+                        pipedOut.flush();
+                    } catch (Exception ignored) {}
+                } finally {
+                    try { pipedOut.close(); } catch (Exception ignored) {}
+                }
+            }, "agent-sse-" + taskId);
+            thread.setDaemon(true);
+            thread.start();
+
+            // Wire the response AFTER the writer thread is already running so the
+            // PipedInputStream will have data as soon as the HTTP runtime reads it.
+            HttpResponse sseResponse = HttpResponse.builder()
+                    .statusCode(200)
+                    .addHeader("Content-Type", "text/event-stream; charset=UTF-8")
+                    .addHeader("Cache-Control", "no-cache, no-transform")
+                    .addHeader("Connection", "keep-alive")
+                    .addHeader("X-Accel-Buffering", "no")
+                    .entity(new InputStreamHttpEntity(pipedIn))
+                    .build();
+
+            responseCallback.responseReady(sseResponse, new org.mule.runtime.http.api.server.async.ResponseStatusCallback() {
+                @Override public void responseSendFailure(Throwable t) {
+                    LOGGER.warn("SSE send failure for task {}: {}", taskId, t.getMessage());
+                    try { pipedOut.close(); } catch (Exception ignored) {}
+                }
+                @Override public void responseSendSuccessfully() { }
+            });
+
+        } catch (Exception e) {
+            LOGGER.error("Failed to set up SSE stream for task {}: {}", taskId, e.getMessage(), e);
+            sendResponse(responseCallback, 500,
+                    buildA2AResponse(taskId, "failed", "Streaming setup failed: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Extracts the user message text from a JSON-RPC 2.0 or flat A2A request body.
+     * Checks {@code params.message.parts[0].text} first, then {@code message.parts[0].text},
+     * and falls back to the raw body string.
+     */
+    private static String extractUserMessage(String body) {
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            // JSON-RPC 2.0: params.message.parts[0].text
+            if (root.has("params") && root.get("params").isJsonObject()) {
+                JsonObject params = root.getAsJsonObject("params");
+                if (params.has("message") && params.get("message").isJsonObject()) {
+                    String text = firstTextPart(params.getAsJsonObject("message"));
+                    if (text != null) return text;
+                }
+            }
+            // Flat A2A: message.parts[0].text
+            if (root.has("message") && root.get("message").isJsonObject()) {
+                String text = firstTextPart(root.getAsJsonObject("message"));
+                if (text != null) return text;
+            }
+        } catch (Exception ignored) {}
+        return body;
+    }
+
+    private static String firstTextPart(JsonObject message) {
+        try {
+            JsonArray parts = message.getAsJsonArray("parts");
+            if (parts != null && parts.size() > 0) {
+                JsonObject part = parts.get(0).getAsJsonObject();
+                if (part.has("text")) return part.get("text").getAsString();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static boolean isStreamingRequest(String body) {
+        try {
+            JsonObject obj = JsonParser.parseString(body).getAsJsonObject();
+            if (!obj.has("method")) return false;
+            String method = obj.get("method").getAsString();
+            return "tasks/sendSubscribe".equals(method) || "message/stream".equals(method);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Builds an A2A-compliant SSE event string.
+     */
+    private static String buildSseEvent(String taskId, String state, String text, boolean isFinal) {
+        JsonObject part = new JsonObject();
+        part.addProperty("type", "text");
+        part.addProperty("text", text != null ? text : "");
+        JsonArray parts = new JsonArray();
+        parts.add(part);
+        JsonObject message = new JsonObject();
+        message.addProperty("role", "agent");
+        message.add("parts", parts);
+        JsonObject status = new JsonObject();
+        status.addProperty("state", state);
+        status.add("message", message);
+        JsonObject task = new JsonObject();
+        task.addProperty("id", taskId);
+        task.add("status", status);
+        task.addProperty("final", isFinal);
+        return "event: task-status-update\ndata: " + task + "\n\n";
+    }
+
+    /**
      * Extracts the task id from an A2A task JSON body.
      * Falls back to a new UUID if not present.
      */
     private static String extractTaskId(String body) {
         try {
-            JsonObject task = JsonParser.parseString(body).getAsJsonObject();
-            if (task.has("id")) return task.get("id").getAsString();
-        } catch (Exception ignored) {}
-        return UUID.randomUUID().toString();
-    }
-
-    /**
-     * Extracts the user message text from an A2A task JSON body.
-     * Falls back to the raw body if the structure doesn't match.
-     */
-    private static String extractUserMessage(String body) {
-        try {
-            JsonObject task = JsonParser.parseString(body).getAsJsonObject();
-            JsonObject message = task.getAsJsonObject("message");
-            if (message != null) {
-                JsonArray parts = message.getAsJsonArray("parts");
-                if (parts != null && parts.size() > 0) {
-                    JsonObject firstPart = parts.get(0).getAsJsonObject();
-                    if (firstPart.has("text")) {
-                        return firstPart.get("text").getAsString();
-                    }
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            // JSON-RPC top-level id
+            if (root.has("id")) return root.get("id").getAsString();
+            // A2A flat envelope id
+            if (root.has("params") && root.get("params").isJsonObject()) {
+                JsonObject params = root.getAsJsonObject("params");
+                if (params.has("message") && params.get("message").isJsonObject()) {
+                    JsonObject msg = params.getAsJsonObject("message");
+                    if (msg.has("messageId")) return msg.get("messageId").getAsString();
                 }
             }
         } catch (Exception ignored) {}
-        return body; // fallback: pass raw body
+        return UUID.randomUUID().toString();
     }
 
     /**
