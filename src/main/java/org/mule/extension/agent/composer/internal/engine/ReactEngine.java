@@ -429,8 +429,11 @@ public class ReactEngine {
                         .collect(Collectors.toList());
 
         String skillInstructions = skill.getInstructions();
-        LOGGER.debug("[Skill '{}'] Starting sub-loop | task='{}' | tools=({}): {}",
-                skill.getName(), task, skillMcpTools.size(),
+        LOGGER.info("[Skill '{}'] Sub-loop starting | allMcpTools={} | allowedToolNames={} | skillMcpTools=({}): {}",
+                skill.getName(),
+                allMcpTools.size(),
+                allowedToolNames.isEmpty() ? "(all)" : allowedToolNames,
+                skillMcpTools.size(),
                 skillMcpTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
 
         LlmClient llmClient = LlmClientFactory.create(config);
@@ -438,27 +441,54 @@ public class ReactEngine {
         skillMessages.add(new LlmMessage("user", task));
 
         String skillAnswer = null;
-        int maxSkillIterations = 3;
+        int maxSkillIterations = 15;
+        // Number of consecutive text-only responses (no tool call) since the last tool call.
+        // Resets to 0 whenever the LLM actually calls a tool.
+        // We re-prompt up to MAX_TEXT_REPROMPTS times before accepting the text as final.
+        int consecutiveTextResponses = 0;
+        final int MAX_TEXT_REPROMPTS = 3;
+        boolean hasTools = !skillMcpTools.isEmpty();
 
         for (int i = 0; i < maxSkillIterations; i++) {
             LOGGER.info("[Skill '{}' | Step {}/{}] Sending {} message(s) to LLM",
                     skill.getName(), i + 1, maxSkillIterations, skillMessages.size());
             LlmResponse response = llmClient.chat(skillInstructions, skillMessages, skillMcpTools);
 
-            if (response.hasFinalAnswer()) {
-                LOGGER.debug("[Skill '{}' | Step {}/{}] Tokens used | input={} output={} total={}",
-                        skill.getName(), i + 1, maxSkillIterations,
-                        response.getInputTokens(), response.getOutputTokens(),
-                        response.getInputTokens() + response.getOutputTokens());
-                skillAnswer = response.getContent();
-                LOGGER.debug("[Skill '{}'] Final answer after {} iteration(s).", skill.getName(), i + 1);
-                break;
-            }
-
             LOGGER.debug("[Skill '{}' | Step {}/{}] Tokens used | input={} output={} total={}",
                     skill.getName(), i + 1, maxSkillIterations,
                     response.getInputTokens(), response.getOutputTokens(),
                     response.getInputTokens() + response.getOutputTokens());
+
+            if (response.hasFinalAnswer()) {
+                if (hasTools && consecutiveTextResponses < MAX_TEXT_REPROMPTS) {
+                    // The LLM returned text without calling a tool.
+                    // It may still have more tool steps to execute (e.g. the skill
+                    // instructions say "first draft the ticket, then call create_issue").
+                    // Re-prompt it explicitly to invoke the tools rather than describing them.
+                    consecutiveTextResponses++;
+                    LOGGER.info("[Skill '{}' | Step {}/{}] LLM responded with text but no tool call " +
+                            "— re-prompting to execute tools (attempt {}/{}).",
+                            skill.getName(), i + 1, maxSkillIterations,
+                            consecutiveTextResponses, MAX_TEXT_REPROMPTS);
+                    // Keep the LLM's text so it retains context (e.g. the generated ticket
+                    // title/description), but add an explicit directive to call tools next.
+                    skillMessages.add(new LlmMessage("assistant",
+                            response.getContent() != null ? response.getContent() : "Understood."));
+                    skillMessages.add(new LlmMessage("user",
+                            "You MUST now execute the next required step by calling the appropriate tool directly. "
+                            + "Do not produce more text — invoke the tool now."));
+                    continue;
+                }
+                // Exceeded re-prompt budget (or no tools) — accept text as the final answer.
+                skillAnswer = response.getContent();
+                LOGGER.info("[Skill '{}'] Accepted final answer at step {} "
+                        + "(consecutiveTextResponses={}, hasTools={}).",
+                        skill.getName(), i + 1, consecutiveTextResponses, hasTools);
+                break;
+            }
+
+            // LLM requested a tool call — reset the consecutive-text counter.
+            consecutiveTextResponses = 0;
 
             ToolCall toolCall = response.getToolCall();
             LOGGER.info("[Skill '{}' | Step {}/{}] >>> Using tool '{}' | args: {}",
@@ -564,22 +594,20 @@ public class ReactEngine {
     private boolean shouldStopAfterFinalAnswer(List<AgentResponse.ToolCallRecord> toolCalls,
                                                List<ToolDefinition> tools) {
         if (tools == null || tools.isEmpty()) {
+            // No tools available — model can only answer from knowledge, so stop.
             return true;
         }
         if (toolCalls == null || toolCalls.isEmpty()) {
-            // LLM answered directly without using any tools — stop immediately
+            // LLM answered directly without using any tools — stop immediately.
             return true;
         }
-        for (AgentResponse.ToolCallRecord call : toolCalls) {
-            if (call == null) {
-                continue;
-            }
-            String response = call.getToolResponse();
-            if (response != null && !response.trim().isEmpty() && !isLikelyToolError(response)) {
-                return true;
-            }
-        }
-        return false;
+        // Only stop when the MOST RECENT tool call in this iteration produced a
+        // good result.  Walking the whole list would stop the loop after the very
+        // first successful tool call, preventing subsequent iterations.
+        AgentResponse.ToolCallRecord last = toolCalls.get(toolCalls.size() - 1);
+        if (last == null) return false;
+        String response = last.getToolResponse();
+        return response != null && !response.trim().isEmpty() && !isLikelyToolError(response);
     }
 
     private boolean isLikelyToolError(String text) {
