@@ -102,25 +102,29 @@ The **Agent Listener** source appears in the Anypoint Studio palette under **Tri
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `{agentPath}/.well-known/agent.json` | `GET` | Serves the A2A agent card (auto-generated from config) |
-| `{agentPath}` | `POST` | Receives an A2A task request and triggers the Mule flow |
+| `/.well-known/agent-card.json` | `GET` | Serves the A2A 0.3.0 agent card (a legacy `{agentPath}/.well-known/agent.json` alias is also exposed) |
+| `{agentPath}` | `POST` | Receives A2A JSON-RPC calls such as `message/send`, `message/stream`, `tasks/get`, and `tasks/cancel` |
 
-Responses are always returned in the **A2A Task response structure**:
+Completed responses are returned in the **A2A 0.3.0 Task response structure**, with the agent payload in `artifacts` so A2A clients surface it under the response/output area instead of the general status area:
 
 ```json
 {
   "id": "<taskId>",
+  "contextId": "<contextId>",
   "status": {
-    "state": "completed",
-    "message": {
-      "role": "agent",
-      "parts": [{ "type": "text", "text": "<agent output>" }]
+    "state": "completed"
+  },
+  "artifacts": [
+    {
+      "artifactId": "<taskId>-response",
+      "parts": [{ "kind": "text", "text": "<agent output>" }]
     }
-  }
+  ],
+  "kind": "task"
 }
 ```
 
-`state` is `completed`, `failed`, or `canceled` depending on flow outcome.
+`input-required`, `failed`, and `canceled` states still use `status.message` for the human-readable update.
 
 ---
 
@@ -145,4 +149,3 @@ Each MCP server entry supports:
 | `AGENT-COMPOSER:AGENT_LISTENER_ERROR` | Failure during Agent Listener startup or request handling |
 
 Both extend `MULE:CONNECTIVITY`.
-

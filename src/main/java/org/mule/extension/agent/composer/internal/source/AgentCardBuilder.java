@@ -72,19 +72,22 @@ public class AgentCardBuilder {
         String agentUrl = scheme + "://" + host + ":" + port + normalizedPath;
 
         Map<String, Object> card = new LinkedHashMap<>();
+        card.put("protocolVersion", "0.3.0");
         card.put("name", nonEmpty(config.getAgentName(), "Agent Composer"));
         card.put("description", nonEmpty(config.getAgentDescription(), "A ReAct agent powered by Agent Composer."));
         card.put("version", nonEmpty(config.getAgentVersion(), "1.0.0"));
         card.put("url", agentUrl);
+        card.put("preferredTransport", "JSONRPC");
+        card.put("additionalInterfaces", Collections.singletonList(interfaceEntry(agentUrl, "JSONRPC")));
 
         Map<String, Object> capabilities = new LinkedHashMap<>();
         capabilities.put("streaming", true);
         capabilities.put("pushNotifications", false);
-        capabilities.put("stateTransitionHistory", true);
+        capabilities.put("stateTransitionHistory", false);
         card.put("capabilities", capabilities);
 
-        card.put("defaultInputModes", Collections.singletonList("text"));
-        card.put("defaultOutputModes", Collections.singletonList("text"));
+        card.put("defaultInputModes", Collections.singletonList("text/plain"));
+        card.put("defaultOutputModes", List.of("text/plain", "application/json"));
         card.put("skills", buildSkills(config.getMcpServers(), config.getSkills(),
                 config.isIncludeMcpToolsAsSkills()));
 
@@ -109,9 +112,10 @@ public class AgentCardBuilder {
                 entry.put("id", skill.getName());
                 entry.put("name", skill.getName());
                 entry.put("description", nonEmpty(skill.getDescription(), ""));
-                if (skill.getTags() != null && !skill.getTags().isEmpty()) {
-                    entry.put("tags", skill.getTagList());
-                }
+                entry.put("tags", (skill.getTags() != null && !skill.getTags().isEmpty())
+                        ? skill.getTagList() : Collections.emptyList());
+                entry.put("inputModes", Collections.singletonList("text/plain"));
+                entry.put("outputModes", List.of("text/plain", "application/json"));
                 skills.add(entry);
             }
         }
@@ -131,6 +135,9 @@ public class AgentCardBuilder {
                         skill.put("id", tool.getName());
                         skill.put("name", tool.getName());
                         skill.put("description", nonEmpty(tool.getDescription(), ""));
+                        skill.put("tags", Collections.emptyList());
+                        skill.put("inputModes", Collections.singletonList("text/plain"));
+                        skill.put("outputModes", List.of("text/plain", "application/json"));
                         skills.add(skill);
                     }
                 } catch (Exception e) {
@@ -145,10 +152,20 @@ public class AgentCardBuilder {
             defaultSkill.put("id", "text-reasoning");
             defaultSkill.put("name", "Text Reasoning");
             defaultSkill.put("description", "Answers questions and performs tasks using language model reasoning.");
+            defaultSkill.put("tags", Collections.emptyList());
+            defaultSkill.put("inputModes", Collections.singletonList("text/plain"));
+            defaultSkill.put("outputModes", List.of("text/plain", "application/json"));
             skills.add(defaultSkill);
         }
 
         return skills;
+    }
+
+    private static Map<String, Object> interfaceEntry(String url, String transport) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("url", url);
+        entry.put("transport", transport);
+        return entry;
     }
 
     private static String nonEmpty(String value, String fallback) {

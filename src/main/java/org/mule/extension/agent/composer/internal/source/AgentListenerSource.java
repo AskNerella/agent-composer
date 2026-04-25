@@ -1,13 +1,16 @@
 package org.mule.extension.agent.composer.internal.source;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonParser;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
 import org.mule.extension.agent.composer.internal.engine.ReactEngine;
 import org.mule.runtime.api.exception.DefaultMuleException;
 import org.mule.runtime.api.exception.MuleException;
 import org.mule.runtime.api.metadata.TypedValue;
+import org.mule.runtime.api.store.ObjectStore;
 import org.mule.runtime.api.store.ObjectStoreManager;
 import org.mule.runtime.http.api.HttpService;
 import org.mule.runtime.http.api.domain.entity.ByteArrayHttpEntity;
@@ -38,7 +41,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
+import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -47,7 +53,7 @@ import java.util.UUID;
  * Message source that attaches to an existing {@code <http:listener-config\>\} global element
  * (referenced by name in the connector configuration) and registers two HTTP endpoints:
  * <ul>
- *   <li>{@code GET /.well-known/agent.json} — serves the A2A agent card.</li>
+ *   <li>{@code GET /.well-known/agent-card.json} — serves the A2A 0.3.0 agent card.</li>
  *   <li>{@code POST {agentPath}} — receives an A2A task, triggers the Mule flow,
  *       and synchronously returns the flow's output payload to the HTTP caller.</li>
  * </ul>
@@ -70,7 +76,13 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static final String RESPONSE_CALLBACK_VAR = "responseCallback";
     private static final String REQUEST_VAR = "requestId";
     private static final String TASK_ID_VAR = "taskId";
+    private static final String CONTEXT_ID_VAR = "contextId";
+    private static final String RPC_ID_VAR = "rpcId";
+    private static final String IS_JSONRPC_VAR = "isJsonRpc";
     private static final String IS_STREAMING_VAR = "isStreaming";
+    private static final String TASK_STORE_PREFIX = "a2a:task:";
+    private static final String WELL_KNOWN_CARD_PATH = "/.well-known/agent-card.json";
+    private static final String LEGACY_CARD_SUFFIX = "/.well-known/agent.json";
 
     @Config
     private AgentComposerConfiguration config;
@@ -84,6 +96,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private HttpServer httpServer;
     private RequestHandlerManager agentHandlerManager;
     private RequestHandlerManager cardHandlerManager;
+    private RequestHandlerManager legacyCardHandlerManager;
 
     @Override
     public void onStart(SourceCallback<String, AgentListenerAttributes> sourceCallback) throws MuleException {
@@ -103,20 +116,12 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
 
-        // ── GET {agentPath}/.well-known/agent.json ──────────────────────────
-        String cardPath = normalizedPath + "/.well-known/agent.json";
-        cardHandlerManager = httpServer.addRequestHandler(cardPath, (requestCtx, responseCallback) -> {
-            String method = requestCtx.getRequest().getMethod();
-            if (!requestCtx.getRequest().getPath().equals(cardPath)) {
-                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
-                return;
-            }
-            if (!"GET".equalsIgnoreCase(method)) {
-                sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
-                return;
-            }
-            sendResponseBytes(responseCallback, 200, cardBytes);
-        });
+        // ── GET /.well-known/agent-card.json (plus legacy alias) ───────────
+        String legacyCardPath = normalizedPath + LEGACY_CARD_SUFFIX;
+        cardHandlerManager = addCardHandler(WELL_KNOWN_CARD_PATH, cardBytes);
+        if (!WELL_KNOWN_CARD_PATH.equals(legacyCardPath)) {
+            legacyCardHandlerManager = addCardHandler(legacyCardPath, cardBytes);
+        }
 
         // ── POST {agentPath} ─────────────────────────────────────────────────
         agentHandlerManager = httpServer.addRequestHandler(normalizedPath, (requestCtx, responseCallback) -> {
@@ -156,22 +161,47 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         headers,
                         requestId);
 
-                // Store HTTP callback in context so @OnSuccess / @OnError can send the response
-                String taskId = extractTaskId(body);
+                String rpcIdJson = extractRpcIdJson(body);
+                boolean isJsonRpc = rpcIdJson != null;
+                String methodName = extractMethodName(body);
 
-                // ── Streaming: message/stream or tasks/sendSubscribe ─────────
-                // These bypass the Mule flow so we can push SSE events per iteration.
-                if (isStreamingRequest(body)) {
-                    handleStreamingRequest(responseCallback, body, taskId);
+                if (isTaskGetRequest(methodName)) {
+                    handleTaskGetRequest(responseCallback, body, isJsonRpc, rpcIdJson);
                     return;
                 }
 
-                // ── Non-streaming: tasks/send ────────────────────────────────
+                if (isTaskCancelRequest(methodName)) {
+                    handleTaskCancelRequest(responseCallback, body, isJsonRpc, rpcIdJson);
+                    return;
+                }
+
+                if (methodName != null && !isMessageSendRequest(methodName) && !isStreamingRequest(methodName)) {
+                    sendProtocolError(responseCallback, 501, -32004,
+                            "This operation is not supported by Agent Listener.", isJsonRpc, rpcIdJson);
+                    return;
+                }
+
+                // Store HTTP callback in context so @OnSuccess / @OnError can send the response
+                String taskId = extractMessageTaskId(body);
+                String contextId = resolveContextId(body, taskId);
+                persistTask(buildTask(taskId, contextId, "submitted", null, null));
+
+                // ── Streaming: message/stream or tasks/sendSubscribe ─────────
+                // These bypass the Mule flow so we can push SSE events per iteration.
+                if (isStreamingRequest(methodName)) {
+                    handleStreamingRequest(responseCallback, body, taskId, contextId, rpcIdJson, isJsonRpc);
+                    return;
+                }
+
+                // ── Non-streaming: message/send ──────────────────────────────
                 // Pass raw body to the Mule flow; @OnSuccess sends the final A2A JSON response.
                 SourceCallbackContext ctx = sourceCallback.createContext();
                 ctx.addVariable(RESPONSE_CALLBACK_VAR, responseCallback);
                 ctx.addVariable(REQUEST_VAR, requestId);
                 ctx.addVariable(TASK_ID_VAR, taskId);
+                ctx.addVariable(CONTEXT_ID_VAR, contextId);
+                ctx.addVariable(RPC_ID_VAR, rpcIdJson != null ? rpcIdJson : "null");
+                ctx.addVariable(IS_JSONRPC_VAR, isJsonRpc);
                 ctx.addVariable(IS_STREAMING_VAR, false);
 
                 sourceCallback.handle(
@@ -189,7 +219,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         });
 
         LOGGER.info("Agent Listener attached to HTTP Listener Config '{}' | path={} card={}",
-                configName, normalizedPath, cardPath);
+                configName, normalizedPath, WELL_KNOWN_CARD_PATH);
     }
 
     @Override
@@ -199,6 +229,9 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         }
         if (cardHandlerManager != null) {
             cardHandlerManager.stop();
+        }
+        if (legacyCardHandlerManager != null) {
+            legacyCardHandlerManager.stop();
         }
         LOGGER.info("Agent Listener detached from HTTP Listener Config '{}'.", config.getHttpListenerConfig());
     }
@@ -210,19 +243,29 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     @OnSuccess
     public void onSuccess(@Content TypedValue<Object> payload, SourceCallbackContext callbackContext) {
         String taskId = callbackContext.<String>getVariable(TASK_ID_VAR).orElse(UUID.randomUUID().toString());
+        String contextId = callbackContext.<String>getVariable(CONTEXT_ID_VAR).orElse(taskId);
+        String rpcIdJson = callbackContext.<String>getVariable(RPC_ID_VAR).orElse("null");
+        boolean isJsonRpc = callbackContext.<Boolean>getVariable(IS_JSONRPC_VAR).orElse(false);
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
-            String text = (payload != null && payload.getValue() != null) ? payload.getValue().toString() : "";
-            // The Mule flow may return a JSON AgentResponse — check for input-required.
-            try {
-                com.google.gson.JsonObject parsed = com.google.gson.JsonParser.parseString(text).getAsJsonObject();
-                if (parsed.has("requiresInput") && parsed.get("requiresInput").getAsBoolean()) {
-                    String question = parsed.has("inputRequest") ? parsed.get("inputRequest").getAsString() : text;
-                    String conversationId = parsed.has("sessionId") ? parsed.get("sessionId").getAsString() : taskId;
-                    sendResponse(cb, 200, buildA2AResponse(taskId, "input-required", question, conversationId));
-                    return;
-                }
-            } catch (Exception ignored) {}
-            sendResponse(cb, 200, buildA2AResponse(taskId, "completed", text, taskId));
+            JsonObject canceledTask = getCanceledTask(taskId);
+            if (canceledTask != null) {
+                sendResponse(cb, 200, wrapTaskResponse(canceledTask, isJsonRpc, rpcIdJson));
+                return;
+            }
+
+            String rawPayload = stringifyPayload(payload);
+            JsonObject agentResponse = parseJsonObject(rawPayload);
+            if (isInputRequired(agentResponse)) {
+                String question = extractInputRequest(agentResponse, rawPayload);
+                JsonObject task = buildTask(taskId, contextId, "input-required", question, null);
+                persistTask(task);
+                sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
+                return;
+            }
+
+            JsonObject task = buildTask(taskId, contextId, "completed", null, extractAgentOutput(rawPayload, agentResponse));
+            persistTask(task);
+            sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
         });
     }
 
@@ -233,90 +276,193 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     @OnTerminate
     public void onTerminate(SourceCallbackContext callbackContext) {
         String taskId = callbackContext.<String>getVariable(TASK_ID_VAR).orElse(UUID.randomUUID().toString());
-        callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb ->
-            sendResponse(cb, 503, buildA2AResponse(taskId, "canceled", "Flow terminated before response was sent", taskId)));
+        String contextId = callbackContext.<String>getVariable(CONTEXT_ID_VAR).orElse(taskId);
+        String rpcIdJson = callbackContext.<String>getVariable(RPC_ID_VAR).orElse("null");
+        boolean isJsonRpc = callbackContext.<Boolean>getVariable(IS_JSONRPC_VAR).orElse(false);
+        callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
+            JsonObject task = getCanceledTask(taskId);
+            if (task == null) {
+                task = buildTask(taskId, contextId, "canceled", "Flow terminated before response was sent", null);
+                persistTask(task);
+            }
+            sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
+        });
     }
 
     @OnError
     public void onError(@org.mule.sdk.api.annotation.param.Optional Error error, SourceCallbackContext callbackContext) {
         String requestId = callbackContext.<String>getVariable(REQUEST_VAR).orElse("unknown");
         String taskId = callbackContext.<String>getVariable(TASK_ID_VAR).orElse(UUID.randomUUID().toString());
+        String contextId = callbackContext.<String>getVariable(CONTEXT_ID_VAR).orElse(taskId);
+        String rpcIdJson = callbackContext.<String>getVariable(RPC_ID_VAR).orElse("null");
+        boolean isJsonRpc = callbackContext.<Boolean>getVariable(IS_JSONRPC_VAR).orElse(false);
         String msg = error != null ? error.getDescription() : "unknown";
         LOGGER.error("Flow error for agent request {}: {}", requestId, msg);
-        callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb ->
-                sendResponse(cb, 500, buildA2AResponse(taskId, "failed", msg, taskId)));
+        callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
+            JsonObject task = getCanceledTask(taskId);
+            if (task == null) {
+                task = buildTask(taskId, contextId, "failed", msg, null);
+                persistTask(task);
+            }
+            sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
+        });
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    private RequestHandlerManager addCardHandler(String path, byte[] cardBytes) {
+        return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
+            if (!requestCtx.getRequest().getPath().equals(path)) {
+                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(requestCtx.getRequest().getMethod())) {
+                sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
+                return;
+            }
+            sendResponseBytes(responseCallback, 200, cardBytes);
+        });
+    }
+
+    private void handleTaskGetRequest(HttpResponseReadyCallback responseCallback, String body, boolean isJsonRpc, String rpcIdJson) {
+        String taskId = extractTaskOperationId(body);
+        if (taskId == null || taskId.trim().isEmpty()) {
+            sendProtocolError(responseCallback, 400, -32602, "Missing required task id.", isJsonRpc, rpcIdJson);
+            return;
+        }
+
+        JsonObject task = loadTask(taskId);
+        if (task == null) {
+            sendProtocolError(responseCallback, 404, -32001, "Task not found.", isJsonRpc, rpcIdJson);
+            return;
+        }
+
+        Integer historyLength = extractHistoryLength(body);
+        if (historyLength != null && historyLength >= 0 && task.has("history") && task.get("history").isJsonArray()) {
+            JsonArray history = task.getAsJsonArray("history");
+            JsonArray trimmedHistory = new JsonArray();
+            int from = Math.max(0, history.size() - historyLength);
+            for (int i = from; i < history.size(); i++) {
+                trimmedHistory.add(history.get(i));
+            }
+            task.add("history", trimmedHistory);
+        }
+
+        sendResponse(responseCallback, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
+    }
+
+    private void handleTaskCancelRequest(HttpResponseReadyCallback responseCallback, String body, boolean isJsonRpc, String rpcIdJson) {
+        String taskId = extractTaskOperationId(body);
+        if (taskId == null || taskId.trim().isEmpty()) {
+            sendProtocolError(responseCallback, 400, -32602, "Missing required task id.", isJsonRpc, rpcIdJson);
+            return;
+        }
+
+        JsonObject existingTask = loadTask(taskId);
+        if (existingTask == null) {
+            sendProtocolError(responseCallback, 404, -32001, "Task not found.", isJsonRpc, rpcIdJson);
+            return;
+        }
+
+        String currentState = extractTaskState(existingTask);
+        if (isTerminalState(currentState)) {
+            sendProtocolError(responseCallback, 409, -32002,
+                    "Task cannot be canceled from state '" + currentState + "'.", isJsonRpc, rpcIdJson);
+            return;
+        }
+
+        JsonObject canceledTask = buildTask(taskId, extractTaskContextId(existingTask, taskId),
+                "canceled", "Task canceled by client request.", null);
+        if (existingTask.has("history")) {
+            canceledTask.add("history", existingTask.get("history").deepCopy());
+        }
+        persistTask(canceledTask);
+        sendResponse(responseCallback, 200, wrapTaskResponse(canceledTask, isJsonRpc, rpcIdJson));
+    }
+
     /**
-     * Returns {@code true} if the request body contains {@code "method":"tasks/sendSubscribe"},
-     * indicating an A2A streaming request that should respond with SSE.
+     * Handles a streaming A2A request ({@code message/stream} or legacy {@code tasks/sendSubscribe})
+     * by running the ReAct engine directly in a background thread and emitting A2A 0.3.0
+     * status-update / artifact-update events.
      */
-    /**
-     * Handles a streaming A2A request ({@code message/stream} or {@code tasks/sendSubscribe}) by
-     * running the ReAct engine directly in a background thread, writing one SSE
-     * {@code task-status-update} event after each tool/skill execution, and a final event when
-     * the agent produces its answer. This bypasses the Mule flow entirely so that events can
-     * be flushed incrementally rather than waiting for flow completion.
-     */
-    private void handleStreamingRequest(HttpResponseReadyCallback responseCallback, String body, String taskId) {
+    private void handleStreamingRequest(HttpResponseReadyCallback responseCallback, String body, String taskId, String contextId,
+                                        String rpcIdJson, boolean isJsonRpc) {
         String userMessage = extractUserMessage(body);
         try {
             PipedOutputStream pipedOut = new PipedOutputStream();
             PipedInputStream pipedIn = new PipedInputStream(pipedOut, 131072);
 
-            // Start the background thread BEFORE calling responseReady() so the PipedInputStream
-            // is never empty when the HTTP runtime tries to read it (avoids a deadlock where the
-            // read blocks on the same thread that would otherwise start the writer).
-            // Send an initial SSE comment immediately so the HTTP runtime commits the response
-            // headers and the client knows the stream is open before the first LLM round-trip.
+            JsonObject submittedTask = buildTask(taskId, contextId, "submitted", null, null);
+            persistTask(submittedTask);
+
             try {
                 pipedOut.write(": connected\n\n".getBytes(StandardCharsets.UTF_8));
+                pipedOut.write(buildTaskSseEvent(submittedTask, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
+                pipedOut.flush();
             } catch (Exception ignored) {}
 
             Thread thread = new Thread(() -> {
                 try {
                     ReactEngine engine = new ReactEngine(objectStoreManager);
                     ReactEngine.IterationCallback callback = (iteration, actionName, observation) -> {
+                        if (isTaskCanceled(taskId)) {
+                            return;
+                        }
                         try {
-                            // "calling..." is the sentinel emitted BEFORE tool execution.
-                            // Everything else is a post-execution result event.
                             String summary = "calling...".equals(observation)
                                     ? "[Step " + iteration + "] Calling '" + actionName + "'"
                                     : "[Step " + iteration + "] '" + actionName + "' completed";
-                            byte[] event = buildSseEvent(taskId, "working", summary, false)
-                                    .getBytes(StandardCharsets.UTF_8);
-                            pipedOut.write(event);
+                            JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
+                            persistTask(workingTask);
+                            pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "working", summary, false, isJsonRpc, rpcIdJson)
+                                    .getBytes(StandardCharsets.UTF_8));
                             pipedOut.flush();
                         } catch (Exception e) {
                             LOGGER.warn("Could not write SSE event for task {}: {}", taskId, e.getMessage());
                         }
                     };
+
                     org.mule.extension.agent.composer.internal.model.AgentResponse result =
                             engine.run(config, userMessage, taskId, config.getMaxIterations(), callback);
-                    if (result.isRequiresInput()) {
-                        // Agent paused — tell the client to supply more info and resume
-                        // by sending a new request with the same conversationId.
-                        LOGGER.info("[SSE task {}] Agent requires input: {}", taskId, result.getInputRequest());
-                        byte[] inputRequiredEvent = buildSseEvent(taskId, "input-required",
-                                result.getInputRequest(), true)
-                                .getBytes(StandardCharsets.UTF_8);
-                        pipedOut.write(inputRequiredEvent);
+
+                    if (isTaskCanceled(taskId)) {
+                        JsonObject canceledTask = getCanceledTask(taskId);
+                        if (canceledTask == null) {
+                            canceledTask = buildTask(taskId, contextId, "canceled", "Task canceled by client request.", null);
+                            persistTask(canceledTask);
+                        }
+                        pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "canceled",
+                                extractStatusMessage(canceledTask), true, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
                         pipedOut.flush();
-                    } else {
-                        byte[] finalEvent = buildSseEvent(taskId, "completed", result.getResponse(), true)
-                                .getBytes(StandardCharsets.UTF_8);
-                        pipedOut.write(finalEvent);
-                        pipedOut.flush();
+                        return;
                     }
+
+                    if (result.isRequiresInput()) {
+                        LOGGER.info("[SSE task {}] Agent requires input: {}", taskId, result.getInputRequest());
+                        JsonObject inputRequiredTask = buildTask(taskId, contextId, "input-required", result.getInputRequest(), null);
+                        persistTask(inputRequiredTask);
+                        pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "input-required",
+                                result.getInputRequest(), true, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
+                        pipedOut.flush();
+                        return;
+                    }
+
+                    JsonObject completedTask = buildTask(taskId, contextId, "completed", null, result.getResponse());
+                    persistTask(completedTask);
+                    pipedOut.write(buildArtifactUpdateSseEvent(taskId, contextId, result.getResponse(), isJsonRpc, rpcIdJson)
+                            .getBytes(StandardCharsets.UTF_8));
+                    pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "completed", null, true, isJsonRpc, rpcIdJson)
+                            .getBytes(StandardCharsets.UTF_8));
+                    pipedOut.flush();
                 } catch (Exception e) {
                     LOGGER.error("Streaming agent error for task {}: {}", taskId, e.getMessage(), e);
                     try {
-                        byte[] errEvent = buildSseEvent(taskId, "failed",
-                                "Agent execution failed: " + e.getMessage(), true)
-                                .getBytes(StandardCharsets.UTF_8);
-                        pipedOut.write(errEvent);
+                        JsonObject failedTask = buildTask(taskId, contextId, "failed",
+                                "Agent execution failed: " + e.getMessage(), null);
+                        persistTask(failedTask);
+                        pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "failed",
+                                "Agent execution failed: " + e.getMessage(), true, isJsonRpc, rpcIdJson)
+                                .getBytes(StandardCharsets.UTF_8));
                         pipedOut.flush();
                     } catch (Exception ignored) {}
                 } finally {
@@ -326,8 +472,6 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             thread.setDaemon(true);
             thread.start();
 
-            // Wire the response AFTER the writer thread is already running so the
-            // PipedInputStream will have data as soon as the HTTP runtime reads it.
             HttpResponse sseResponse = HttpResponse.builder()
                     .statusCode(200)
                     .addHeader("Content-Type", "text/event-stream; charset=UTF-8")
@@ -347,9 +491,100 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
         } catch (Exception e) {
             LOGGER.error("Failed to set up SSE stream for task {}: {}", taskId, e.getMessage(), e);
-            sendResponse(responseCallback, 500,
-                    buildA2AResponse(taskId, "failed", "Streaming setup failed: " + e.getMessage(), taskId));
+            JsonObject failedTask = buildTask(taskId, contextId, "failed", "Streaming setup failed: " + e.getMessage(), null);
+            persistTask(failedTask);
+            sendResponse(responseCallback, 200, wrapTaskResponse(failedTask, isJsonRpc, rpcIdJson));
         }
+    }
+
+    private String resolveContextId(String body, String taskId) {
+        String requestContextId = extractMessageContextId(body);
+        if (requestContextId != null && !requestContextId.trim().isEmpty()) {
+            return requestContextId.trim();
+        }
+        JsonObject storedTask = loadTask(taskId);
+        if (storedTask != null && storedTask.has("contextId") && !storedTask.get("contextId").isJsonNull()) {
+            return storedTask.get("contextId").getAsString();
+        }
+        return taskId;
+    }
+
+    private JsonObject getCanceledTask(String taskId) {
+        JsonObject storedTask = loadTask(taskId);
+        if (storedTask != null && "canceled".equals(extractTaskState(storedTask))) {
+            return storedTask;
+        }
+        return null;
+    }
+
+    private boolean isTaskCanceled(String taskId) {
+        return getCanceledTask(taskId) != null;
+    }
+
+    private void persistTask(JsonObject task) {
+        if (task == null || !task.has("id")) {
+            return;
+        }
+        try {
+            ObjectStore<Serializable> store = objectStoreManager.getObjectStore(config.getObjectStore());
+            String key = taskStoreKey(task.get("id").getAsString());
+            if (store.contains(key)) {
+                store.remove(key);
+            }
+            store.store(key, task.toString());
+        } catch (Exception e) {
+            LOGGER.warn("Could not persist A2A task snapshot: {}", e.getMessage());
+        }
+    }
+
+    private JsonObject loadTask(String taskId) {
+        if (taskId == null || taskId.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            ObjectStore<Serializable> store = objectStoreManager.getObjectStore(config.getObjectStore());
+            String key = taskStoreKey(taskId);
+            if (!store.contains(key)) {
+                return null;
+            }
+            String payload = (String) store.retrieve(key);
+            return JsonParser.parseString(payload).getAsJsonObject();
+        } catch (Exception e) {
+            LOGGER.warn("Could not load A2A task '{}' from store: {}", taskId, e.getMessage());
+            return null;
+        }
+    }
+
+    private static String taskStoreKey(String taskId) {
+        return TASK_STORE_PREFIX + taskId;
+    }
+
+    private static String stringifyPayload(TypedValue<Object> payload) {
+        return (payload != null && payload.getValue() != null) ? payload.getValue().toString() : "";
+    }
+
+    private static boolean isInputRequired(JsonObject agentResponse) {
+        return agentResponse != null
+                && agentResponse.has("requiresInput")
+                && !agentResponse.get("requiresInput").isJsonNull()
+                && agentResponse.get("requiresInput").getAsBoolean();
+    }
+
+    private static String extractInputRequest(JsonObject agentResponse, String rawPayload) {
+        if (agentResponse != null && agentResponse.has("inputRequest") && !agentResponse.get("inputRequest").isJsonNull()) {
+            return agentResponse.get("inputRequest").getAsString();
+        }
+        return rawPayload != null ? rawPayload : "";
+    }
+
+    private static String extractAgentOutput(String rawPayload, JsonObject agentResponse) {
+        if (agentResponse != null && agentResponse.has("response") && !agentResponse.get("response").isJsonNull()) {
+            JsonElement response = agentResponse.get("response");
+            return response.isJsonPrimitive() && response.getAsJsonPrimitive().isString()
+                    ? response.getAsString()
+                    : response.toString();
+        }
+        return rawPayload != null ? rawPayload : "";
     }
 
     /**
@@ -360,18 +595,20 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static String extractUserMessage(String body) {
         try {
             JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-            // JSON-RPC 2.0: params.message.parts[0].text
             if (root.has("params") && root.get("params").isJsonObject()) {
                 JsonObject params = root.getAsJsonObject("params");
                 if (params.has("message") && params.get("message").isJsonObject()) {
                     String text = firstTextPart(params.getAsJsonObject("message"));
-                    if (text != null) return text;
+                    if (text != null) {
+                        return text;
+                    }
                 }
             }
-            // Flat A2A: message.parts[0].text
             if (root.has("message") && root.get("message").isJsonObject()) {
                 String text = firstTextPart(root.getAsJsonObject("message"));
-                if (text != null) return text;
+                if (text != null) {
+                    return text;
+                }
             }
         } catch (Exception ignored) {}
         return body;
@@ -380,94 +617,335 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static String firstTextPart(JsonObject message) {
         try {
             JsonArray parts = message.getAsJsonArray("parts");
-            if (parts != null && parts.size() > 0) {
-                JsonObject part = parts.get(0).getAsJsonObject();
-                if (part.has("text")) return part.get("text").getAsString();
+            if (parts == null) {
+                return null;
+            }
+            for (JsonElement element : parts) {
+                if (element != null && element.isJsonObject()) {
+                    JsonObject part = element.getAsJsonObject();
+                    if (part.has("text") && !part.get("text").isJsonNull()) {
+                        return part.get("text").getAsString();
+                    }
+                }
             }
         } catch (Exception ignored) {}
         return null;
     }
 
-    private static boolean isStreamingRequest(String body) {
-        try {
-            JsonObject obj = JsonParser.parseString(body).getAsJsonObject();
-            if (!obj.has("method")) return false;
-            String method = obj.get("method").getAsString();
-            return "tasks/sendSubscribe".equals(method) || "message/stream".equals(method);
-        } catch (Exception ignored) {
-            return false;
-        }
-    }
-
-    /**
-     * Builds an A2A-compliant SSE event string.
-     * The {@code conversationId} (= taskId for streaming) is included so clients can
-     * resume a paused conversation by sending a new request with that id.
-     */
-    private static String buildSseEvent(String taskId, String state, String text, boolean isFinal) {
-        JsonObject part = new JsonObject();
-        part.addProperty("type", "text");
-        part.addProperty("text", text != null ? text : "");
-        JsonArray parts = new JsonArray();
-        parts.add(part);
-        JsonObject message = new JsonObject();
-        message.addProperty("role", "agent");
-        message.add("parts", parts);
-        JsonObject status = new JsonObject();
-        status.addProperty("state", state);
-        status.add("message", message);
-        JsonObject task = new JsonObject();
-        task.addProperty("id", taskId);
-        task.addProperty("conversationId", taskId);
-        task.add("status", status);
-        task.addProperty("final", isFinal);
-        return "event: task-status-update\ndata: " + task + "\n\n";
-    }
-
-    /**
-     * Extracts the task id from an A2A task JSON body.
-     * Falls back to a new UUID if not present.
-     */
-    private static String extractTaskId(String body) {
+    private static String extractMethodName(String body) {
         try {
             JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-            // JSON-RPC top-level id
-            if (root.has("id")) return root.get("id").getAsString();
-            // A2A flat envelope id
+            if (root.has("method") && !root.get("method").isJsonNull()) {
+                return root.get("method").getAsString();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static boolean isStreamingRequest(String methodName) {
+        return "message/stream".equals(methodName) || "tasks/sendSubscribe".equals(methodName);
+    }
+
+    private static boolean isTaskGetRequest(String methodName) {
+        return "tasks/get".equals(methodName);
+    }
+
+    private static boolean isTaskCancelRequest(String methodName) {
+        return "tasks/cancel".equals(methodName);
+    }
+
+    private static boolean isMessageSendRequest(String methodName) {
+        return methodName == null || "message/send".equals(methodName) || "tasks/send".equals(methodName);
+    }
+
+    private static String extractMessageTaskId(String body) {
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
             if (root.has("params") && root.get("params").isJsonObject()) {
                 JsonObject params = root.getAsJsonObject("params");
                 if (params.has("message") && params.get("message").isJsonObject()) {
-                    JsonObject msg = params.getAsJsonObject("message");
-                    if (msg.has("messageId")) return msg.get("messageId").getAsString();
+                    JsonObject message = params.getAsJsonObject("message");
+                    if (message.has("taskId") && !message.get("taskId").isJsonNull()) {
+                        return message.get("taskId").getAsString();
+                    }
+                }
+            }
+            if (root.has("message") && root.get("message").isJsonObject()) {
+                JsonObject message = root.getAsJsonObject("message");
+                if (message.has("taskId") && !message.get("taskId").isJsonNull()) {
+                    return message.get("taskId").getAsString();
                 }
             }
         } catch (Exception ignored) {}
         return UUID.randomUUID().toString();
     }
 
+    private static String extractMessageContextId(String body) {
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            if (root.has("params") && root.get("params").isJsonObject()) {
+                JsonObject params = root.getAsJsonObject("params");
+                if (params.has("message") && params.get("message").isJsonObject()) {
+                    JsonObject message = params.getAsJsonObject("message");
+                    if (message.has("contextId") && !message.get("contextId").isJsonNull()) {
+                        return message.get("contextId").getAsString();
+                    }
+                }
+            }
+            if (root.has("message") && root.get("message").isJsonObject()) {
+                JsonObject message = root.getAsJsonObject("message");
+                if (message.has("contextId") && !message.get("contextId").isJsonNull()) {
+                    return message.get("contextId").getAsString();
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static String extractTaskOperationId(String body) {
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            if (root.has("params") && root.get("params").isJsonObject()) {
+                JsonObject params = root.getAsJsonObject("params");
+                if (params.has("id") && !params.get("id").isJsonNull()) {
+                    return params.get("id").getAsString();
+                }
+            }
+            if (!root.has("jsonrpc") && root.has("id") && !root.get("id").isJsonNull()) {
+                return root.get("id").getAsString();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static Integer extractHistoryLength(String body) {
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            if (root.has("params") && root.get("params").isJsonObject()) {
+                JsonObject params = root.getAsJsonObject("params");
+                if (params.has("historyLength") && !params.get("historyLength").isJsonNull()) {
+                    return params.get("historyLength").getAsInt();
+                }
+            }
+            if (!root.has("jsonrpc") && root.has("historyLength") && !root.get("historyLength").isJsonNull()) {
+                return root.get("historyLength").getAsInt();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
     /**
-     * Builds an A2A-compliant Task response JSON, including the conversationId so
-     * clients can use it to resume a paused (input-required) conversation.
+     * Extracts the JSON-RPC {@code id} field from the request body as a raw JSON string,
+     * preserving its type (number vs string). Returns {@code null} if this is not a JSON-RPC request.
      */
-    private static String buildA2AResponse(String taskId, String state, String text, String conversationId) {
-        JsonObject part = new JsonObject();
-        part.addProperty("type", "text");
-        part.addProperty("text", text);
-        JsonArray parts = new JsonArray();
-        parts.add(part);
-        JsonObject message = new JsonObject();
-        message.addProperty("role", "agent");
-        message.add("parts", parts);
-        JsonObject status = new JsonObject();
-        status.addProperty("state", state);
-        status.add("message", message);
+    private static String extractRpcIdJson(String body) {
+        try {
+            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+            if (root.has("jsonrpc") && root.has("id")) {
+                return root.get("id").toString();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static JsonObject parseJsonObject(String text) {
+        try {
+            JsonElement parsed = JsonParser.parseString(text);
+            if (parsed.isJsonObject()) {
+                return parsed.getAsJsonObject();
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static JsonObject buildTask(String taskId, String contextId, String state, String statusText, String artifactText) {
+        String safeContextId = (contextId == null || contextId.trim().isEmpty()) ? taskId : contextId;
         JsonObject task = new JsonObject();
         task.addProperty("id", taskId);
-        if (conversationId != null) {
-            task.addProperty("conversationId", conversationId);
+        task.addProperty("contextId", safeContextId);
+        task.add("status", buildStatus(state, statusText, taskId, safeContextId));
+        if (artifactText != null) {
+            JsonArray artifacts = new JsonArray();
+            artifacts.add(buildArtifact(taskId, artifactText));
+            task.add("artifacts", artifacts);
         }
-        task.add("status", status);
-        return task.toString();
+        task.addProperty("kind", "task");
+        return task;
+    }
+
+    private static JsonObject buildStatus(String state, String text, String taskId, String contextId) {
+        JsonObject status = new JsonObject();
+        status.addProperty("state", state);
+        status.addProperty("timestamp", nowUtc());
+        if (text != null && !text.trim().isEmpty()) {
+            status.add("message", buildMessage(taskId, contextId, text));
+        }
+        return status;
+    }
+
+    private static JsonObject buildMessage(String taskId, String contextId, String text) {
+        JsonObject message = new JsonObject();
+        message.addProperty("role", "agent");
+        JsonArray parts = new JsonArray();
+        parts.add(buildTextPart(text, null));
+        message.add("parts", parts);
+        message.addProperty("messageId", UUID.randomUUID().toString());
+        message.addProperty("taskId", taskId);
+        message.addProperty("contextId", contextId);
+        message.addProperty("kind", "message");
+        return message;
+    }
+
+    private static JsonObject buildArtifact(String taskId, String payload) {
+        JsonObject artifact = new JsonObject();
+        artifact.addProperty("artifactId", taskId + "-response");
+        artifact.addProperty("name", "response");
+        JsonArray parts = new JsonArray();
+        parts.add(buildPayloadPart(payload));
+        artifact.add("parts", parts);
+        return artifact;
+    }
+
+    private static JsonObject buildPayloadPart(String payload) {
+        String safePayload = payload != null ? payload : "";
+        try {
+            JsonElement parsed = JsonParser.parseString(safePayload);
+            if (parsed.isJsonObject()) {
+                JsonObject part = new JsonObject();
+                part.addProperty("kind", "data");
+                part.add("data", parsed.getAsJsonObject());
+                JsonObject metadata = new JsonObject();
+                metadata.addProperty("mimeType", "application/json");
+                part.add("metadata", metadata);
+                return part;
+            }
+            return buildTextPart(safePayload, "application/json");
+        } catch (Exception ignored) {
+            return buildTextPart(safePayload, null);
+        }
+    }
+
+    private static JsonObject buildTextPart(String text, String mimeType) {
+        JsonObject part = new JsonObject();
+        part.addProperty("kind", "text");
+        part.addProperty("text", text != null ? text : "");
+        if (mimeType != null) {
+            JsonObject metadata = new JsonObject();
+            metadata.addProperty("mimeType", mimeType);
+            part.add("metadata", metadata);
+        }
+        return part;
+    }
+
+    private static String buildTaskSseEvent(JsonObject task, boolean isJsonRpc, String rpcIdJson) {
+        return wrapSseData(task, isJsonRpc, rpcIdJson);
+    }
+
+    private static String buildStatusUpdateSseEvent(String taskId, String contextId, String state, String text,
+                                                    boolean isFinal, boolean isJsonRpc, String rpcIdJson) {
+        JsonObject update = new JsonObject();
+        update.addProperty("taskId", taskId);
+        update.addProperty("contextId", contextId);
+        update.addProperty("kind", "status-update");
+        update.add("status", buildStatus(state, text, taskId, contextId));
+        update.addProperty("final", isFinal);
+        return wrapSseData(update, isJsonRpc, rpcIdJson);
+    }
+
+    private static String buildArtifactUpdateSseEvent(String taskId, String contextId, String payload,
+                                                      boolean isJsonRpc, String rpcIdJson) {
+        JsonObject update = new JsonObject();
+        update.addProperty("taskId", taskId);
+        update.addProperty("contextId", contextId);
+        update.addProperty("kind", "artifact-update");
+        update.add("artifact", buildArtifact(taskId, payload));
+        update.addProperty("lastChunk", true);
+        return wrapSseData(update, isJsonRpc, rpcIdJson);
+    }
+
+    private static String wrapSseData(JsonObject result, boolean isJsonRpc, String rpcIdJson) {
+        return "data: " + wrapResult(result, isJsonRpc, rpcIdJson) + "\n\n";
+    }
+
+    private static String wrapTaskResponse(JsonObject task, boolean isJsonRpc, String rpcIdJson) {
+        return wrapResult(task, isJsonRpc, rpcIdJson);
+    }
+
+    private static String wrapResult(JsonObject result, boolean isJsonRpc, String rpcIdJson) {
+        if (!isJsonRpc) {
+            return result.toString();
+        }
+        JsonObject response = new JsonObject();
+        response.addProperty("jsonrpc", "2.0");
+        response.add("id", parseRpcId(rpcIdJson));
+        response.add("result", result);
+        return response.toString();
+    }
+
+    private static void sendProtocolError(HttpResponseReadyCallback responseCallback, int httpStatus, int code, String message,
+                                          boolean isJsonRpc, String rpcIdJson) {
+        JsonObject errorBody = new JsonObject();
+        if (isJsonRpc) {
+            errorBody.addProperty("jsonrpc", "2.0");
+            errorBody.add("id", parseRpcId(rpcIdJson));
+            JsonObject error = new JsonObject();
+            error.addProperty("code", code);
+            error.addProperty("message", message);
+            errorBody.add("error", error);
+            sendResponse(responseCallback, 200, errorBody.toString());
+            return;
+        }
+
+        errorBody.addProperty("code", code);
+        errorBody.addProperty("error", message);
+        sendResponse(responseCallback, httpStatus, errorBody.toString());
+    }
+
+    private static JsonElement parseRpcId(String rpcIdJson) {
+        if (rpcIdJson == null) {
+            return JsonNull.INSTANCE;
+        }
+        try {
+            return JsonParser.parseString(rpcIdJson);
+        } catch (Exception ignored) {
+            return JsonNull.INSTANCE;
+        }
+    }
+
+    private static String extractTaskState(JsonObject task) {
+        try {
+            return task.getAsJsonObject("status").get("state").getAsString();
+        } catch (Exception ignored) {
+            return "unknown";
+        }
+    }
+
+    private static String extractTaskContextId(JsonObject task, String fallback) {
+        if (task != null && task.has("contextId") && !task.get("contextId").isJsonNull()) {
+            return task.get("contextId").getAsString();
+        }
+        return fallback;
+    }
+
+    private static String extractStatusMessage(JsonObject task) {
+        try {
+            JsonObject status = task.getAsJsonObject("status");
+            if (status != null && status.has("message") && status.get("message").isJsonObject()) {
+                return firstTextPart(status.getAsJsonObject("message"));
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static boolean isTerminalState(String state) {
+        return "completed".equals(state)
+                || "failed".equals(state)
+                || "canceled".equals(state)
+                || "rejected".equals(state);
+    }
+
+    private static String nowUtc() {
+        return OffsetDateTime.now(ZoneOffset.UTC).toString();
     }
 
     private static void sendResponse(
