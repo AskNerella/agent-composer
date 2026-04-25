@@ -63,7 +63,7 @@ import java.util.UUID;
  *
  * <p>Typical developer flow:
  * <pre>
- *   [Agent Listener] → [Execute Agent (userMessage="#[payload]")]
+ *   [Agent Listener] → [Execute Agent]
  * </pre>
  */
 @EmitsResponse
@@ -82,6 +82,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static final String IS_STREAMING_VAR = "isStreaming";
     private static final String TASK_STORE_PREFIX = "a2a:task:";
     private static final String WELL_KNOWN_CARD_PATH = "/.well-known/agent-card.json";
+    private static final String SCOPED_CARD_SUFFIX = "/.well-known/agent-card.json";
     private static final String LEGACY_CARD_SUFFIX = "/.well-known/agent.json";
 
     @Config
@@ -96,6 +97,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private HttpServer httpServer;
     private RequestHandlerManager agentHandlerManager;
     private RequestHandlerManager cardHandlerManager;
+    private RequestHandlerManager scopedCardHandlerManager;
     private RequestHandlerManager legacyCardHandlerManager;
 
     @Override
@@ -116,9 +118,13 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
 
-        // ── GET /.well-known/agent-card.json (plus legacy alias) ───────────
+        // ── GET /.well-known/agent-card.json (plus scoped and legacy aliases) ───────────
+        String scopedCardPath = normalizedPath + SCOPED_CARD_SUFFIX;
         String legacyCardPath = normalizedPath + LEGACY_CARD_SUFFIX;
         cardHandlerManager = addCardHandler(WELL_KNOWN_CARD_PATH, cardBytes);
+        if (!WELL_KNOWN_CARD_PATH.equals(scopedCardPath)) {
+            scopedCardHandlerManager = addCardHandler(scopedCardPath, cardBytes);
+        }
         if (!WELL_KNOWN_CARD_PATH.equals(legacyCardPath)) {
             legacyCardHandlerManager = addCardHandler(legacyCardPath, cardBytes);
         }
@@ -154,13 +160,6 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 String remoteAddr = requestCtx.getClientConnection() != null
                         ? requestCtx.getClientConnection().getRemoteHostAddress().toString() : "unknown";
 
-                AgentListenerAttributes attributes = new AgentListenerAttributes(
-                        method,
-                        requestCtx.getRequest().getPath(),
-                        remoteAddr,
-                        headers,
-                        requestId);
-
                 String rpcIdJson = extractRpcIdJson(body);
                 boolean isJsonRpc = rpcIdJson != null;
                 String methodName = extractMethodName(body);
@@ -181,9 +180,18 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     return;
                 }
 
-                // Store HTTP callback in context so @OnSuccess / @OnError can send the response
+                String requestContextId = extractMessageContextId(body);
                 String taskId = extractMessageTaskId(body);
-                String contextId = resolveContextId(body, taskId);
+                String contextId = resolveContextId(requestContextId, taskId);
+
+                AgentListenerAttributes attributes = new AgentListenerAttributes(
+                        method,
+                        requestCtx.getRequest().getPath(),
+                        remoteAddr,
+                        headers,
+                        requestId);
+
+                // Store HTTP callback in context so @OnSuccess / @OnError can send the response
                 persistTask(buildTask(taskId, contextId, "submitted", null, null));
 
                 // ── Streaming: message/stream or tasks/sendSubscribe ─────────
@@ -229,6 +237,9 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         }
         if (cardHandlerManager != null) {
             cardHandlerManager.stop();
+        }
+        if (scopedCardHandlerManager != null) {
+            scopedCardHandlerManager.stop();
         }
         if (legacyCardHandlerManager != null) {
             legacyCardHandlerManager.stop();
@@ -423,7 +434,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     };
 
                     org.mule.extension.agent.composer.internal.model.AgentResponse result =
-                            engine.run(config, userMessage, taskId, config.getMaxIterations(), callback);
+                            engine.run(config, userMessage, contextId, 5, callback);
 
                     if (isTaskCanceled(taskId)) {
                         JsonObject canceledTask = getCanceledTask(taskId);
@@ -497,8 +508,12 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         }
     }
 
-    private String resolveContextId(String body, String taskId) {
-        String requestContextId = extractMessageContextId(body);
+    /**
+     * Uses the caller-supplied A2A {@code message.contextId} as the conversation key whenever present.
+     * For follow-up task operations we fall back to the previously stored task context, and only derive
+     * a new context from {@code taskId} when the client omitted a context entirely.
+     */
+    private String resolveContextId(String requestContextId, String taskId) {
         if (requestContextId != null && !requestContextId.trim().isEmpty()) {
             return requestContextId.trim();
         }

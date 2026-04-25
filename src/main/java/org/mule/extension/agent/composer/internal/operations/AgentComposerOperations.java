@@ -31,6 +31,8 @@ import static org.mule.sdk.api.annotation.param.MediaType.APPLICATION_JSON;
 public class AgentComposerOperations {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(AgentComposerOperations.class);
+    private static final Gson GSON = new Gson();
+    private static final int DEFAULT_MAX_ITERATIONS = 5;
 
     @Inject
     private ObjectStoreManager objectStoreManager;
@@ -53,7 +55,7 @@ public class AgentComposerOperations {
             String userMessage,
 
             @DisplayName("Conversation ID")
-            @Summary("Key that scopes this conversation within the Object Store. Defaults to the Mule correlation ID.")
+            @Summary("Key that scopes this conversation within the Object Store. Defaults to the A2A message.contextId when present, otherwise the Mule correlation ID.")
             @Optional(defaultValue = "#[correlationId]")
             String conversationId,
 
@@ -64,7 +66,7 @@ public class AgentComposerOperations {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
         AgentResponse response = engine.run(config, userMessage, conversationId, maxIterations);
-        return new Gson().toJson(response);
+        return GSON.toJson(response);
     }
 
     // ── Evaluate Agent ────────────────────────────────────────────────────────
@@ -119,7 +121,7 @@ public class AgentComposerOperations {
         result.put("provider", String.valueOf(config.getProvider()));
         result.put("modelName", config.getModelName());
 
-        return new Gson().toJson(result);
+        return GSON.toJson(result);
     }
 
     // ── Memory Operations ─────────────────────────────────────────────────────
@@ -136,7 +138,7 @@ public class AgentComposerOperations {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
         Map<String, Object> result = engine.resetMemory(config.getObjectStore());
-        return new Gson().toJson(result);
+        return GSON.toJson(result);
     }
 
     /**
@@ -162,7 +164,7 @@ public class AgentComposerOperations {
         ReactEngine engine = new ReactEngine(objectStoreManager);
         Map<String, Object> result = engine.checkMemory(config, userTask, config.getObjectStore(),
                 maxResults != null ? maxResults : 3);
-        return new Gson().toJson(result);
+        return GSON.toJson(result);
     }
 
     /**
@@ -181,7 +183,7 @@ public class AgentComposerOperations {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
         Map<String, Object> result = engine.retrieveConversation(sessionId, config.getObjectStore());
-        return new Gson().toJson(result);
+        return GSON.toJson(result);
     }
 
     /**
@@ -211,6 +213,6 @@ public class AgentComposerOperations {
 
         ReactEngine engine = new ReactEngine(objectStoreManager);
         Map<String, Object> result = engine.deleteConversation(sessionId, userTask, config.getObjectStore());
-        return new Gson().toJson(result);
+        return GSON.toJson(result);
     }
 }

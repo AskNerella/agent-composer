@@ -93,27 +93,11 @@ public class AgentComposerConfiguration {
   private String agentPath;
 
   @Parameter
-  @DisplayName("Public Host")
-  @Summary("Publicly reachable hostname or IP for this agent (used in the A2A agent card URL). "
-          + "Leave blank to use the HTTP listener's bound address.")
-  @Optional
-  @Placement(order = 9)
-  private String publicHost;
-
-  @Parameter
   @DisplayName("Request Timeout (seconds)")
   @Summary("Seconds to wait for the Mule flow to produce a response before returning HTTP 504.")
   @Optional(defaultValue = "300")
   @Placement(order = 9)
   private int requestTimeoutSeconds;
-
-  @Parameter
-  @DisplayName("Max Iterations")
-  @Summary("Maximum ReAct loop iterations per request (applies to both streaming and non-streaming).")
-  @Optional(defaultValue = "10")
-  @Placement(order = 10)
-  private int maxIterations;
-
   // ── Agent ─────────────────────────────────────────────────────────────────
 
   @Parameter
@@ -190,12 +174,10 @@ public class AgentComposerConfiguration {
   public String getObjectStore()              { return objectStore; }
   public String getHttpListenerConfig()       { return httpListenerConfig; }
   public String getAgentPath()                { return agentPath; }
-  public String getPublicHost()               { return publicHost; }
   public int getRequestTimeoutSeconds()       { return requestTimeoutSeconds; }
   public String getAgentName()                { return agentName; }
   public String getAgentDescription()         { return agentDescription; }
   public String getAgentVersion()             { return agentVersion; }
   public List<AgentSkillConfig> getSkills()   { return skills; }
   public boolean isIncludeMcpToolsAsSkills()  { return includeMcpToolsAsSkills; }
-  public int getMaxIterations()               { return maxIterations <= 0 ? 10 : maxIterations; }
 }

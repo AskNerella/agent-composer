@@ -76,7 +76,7 @@ Runs the ReAct loop and returns a structured JSON response with the final answer
 | Parameter | Default | Description |
 |---|---|---|
 | User Message | `#[payload]` | The user's input for this turn |
-| Conversation ID | `#[correlationId]` | Key scoping this conversation in the Object Store |
+| Conversation ID | `#[correlationId]` | Key scoping this conversation in the Object Store; A2A `message.contextId` is used automatically when present |
 | Max Iterations | `5` | Hard cap on Reason-Act cycles |
 
 **Typical flow:**
@@ -102,7 +102,9 @@ The **Agent Listener** source appears in the Anypoint Studio palette under **Tri
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/.well-known/agent-card.json` | `GET` | Serves the A2A 0.3.0 agent card (a legacy `{agentPath}/.well-known/agent.json` alias is also exposed) |
+| `/.well-known/agent-card.json` | `GET` | Serves the A2A 0.3.0 agent card |
+| `{agentPath}/.well-known/agent-card.json` | `GET` | Scoped alias for environments where the root well-known path is not exposed through the listener |
+| `{agentPath}/.well-known/agent.json` | `GET` | Legacy compatibility alias |
 | `{agentPath}` | `POST` | Receives A2A JSON-RPC calls such as `message/send`, `message/stream`, `tasks/get`, and `tasks/cancel` |
 
 Completed responses are returned in the **A2A 0.3.0 Task response structure**, with the agent payload in `artifacts` so A2A clients surface it under the response/output area instead of the general status area:
@@ -125,6 +127,9 @@ Completed responses are returned in the **A2A 0.3.0 Task response structure**, w
 ```
 
 `input-required`, `failed`, and `canceled` states still use `status.message` for the human-readable update.
+
+When `Execute Agent` is invoked directly after `Agent Listener`, leave `User Message`, `Conversation ID`, and `Max Iterations` at their defaults unless you want to override them.
+The operation unwraps A2A request bodies automatically, using `message.parts[].text` as the user input, `message.contextId` as the conversation key, and the operation-level `Max Iterations` value for the React loop.
 
 ---
 

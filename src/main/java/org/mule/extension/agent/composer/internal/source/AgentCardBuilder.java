@@ -34,16 +34,15 @@ public class AgentCardBuilder {
 
     /**
      * Builds the A2A agent card with an absolute URL derived from the HTTP server's
-     * bound address (host + port).  If the server is bound to {@code 0.0.0.0} or
-     * {@code ::} the {@code publicHost} config value is used instead; if that is
-     * also absent it falls back to {@code localhost}.
+     * bound address (host + port). If the listener is bound to a wildcard address,
+     * the builder falls back to the Mule host system property and then to {@code localhost}.
      */
     public static String build(AgentComposerConfiguration config, HttpServer httpServer) {
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
 
-        // Resolve host: prefer explicit publicHost, then server IP (if not wildcard),
-        // then mule.host system property, else "localhost".
+        // Resolve host from the bound server address when possible, then fall back
+        // to mule.host and finally localhost for wildcard listener bindings.
         String host = System.getProperty("mule.host", "localhost");
         int port = 8081;
         try {
@@ -62,10 +61,6 @@ public class AgentCardBuilder {
                     host = boundIp;
                 }
             } catch (Exception ignored) {}
-        }
-        String publicHost = config.getPublicHost();
-        if (publicHost != null && !publicHost.trim().isEmpty()) {
-            host = publicHost.trim();
         }
 
         String scheme = (port == 443 || port == 8443) ? "https" : "http";
