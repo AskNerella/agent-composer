@@ -7,6 +7,7 @@ import org.mule.extension.agent.composer.internal.configs.AgentSkillConfig;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.mcp.McpClient;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
+import org.mule.runtime.http.api.server.HttpServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,15 +33,43 @@ public class AgentCardBuilder {
     private AgentCardBuilder() {}
 
     /**
-     * Builds the A2A agent card. The {@code url} field is left as a relative path
-     * since the host/port are owned by the referenced {@code http:listener-config}.
+     * Builds the A2A agent card with an absolute URL derived from the HTTP server's
+     * bound address (host + port).  If the server is bound to {@code 0.0.0.0} or
+     * {@code ::} the {@code publicHost} config value is used instead; if that is
+     * also absent it falls back to {@code localhost}.
      */
-    public static String build(AgentComposerConfiguration config) {
+    public static String build(AgentComposerConfiguration config, HttpServer httpServer) {
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
-        // The url is relative — callers who need an absolute URL should prepend
-        // the host/port from the referenced http:listener-config themselves.
-        String agentUrl = normalizedPath;
+
+        // Resolve host: prefer explicit publicHost, then server IP (if not wildcard),
+        // then mule.host system property, else "localhost".
+        String host = System.getProperty("mule.host", "localhost");
+        int port = 8081;
+        try {
+            String mulePort = System.getProperty("mule.port");
+            if (mulePort != null && !mulePort.isEmpty()) {
+                port = Integer.parseInt(mulePort);
+            }
+        } catch (NumberFormatException ignored) {}
+
+        if (httpServer != null) {
+            try {
+                port = httpServer.getServerAddress().getPort();
+                String boundIp = httpServer.getServerAddress().getIp();
+                if (boundIp != null && !boundIp.isEmpty()
+                        && !boundIp.equals("0.0.0.0") && !boundIp.equals("::")) {
+                    host = boundIp;
+                }
+            } catch (Exception ignored) {}
+        }
+        String publicHost = config.getPublicHost();
+        if (publicHost != null && !publicHost.trim().isEmpty()) {
+            host = publicHost.trim();
+        }
+
+        String scheme = (port == 443 || port == 8443) ? "https" : "http";
+        String agentUrl = scheme + "://" + host + ":" + port + normalizedPath;
 
         Map<String, Object> card = new LinkedHashMap<>();
         card.put("name", nonEmpty(config.getAgentName(), "Agent Composer"));
@@ -49,20 +78,28 @@ public class AgentCardBuilder {
         card.put("url", agentUrl);
 
         Map<String, Object> capabilities = new LinkedHashMap<>();
-        capabilities.put("streaming", false);
+        capabilities.put("streaming", true);
         capabilities.put("pushNotifications", false);
         capabilities.put("stateTransitionHistory", true);
         card.put("capabilities", capabilities);
 
         card.put("defaultInputModes", Collections.singletonList("text"));
         card.put("defaultOutputModes", Collections.singletonList("text"));
-        card.put("skills", buildSkills(config.getMcpServers(), config.getSkills()));
+        card.put("skills", buildSkills(config.getMcpServers(), config.getSkills(),
+                config.isIncludeMcpToolsAsSkills()));
 
         return GSON.toJson(card);
     }
 
+    /** @deprecated Use {@link #build(AgentComposerConfiguration, HttpServer)} for an absolute URL. */
+    @Deprecated
+    public static String build(AgentComposerConfiguration config) {
+        return build(config, null);
+    }
+
     private static List<Map<String, Object>> buildSkills(List<McpServerConfig> mcpServers,
-                                                          List<AgentSkillConfig> configuredSkills) {
+                                                          List<AgentSkillConfig> configuredSkills,
+                                                          boolean includeMcpToolsAsSkills) {
         List<Map<String, Object>> skills = new ArrayList<>();
 
         // Configured skills go first — only name + description to avoid context overflow
@@ -72,12 +109,15 @@ public class AgentCardBuilder {
                 entry.put("id", skill.getName());
                 entry.put("name", skill.getName());
                 entry.put("description", nonEmpty(skill.getDescription(), ""));
+                if (skill.getTags() != null && !skill.getTags().isEmpty()) {
+                    entry.put("tags", skill.getTagList());
+                }
                 skills.add(entry);
             }
         }
 
-        // MCP tool skills (auto-discovered)
-        if (mcpServers != null && !mcpServers.isEmpty()) {
+        // MCP tool skills (auto-discovered) — controlled by the includeMcpToolsAsSkills flag.
+        if (includeMcpToolsAsSkills && mcpServers != null && !mcpServers.isEmpty()) {
             McpClient mcpClient = new McpClient();
             for (McpServerConfig server : mcpServers) {
                 try {

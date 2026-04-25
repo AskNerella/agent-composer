@@ -23,6 +23,10 @@ public class AgentResponse {
     private boolean cacheHit;
     private String conversationSummary;
     private List<ToolCallRecord> toolCalls = new ArrayList<>();
+    /** True when the agent paused and is waiting for the user to supply more information. */
+    private boolean requiresInput;
+    /** The clarifying question the agent wants answered before it can continue. */
+    private String inputRequest;
 
     public AgentResponse() {}
 
@@ -49,6 +53,8 @@ public class AgentResponse {
     public boolean isCacheHit() { return cacheHit; }
     public String getConversationSummary() { return conversationSummary; }
     public List<ToolCallRecord> getToolCalls() { return toolCalls; }
+    public boolean isRequiresInput() { return requiresInput; }
+    public String getInputRequest() { return inputRequest; }
 
     // Setters
     public void setUserTask(String userTask) { this.userTask = userTask; }
@@ -63,6 +69,8 @@ public class AgentResponse {
     public void setCacheHit(boolean cacheHit) { this.cacheHit = cacheHit; }
     public void setConversationSummary(String conversationSummary) { this.conversationSummary = conversationSummary; }
     public void setToolCalls(List<ToolCallRecord> toolCalls) { this.toolCalls = toolCalls; }
+    public void setRequiresInput(boolean requiresInput) { this.requiresInput = requiresInput; }
+    public void setInputRequest(String inputRequest) { this.inputRequest = inputRequest; }
 
     public void addToolCall(ToolCallRecord record) {
         this.toolCalls.add(record);

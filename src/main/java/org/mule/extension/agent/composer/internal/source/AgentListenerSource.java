@@ -96,8 +96,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                             + configName + "'. Ensure this name matches an <http:listener-config> in your Mule app.", e));
         }
 
-        // Build agent card once at startup
-        String agentCardJson = AgentCardBuilder.build(config);
+        // Build agent card once at startup — pass httpServer so the URL is absolute
+        String agentCardJson = AgentCardBuilder.build(config, httpServer);
         byte[] cardBytes  = agentCardJson.getBytes(StandardCharsets.UTF_8);
 
         String normalizedPath = config.getAgentPath().startsWith("/")
@@ -212,7 +212,17 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String taskId = callbackContext.<String>getVariable(TASK_ID_VAR).orElse(UUID.randomUUID().toString());
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
             String text = (payload != null && payload.getValue() != null) ? payload.getValue().toString() : "";
-            sendResponse(cb, 200, buildA2AResponse(taskId, "completed", text));
+            // The Mule flow may return a JSON AgentResponse — check for input-required.
+            try {
+                com.google.gson.JsonObject parsed = com.google.gson.JsonParser.parseString(text).getAsJsonObject();
+                if (parsed.has("requiresInput") && parsed.get("requiresInput").getAsBoolean()) {
+                    String question = parsed.has("inputRequest") ? parsed.get("inputRequest").getAsString() : text;
+                    String conversationId = parsed.has("sessionId") ? parsed.get("sessionId").getAsString() : taskId;
+                    sendResponse(cb, 200, buildA2AResponse(taskId, "input-required", question, conversationId));
+                    return;
+                }
+            } catch (Exception ignored) {}
+            sendResponse(cb, 200, buildA2AResponse(taskId, "completed", text, taskId));
         });
     }
 
@@ -224,7 +234,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     public void onTerminate(SourceCallbackContext callbackContext) {
         String taskId = callbackContext.<String>getVariable(TASK_ID_VAR).orElse(UUID.randomUUID().toString());
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb ->
-            sendResponse(cb, 503, buildA2AResponse(taskId, "canceled", "Flow terminated before response was sent")));
+            sendResponse(cb, 503, buildA2AResponse(taskId, "canceled", "Flow terminated before response was sent", taskId)));
     }
 
     @OnError
@@ -234,7 +244,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String msg = error != null ? error.getDescription() : "unknown";
         LOGGER.error("Flow error for agent request {}: {}", requestId, msg);
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb ->
-                sendResponse(cb, 500, buildA2AResponse(taskId, "failed", msg)));
+                sendResponse(cb, 500, buildA2AResponse(taskId, "failed", msg, taskId)));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -259,12 +269,22 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             // Start the background thread BEFORE calling responseReady() so the PipedInputStream
             // is never empty when the HTTP runtime tries to read it (avoids a deadlock where the
             // read blocks on the same thread that would otherwise start the writer).
+            // Send an initial SSE comment immediately so the HTTP runtime commits the response
+            // headers and the client knows the stream is open before the first LLM round-trip.
+            try {
+                pipedOut.write(": connected\n\n".getBytes(StandardCharsets.UTF_8));
+            } catch (Exception ignored) {}
+
             Thread thread = new Thread(() -> {
                 try {
                     ReactEngine engine = new ReactEngine(objectStoreManager);
                     ReactEngine.IterationCallback callback = (iteration, actionName, observation) -> {
                         try {
-                            String summary = "[Step " + iteration + "] Using '" + actionName + "'";
+                            // "calling..." is the sentinel emitted BEFORE tool execution.
+                            // Everything else is a post-execution result event.
+                            String summary = "calling...".equals(observation)
+                                    ? "[Step " + iteration + "] Calling '" + actionName + "'"
+                                    : "[Step " + iteration + "] '" + actionName + "' completed";
                             byte[] event = buildSseEvent(taskId, "working", summary, false)
                                     .getBytes(StandardCharsets.UTF_8);
                             pipedOut.write(event);
@@ -274,11 +294,22 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         }
                     };
                     org.mule.extension.agent.composer.internal.model.AgentResponse result =
-                            engine.run(config, userMessage, taskId, 10, callback);
-                    byte[] finalEvent = buildSseEvent(taskId, "completed", result.getResponse(), true)
-                            .getBytes(StandardCharsets.UTF_8);
-                    pipedOut.write(finalEvent);
-                    pipedOut.flush();
+                            engine.run(config, userMessage, taskId, config.getMaxIterations(), callback);
+                    if (result.isRequiresInput()) {
+                        // Agent paused — tell the client to supply more info and resume
+                        // by sending a new request with the same conversationId.
+                        LOGGER.info("[SSE task {}] Agent requires input: {}", taskId, result.getInputRequest());
+                        byte[] inputRequiredEvent = buildSseEvent(taskId, "input-required",
+                                result.getInputRequest(), true)
+                                .getBytes(StandardCharsets.UTF_8);
+                        pipedOut.write(inputRequiredEvent);
+                        pipedOut.flush();
+                    } else {
+                        byte[] finalEvent = buildSseEvent(taskId, "completed", result.getResponse(), true)
+                                .getBytes(StandardCharsets.UTF_8);
+                        pipedOut.write(finalEvent);
+                        pipedOut.flush();
+                    }
                 } catch (Exception e) {
                     LOGGER.error("Streaming agent error for task {}: {}", taskId, e.getMessage(), e);
                     try {
@@ -317,7 +348,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         } catch (Exception e) {
             LOGGER.error("Failed to set up SSE stream for task {}: {}", taskId, e.getMessage(), e);
             sendResponse(responseCallback, 500,
-                    buildA2AResponse(taskId, "failed", "Streaming setup failed: " + e.getMessage()));
+                    buildA2AResponse(taskId, "failed", "Streaming setup failed: " + e.getMessage(), taskId));
         }
     }
 
@@ -370,6 +401,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
     /**
      * Builds an A2A-compliant SSE event string.
+     * The {@code conversationId} (= taskId for streaming) is included so clients can
+     * resume a paused conversation by sending a new request with that id.
      */
     private static String buildSseEvent(String taskId, String state, String text, boolean isFinal) {
         JsonObject part = new JsonObject();
@@ -385,6 +418,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         status.add("message", message);
         JsonObject task = new JsonObject();
         task.addProperty("id", taskId);
+        task.addProperty("conversationId", taskId);
         task.add("status", status);
         task.addProperty("final", isFinal);
         return "event: task-status-update\ndata: " + task + "\n\n";
@@ -412,9 +446,10 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     }
 
     /**
-     * Builds an A2A-compliant Task response JSON.
+     * Builds an A2A-compliant Task response JSON, including the conversationId so
+     * clients can use it to resume a paused (input-required) conversation.
      */
-    private static String buildA2AResponse(String taskId, String state, String text) {
+    private static String buildA2AResponse(String taskId, String state, String text, String conversationId) {
         JsonObject part = new JsonObject();
         part.addProperty("type", "text");
         part.addProperty("text", text);
@@ -428,6 +463,9 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         status.add("message", message);
         JsonObject task = new JsonObject();
         task.addProperty("id", taskId);
+        if (conversationId != null) {
+            task.addProperty("conversationId", conversationId);
+        }
         task.add("status", status);
         return task.toString();
     }

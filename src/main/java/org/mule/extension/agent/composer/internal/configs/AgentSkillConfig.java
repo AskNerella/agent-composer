@@ -20,12 +20,9 @@ import java.util.stream.Collectors;
  * <p>When the LLM calls a skill, the engine runs a focused sub-loop using:
  * <ul>
  *   <li>{@code instructions} – injected as the system prompt for the sub-loop.</li>
- *   <li>{@code tools} – comma-separated whitelist of MCP tool names the skill may invoke
- *       (empty = all available MCP tools).</li>
  * </ul>
- *
- * <p>Only {@code name} and {@code description} are included in the A2A agent card to
- * avoid context overflow.
+ * All MCP tools configured on the parent agent are available to the skill;
+ * the skill's own instructions guide which ones to use.
  */
 public class AgentSkillConfig {
 
@@ -51,30 +48,25 @@ public class AgentSkillConfig {
     private String instructions;
 
     @Parameter
-    @DisplayName("Tools")
-    @Summary("Comma-separated list of MCP tool names this skill is allowed to use "
-            + "(e.g. confluence_search,confluence_get_page). Leave empty to allow all tools.")
+    @DisplayName("Tags")
+    @Summary("Comma-separated tags advertising this skill's capabilities in the A2A agent card (e.g. 'jira, ticketing, issues').")
     @Optional
     @Placement(order = 4)
-    private String tools;
+    private String tags;
 
     // ── getters ───────────────────────────────────────────────────────────────
 
     public String getName() { return name; }
     public String getDescription() { return description; }
     public String getInstructions() { return instructions; }
+    public String getTags() { return tags; }
 
-    /**
-     * Returns the tool whitelist as a list by splitting the comma-separated {@code tools} string.
-     * Returns an empty list (= allow all) when the field is blank or null.
-     */
-    public List<String> getToolList() {
-        if (tools == null || tools.trim().isEmpty()) {
-            return Collections.emptyList();
-        }
-        return Arrays.stream(tools.split(","))
+    /** Returns {@link #tags} split on commas, trimmed, with blank entries removed. */
+    public List<String> getTagList() {
+        if (tags == null || tags.trim().isEmpty()) return Collections.emptyList();
+        return Arrays.stream(tags.split(","))
                 .map(String::trim)
-                .filter(s -> !s.isEmpty())
+                .filter(t -> !t.isEmpty())
                 .collect(Collectors.toList());
     }
 }

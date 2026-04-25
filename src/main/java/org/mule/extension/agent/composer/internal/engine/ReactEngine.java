@@ -58,6 +58,30 @@ public class ReactEngine {
             "delete", "remove", "drop", "clear", "reset", "destroy", "wipe", "purge",
             "disable", "enable", "toggle", "send", "submit", "publish", "deploy", "push");
 
+    /**
+     * Built-in tool always added to every LLM call.
+     * When the LLM calls this, the engine pauses and returns an {@code input-required}
+     * state so the client can supply the missing information, then resume with the
+     * same {@code conversationId}.
+     */
+    private static final ToolDefinition REQUEST_CLARIFICATION_TOOL;
+    static {
+        Map<String, Object> schema = new java.util.LinkedHashMap<>();
+        schema.put("type", "object");
+        Map<String, Object> props = new java.util.LinkedHashMap<>();
+        Map<String, Object> questionProp = new java.util.LinkedHashMap<>();
+        questionProp.put("type", "string");
+        questionProp.put("description", "The clarifying question to ask the user.");
+        props.put("question", questionProp);
+        schema.put("properties", props);
+        schema.put("required", Collections.singletonList("question"));
+        REQUEST_CLARIFICATION_TOOL = new ToolDefinition(
+                "request_clarification",
+                "Use this tool when you lack critical information needed to complete the task. "
+                + "Ask the user a specific question. They will reply with the same conversationId to resume.",
+                schema, null);
+    }
+
     /** Callback invoked after each tool or skill execution in the ReAct loop. */
     @FunctionalInterface
     public interface IterationCallback {
@@ -109,9 +133,24 @@ public class ReactEngine {
         List<ToolDefinition> mcpTools = discoverMcpTools(mcpServers);
         List<AgentSkillConfig> skills = config.getSkills() != null ? config.getSkills() : Collections.emptyList();
         List<ToolDefinition> skillTools = buildSkillTools(skills);
-        List<ToolDefinition> allTools = new ArrayList<>(mcpTools);
-        allTools.addAll(skillTools);
-        LOGGER.info("MCP tools available ({}): {}", mcpTools.size(),
+        boolean includeMcpToolsAsSkills = config.isIncludeMcpToolsAsSkills();
+
+        // Build the tool list offered to the top-level LLM.
+        // • Skills defined + includeMcpToolsAsSkills=true  → skill tools + raw MCP tools
+        // • Skills defined + includeMcpToolsAsSkills=false → skill tools only (hides raw MCP)
+        // • No skills + includeMcpToolsAsSkills=true       → raw MCP tools only
+        // • No skills + includeMcpToolsAsSkills=false      → no tools (LLM reasons with text only)
+        // In all cases the built-in request_clarification tool is always appended.
+        List<ToolDefinition> allTools = new ArrayList<>();
+        if (!skills.isEmpty()) {
+            allTools.addAll(skillTools);
+        }
+        if (includeMcpToolsAsSkills) {
+            allTools.addAll(mcpTools);
+        }
+        allTools.add(REQUEST_CLARIFICATION_TOOL);
+        LOGGER.info("MCP tools available ({}) | includeMcpToolsAsSkills={}: {}", mcpTools.size(),
+                includeMcpToolsAsSkills,
                 mcpTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
         if (!skillTools.isEmpty()) {
             LOGGER.info("Skills available ({}): {}", skillTools.size(),
@@ -153,6 +192,7 @@ public class ReactEngine {
         String bestFinalAnswer = null;
         int actualIterations = 0;
         int toolFailureCount = 0;
+        int toolCallsSinceCompression = 0; // compress every 2 tool calls
 
         for (int iteration = 0; iteration < maxIterations; iteration++) {
             actualIterations = iteration + 1;
@@ -197,6 +237,26 @@ public class ReactEngine {
             LOGGER.debug("[Iteration {}] Tool call requested: name='{}' args={}", iteration + 1, toolCall.getName(), toolCall.getArguments());
             messages.add(new LlmMessage("assistant", currentThought, Collections.singletonList(toolCall)));
 
+            // ── Built-in: request_clarification ─────────────────────────────
+            if ("request_clarification".equals(toolCall.getName())) {
+                String question = toolCall.getArguments() != null
+                        ? (String) toolCall.getArguments().getOrDefault("question", "Please provide more details.")
+                        : "Please provide more details.";
+                LOGGER.info("[Iteration {}] Agent requested clarification: {}", iteration + 1, question);
+                // Persist conversation so user can resume with the same conversationId
+                messages.add(new LlmMessage("tool_result", "Waiting for user input.", toolCall.getId(), toolCall.getName()));
+                saveHistory(store, conversationId, messages);
+
+                AgentResponse inputRequired = new AgentResponse(
+                        userMessage, question, maxIterations, actualIterations, false, conversationId);
+                inputRequired.setRequiresInput(true);
+                inputRequired.setInputRequest(question);
+                inputRequired.setResumedSession(resumedSession);
+                inputRequired.setReturnReason("input required");
+                inputRequired.setToolCalls(toolCallRecords);
+                return inputRequired;
+            }
+
             String observation;
             String mcpServerName = null;
             AgentSkillConfig matchedSkill = findSkillByName(toolCall.getName(), skills);
@@ -210,7 +270,8 @@ public class ReactEngine {
                         iteration + 1, matchedSkill.getName(), taskArg);
                 mcpServerName = "skill:" + matchedSkill.getName();
                 try {
-                    observation = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg, iteration + 1);
+                    observation = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
+                            iteration + 1, maxIterations - iteration, callback);
                 } catch (Exception e) {
                     observation = "Skill execution failed: " + e.getMessage();
                     toolFailureCount++;
@@ -245,6 +306,16 @@ public class ReactEngine {
             }
 
             messages.add(new LlmMessage("tool_result", observation, toolCall.getId(), toolCall.getName()));
+
+            // ── Context compression ──────────────────────────────────────────
+            // Every 2 tool calls, summarise older messages to keep the context
+            // window manageable and avoid token-limit errors.
+            toolCallsSinceCompression++;
+            if (toolCallsSinceCompression >= 2) {
+                messages = compressHistory(llmClient, messages);
+                toolCallsSinceCompression = 0;
+            }
+
             saveHistory(store, conversationId, messages);
         }
 
@@ -421,18 +492,17 @@ public class ReactEngine {
                                 List<McpServerConfig> mcpServers,
                                 AgentComposerConfiguration config,
                                 String task,
-                                int parentIteration) throws Exception {
-        List<String> allowedToolNames = skill.getToolList();
-        List<ToolDefinition> skillMcpTools = allowedToolNames.isEmpty() ? allMcpTools
-                : allMcpTools.stream()
-                        .filter(t -> allowedToolNames.contains(t.getName()))
-                        .collect(Collectors.toList());
+                                int parentIteration,
+                                int remainingIterations,
+                                IterationCallback callback) throws Exception {
+        // Skill gets MCP tools only when the config flag says so.
+        List<ToolDefinition> skillMcpTools = config.isIncludeMcpToolsAsSkills() ? allMcpTools : Collections.emptyList();
 
         String skillInstructions = skill.getInstructions();
-        LOGGER.info("[Skill '{}'] Sub-loop starting | allMcpTools={} | allowedToolNames={} | skillMcpTools=({}): {}",
+        LOGGER.info("[Skill '{}'] Sub-loop starting | includeMcpToolsAsSkills={} | allMcpTools={} | skillMcpTools=({}): {}",
                 skill.getName(),
+                config.isIncludeMcpToolsAsSkills(),
                 allMcpTools.size(),
-                allowedToolNames.isEmpty() ? "(all)" : allowedToolNames,
                 skillMcpTools.size(),
                 skillMcpTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
 
@@ -441,13 +511,15 @@ public class ReactEngine {
         skillMessages.add(new LlmMessage("user", task));
 
         String skillAnswer = null;
-        int maxSkillIterations = 15;
+        // Use remaining outer-loop budget so total iterations (outer + skill) never exceed maxIterations.
+        int maxSkillIterations = Math.max(1, remainingIterations);
         // Number of consecutive text-only responses (no tool call) since the last tool call.
         // Resets to 0 whenever the LLM actually calls a tool.
         // We re-prompt up to MAX_TEXT_REPROMPTS times before accepting the text as final.
         int consecutiveTextResponses = 0;
         final int MAX_TEXT_REPROMPTS = 3;
         boolean hasTools = !skillMcpTools.isEmpty();
+        int skillToolCallsSinceCompression = 0; // compress every 2 tool calls
 
         for (int i = 0; i < maxSkillIterations; i++) {
             LOGGER.info("[Skill '{}' | Step {}/{}] Sending {} message(s) to LLM",
@@ -495,6 +567,12 @@ public class ReactEngine {
                     skill.getName(), i + 1, maxSkillIterations, toolCall.getName(), toolCall.getArguments());
             skillMessages.add(new LlmMessage("assistant", response.getContent(), Collections.singletonList(toolCall)));
 
+            // Notify before execution so SSE clients see the tool being invoked
+            if (callback != null) {
+                callback.onIteration(parentIteration,
+                        skill.getName() + " → " + toolCall.getName(), "calling...");
+            }
+
             String obs;
             try {
                 obs = executeTool(toolCall, skillMcpTools, mcpServers);
@@ -506,7 +584,21 @@ public class ReactEngine {
                 toolCallRecords.add(new AgentResponse.ToolCallRecord(
                         skill.getName(), toolCall.getName(), toolCall.getArguments(), obs, parentIteration));
             }
+
+            // Notify after execution with the actual observation
+            if (callback != null) {
+                callback.onIteration(parentIteration,
+                        skill.getName() + " → " + toolCall.getName(), obs);
+            }
+
             skillMessages.add(new LlmMessage("tool_result", obs, toolCall.getId(), toolCall.getName()));
+
+            // ── Context compression (skill sub-loop) ─────────────────────────
+            skillToolCallsSinceCompression++;
+            if (skillToolCallsSinceCompression >= 2) {
+                skillMessages = compressHistory(llmClient, skillMessages);
+                skillToolCallsSinceCompression = 0;
+            }
         }
 
         if (skillAnswer == null) {
@@ -514,6 +606,57 @@ public class ReactEngine {
                     + maxSkillIterations + " iterations.";
         }
         return skillAnswer;
+    }
+
+    /**
+     * Compresses the message history by summarising all but the two most recent messages.
+     * Keeps the original user request plus a generated summary as context, then appends
+     * the recent messages unchanged.  Helps prevent context-window overflow on long runs.
+     *
+     * @param llmClient the LLM client to use for summarisation
+     * @param messages  current message list (modified in-place is NOT safe; returns new list)
+     * @return a new, shorter message list
+     */
+    private List<LlmMessage> compressHistory(LlmClient llmClient, List<LlmMessage> messages) {
+        // Nothing to compress if the list is tiny.
+        if (messages.size() <= 4) return messages;
+
+        int keepTail = 2; // always keep the last 2 messages (most recent thought + tool result)
+        int compressUpTo = messages.size() - keepTail;
+
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Summarise the following conversation history in a few sentences. "
+                    + "Preserve all key facts, tool call results, and conclusions. "
+                    + "Do NOT add commentary — just produce the summary.\n\n");
+            for (int i = 0; i < compressUpTo; i++) {
+                LlmMessage m = messages.get(i);
+                String content = m.getContent() != null ? m.getContent() : "(no text content)";
+                sb.append("[").append(m.getRole()).append("] ").append(content).append("\n");
+            }
+
+            LlmResponse summary = llmClient.chat(
+                    "You are a concise summariser.",
+                    Collections.singletonList(new LlmMessage("user", sb.toString())),
+                    Collections.emptyList());
+
+            String summaryText = summary.getContent() != null ? summary.getContent() : "(summary unavailable)";
+            LOGGER.info("[Context compression] Compressed {} messages → summary ({} chars)",
+                    compressUpTo, summaryText.length());
+
+            List<LlmMessage> compressed = new ArrayList<>();
+            // Keep the original user request (index 0) so the LLM always knows the goal.
+            compressed.add(messages.get(0));
+            // Inject the summary as a prior-context user/assistant exchange.
+            compressed.add(new LlmMessage("user", "Summary of conversation so far: " + summaryText));
+            compressed.add(new LlmMessage("assistant", "Understood. Continuing from that point."));
+            // Re-attach the recent tail.
+            compressed.addAll(messages.subList(compressUpTo, messages.size()));
+            return compressed;
+        } catch (Exception e) {
+            LOGGER.warn("[Context compression] Failed to compress history, keeping full history: {}", e.getMessage());
+            return messages;
+        }
     }
 
     /**
