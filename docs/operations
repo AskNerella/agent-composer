@@ -1,0 +1,10 @@
+# Agent Composer — Operations
+
+| Operation | What it does | Key inputs |
+|---|---|---|
+| **Execute Agent** | Runs the ReAct loop: reasons, calls tools via MCP, and returns a final answer with metrics. | `userMessage`, `conversationId`, `maxIterations` |
+| **Evaluate Agent** | Asks the LLM to score an agent response against the original task and optional rubric. Returns a verdict (PASS/FAIL), score, and improvement suggestions. | `userTask`, `agentResponse`, `evaluationCriteria` |
+| **Check Memory** | Searches past solved responses for tasks similar to the current one. Returns ranked matches with confidence scores. | `userTask`, `maxResults` |
+| **Retrieve Conversation** | Returns the full message history and cached responses for a given session. | `sessionId` |
+| **Delete Conversation** | Removes conversation history and cached responses by session ID, by task text match, or both. | `sessionId` *(or)* `userTask` |
+| **Reset Memory** | Clears the entire Object Store — wipes all conversation history and solved-response cache. | *(none — uses config)* |

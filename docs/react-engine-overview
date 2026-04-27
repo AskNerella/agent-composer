@@ -1,0 +1,47 @@
+# React Engine — High-Level Overview
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    actor U as You
+    participant A as Agent Composer
+    participant E as ReAct Engine
+    participant M as Memory
+    participant L as LLM
+    participant T as Tools / Skills
+
+    U->>A: Send a message
+
+    rect rgb(220, 240, 255)
+        A->>M: Seen this before?
+        alt Cached answer
+            M-->>A: Return saved result
+            A-->>U: Answer (instant)
+        else First time
+            M-->>E: Load conversation history
+        end
+    end
+
+    rect rgb(220, 255, 230)
+        loop Reason → Act (up to maxIterations)
+            E->>L: What should I do next?
+
+            rect rgb(255, 245, 200)
+                alt Need more info
+                    L-->>U: Ask a clarifying question
+                    U-->>E: Answer (same conversation)
+                else Call a tool or skill
+                    E->>T: Execute
+                    T-->>E: Result
+                else Done
+                    L-->>E: Final answer
+                end
+            end
+        end
+    end
+
+    E->>M: Save conversation + cache result
+    E-->>A: Final answer
+    A-->>U: Response
+```

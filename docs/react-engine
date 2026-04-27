@@ -7,49 +7,165 @@ sequenceDiagram
     actor U as Caller
     participant O as Agent Composer
     participant R as ReAct Engine
-    participant OS as Memory
-    participant MC as MCP
+    participant OS as ObjectStore (Memory)
+    participant MC as McpClient
     participant L as LLM
     participant MS as MCP Servers
+    participant SK as Skill Sub-Loop
 
-    U->>O: executeAgent()
-    O->>R: run()
+    U->>O: executeAgent(userMessage, conversationId, maxIterations)
+    O->>R: run(config, userMessage, conversationId, maxIterations, callback?)
 
-    %% Discover tools
-    R->>MC: listTools()
+    %% Tool discovery
+    R->>MC: listTools(mcpServers)
     MC->>MS: tools/list
     MS-->>MC: tools
-    MC-->>R: tool catalog
+    MC-->>R: tool catalog (filtered by toolFilterList)
+    note over R: Build allTools:<br/>skills + MCP (if includeMcpToolsAsSkills)<br/>+ request_clarification (always)
 
-    %% Cache check
-    R->>OS: check cache
-    alt cache hit
-        OS-->>R: cached response
-        R-->>O: response
-        O-->>U: result
-    else cache miss
-        R->>OS: load history
+    %% Session & cache check
+    R->>OS: hasConversationHistory(conversationId)?
+    alt resumed session — skip cache
+        OS-->>R: history exists → resumedSession=true
+        R->>OS: loadHistory(conversationId)
+    else new session — check solved-response cache
+        R->>OS: loadSolvedResponse(scoped key)
+        alt scoped cache miss
+            R->>OS: loadSolvedResponse(global key)
+        end
+        alt cache hit (non-mutation request)
+            OS-->>R: cached AgentResponse
+            R-->>O: response (cacheHit=true)
+            O-->>U: result
+        else cache miss
+            R->>OS: loadHistory(conversationId) → empty list
+        end
+    end
 
-        %% Main loop
-        loop until done
-            R->>L: chat(messages, tools)
-            L-->>R: response
+    %% Main ReAct loop
+    loop iteration 1..maxIterations
+        R->>L: chat(instructions, messages, allTools)<br/>[with single auto-retry on failure]
+        L-->>R: LlmResponse (content, stopReason, toolCall?)
 
-            alt final answer
-                R->>OS: save history
-            else tool call
-                R->>MC: callTool()
-                MC->>MS: tools/call
-                MS-->>MC: result
-                MC-->>R: observation
-                R->>OS: save history
+        alt final answer (no tool call)
+            R->>R: track bestFinalAnswer (scored by length + keywords)
+            R->>OS: saveHistory(conversationId, messages)
+            alt shouldStopAfterFinalAnswer (last tool succeeded)
+                R-->>R: break loop early
             end
+        else tool call = request_clarification
+            R->>OS: saveHistory(conversationId, messages)
+            R-->>O: AgentResponse (requiresInput=true, returnReason="input required")
+            O-->>U: clarification question<br/>(resume later with same conversationId)
+        else tool call matches a Skill
+            R->>SK: executeSkill(skill, task, remainingIterations)
+            note over SK: Sub-loop up to remainingIterations<br/>(shares parent's iteration budget)
+            loop skill step 1..maxSkillIterations
+                SK->>L: chat(skillInstructions, skillMessages, skillMcpTools)
+                L-->>SK: response
+                alt final answer but hasTools & reprompts < 3
+                    SK->>SK: re-prompt: "invoke the tool now"
+                else tool call
+                    SK->>MS: tools/call
+                    MS-->>SK: observation
+                    SK->>SK: accumulate toolCallRecords
+                    alt every 2 tool calls
+                        SK->>L: compressHistory (summarise older messages)
+                        L-->>SK: summary
+                    end
+                else accepted final answer
+                    SK-->>R: skill answer
+                end
+            end
+            R->>R: record observation + toolCallRecord
+            R->>OS: saveHistory(conversationId, messages)
+        else MCP tool call
+            R->>MC: callTool(server, name, args)
+            MC->>MS: tools/call
+            MS-->>MC: result
+            MC-->>R: observation
+            R->>R: accumulate toolCallRecords
+            R->>OS: saveHistory(conversationId, messages)
         end
 
-        %% Finalize
-        R->>R: build response
-        R->>OS: save cache
-        R-->>O: response
-        O-->>U: result
+        %% Context compression (main loop)
+        alt every 2 tool calls
+            R->>L: compressHistory (summarise older messages)
+            L-->>R: summary
+        end
     end
+
+    %% Post-loop finalisation
+    alt maxIterations reached without final answer
+        R->>R: finalAnswer = "Maximum iterations reached"
+        R->>OS: saveHistory(conversationId, messages)
+    end
+
+    R->>R: build AgentResponse<br/>(answer, metrics, toolCalls, returnReason)
+
+    alt completed & non-mutation request
+        R->>OS: saveSolvedResponse(scoped key)
+        R->>OS: saveSolvedResponse(global key)
+    end
+
+    R-->>O: AgentResponse
+    O-->>U: result
 ```
+
+---
+
+## What it does & how
+
+### Overview
+
+`ReactEngine` implements the **ReAct (Reason + Act)** pattern: it iteratively calls an LLM, lets it decide whether to call a tool or return a final answer, executes the tool, feeds the result back, and repeats — up to a configurable limit.
+
+---
+
+### Configurable parameters
+
+| Parameter | Where set | Description |
+|---|---|---|
+| `maxIterations` | `run()` call-site | Hard cap on Reason-Act cycles (main loop + skill sub-loops share the same budget). |
+| `instructions` | `AgentComposerConfiguration` | System prompt injected into every LLM call. |
+| `provider` / `modelName` | `AgentComposerConfiguration` | LLM provider and model used for all calls. |
+| `mcpServers` | `AgentComposerConfiguration` | List of MCP server endpoints. Each server can carry a `toolFilterList` to whitelist specific tools. |
+| `includeMcpToolsAsSkills` | `AgentComposerConfiguration` | `true` → raw MCP tools are exposed directly to the LLM in addition to any skill wrappers. `false` → only skill tools are visible (raw MCP stays hidden). |
+| `skills` | `AgentComposerConfiguration` | Named sub-agents with their own `instructions`, optional `toolList` filter, and description surfaced to the top-level LLM as a callable tool. |
+| `objectStore` | `AgentComposerConfiguration` | Name of the Mule ObjectStore used for conversation history and solved-response caching. |
+| `conversationId` | `run()` call-site | Key that scopes history and cache entries; pass the same value to resume a prior session. |
+
+---
+
+### Memory management
+
+The ObjectStore holds two types of entries, both keyed by `conversationId`:
+
+- **Conversation history** — every `LlmMessage` (user, assistant, tool_result) is serialised as JSON after each tool call or final answer. Loaded at the start of each `run()` call so the agent remembers prior turns.
+- **Solved-response cache** — when a run completes successfully and the request is **not** a mutation (create/update/delete), the `AgentResponse` is saved under both a session-scoped key and a global key. Future identical requests return the cached result immediately without re-running the loop.
+
+**Context compression** prevents token-limit errors on long conversations: every 2 tool calls the engine asks the LLM to summarise all but the 2 most recent messages, replacing the older messages with that summary.
+
+---
+
+### Agent loop controls
+
+1. **`maxIterations`** — the loop runs at most this many times. If no final answer is produced, the engine returns `"Maximum iterations reached"` with `completed=false`.
+2. **Early stop** — the loop breaks as soon as the LLM returns a final answer *and* the most recent tool call succeeded (`shouldStopAfterFinalAnswer`). This avoids unnecessary extra iterations.
+3. **Best-answer tracking** — every text response is scored (length, presence of keywords like "steps" / "resolution") and the highest-scoring one is kept as `bestFinalAnswer`, so a late low-quality response cannot overwrite a better earlier one.
+4. **LLM auto-retry** — each LLM call is retried once automatically on transient failure before propagating the error.
+5. **`request_clarification` built-in tool** — always present in the tool list. When called, the engine saves state and returns `requiresInput=true`; the caller resumes with the same `conversationId` after providing the answer.
+6. **Mutation detection** — requests whose first word matches a mutation verb (create, update, delete, …) are never written to the solved-response cache.
+
+---
+
+### Skill execution
+
+Skills are named sub-agents configured with their own system prompt. The top-level LLM sees each skill as an ordinary tool accepting a single `task` string argument.
+
+When a skill is invoked:
+- A **dedicated sub-loop** runs using the *remaining* outer-loop budget (`maxIterations − currentIteration`), ensuring the combined iteration count never exceeds `maxIterations`.
+- The sub-loop uses the skill's own `instructions` as the system prompt.
+- If the LLM returns plain text without calling a tool (and tools are available), the engine re-prompts up to **3 times** with an explicit directive to invoke the tool before accepting the text as the final skill answer.
+- Tool call records from the skill sub-loop are accumulated into the parent's `toolCallRecords` list for full observability.
+- Context compression (every 2 tool calls → summarise) applies independently inside the skill sub-loop.
