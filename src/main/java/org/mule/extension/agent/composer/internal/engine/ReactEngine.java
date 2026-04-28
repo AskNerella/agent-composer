@@ -27,6 +27,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Arrays;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
@@ -82,9 +84,15 @@ public class ReactEngine {
                 schema, null);
     }
 
-    /** Callback invoked after each tool or skill execution in the ReAct loop. */
+    /** Callback invoked before and after each tool or skill execution in the ReAct loop. */
     @FunctionalInterface
     public interface IterationCallback {
+        /**
+         * @param iteration   current ReAct iteration (1-based)
+         * @param actionName  tool or skill name being invoked
+         * @param observation {@code null} when the tool request is being sent;
+         *                    the actual result string when the response is received
+         */
         void onIteration(int iteration, String actionName, String observation);
     }
 
@@ -233,18 +241,22 @@ public class ReactEngine {
                 continue;
             }
 
-            ToolCall toolCall = response.getToolCall();
-            LOGGER.debug("[Iteration {}] Tool call requested: name='{}' args={}", iteration + 1, toolCall.getName(), toolCall.getArguments());
-            messages.add(new LlmMessage("assistant", currentThought, Collections.singletonList(toolCall)));
+            List<ToolCall> toolCalls = response.getToolCalls();
+            LOGGER.debug("[Iteration {}] Tool call(s) requested: {}", iteration + 1,
+                    toolCalls.stream().map(ToolCall::getName).collect(Collectors.joining(", ")));
 
-            // ── Built-in: request_clarification ─────────────────────────────
-            if ("request_clarification".equals(toolCall.getName())) {
-                String question = toolCall.getArguments() != null
-                        ? (String) toolCall.getArguments().getOrDefault("question", "Please provide more details.")
+            // ── Built-in: request_clarification (checked before adding to history) ─
+            ToolCall clarificationCall = toolCalls.stream()
+                    .filter(tc -> "request_clarification".equals(tc.getName()))
+                    .findFirst().orElse(null);
+            if (clarificationCall != null) {
+                String question = clarificationCall.getArguments() != null
+                        ? (String) clarificationCall.getArguments().getOrDefault("question", "Please provide more details.")
                         : "Please provide more details.";
                 LOGGER.info("[Iteration {}] Agent requested clarification: {}", iteration + 1, question);
                 // Persist conversation so user can resume with the same conversationId
-                messages.add(new LlmMessage("tool_result", "Waiting for user input.", toolCall.getId(), toolCall.getName()));
+                messages.add(new LlmMessage("assistant", currentThought, Collections.singletonList(clarificationCall)));
+                messages.add(new LlmMessage("tool_result", "Waiting for user input.", clarificationCall.getId(), clarificationCall.getName()));
                 saveHistory(store, conversationId, messages);
 
                 AgentResponse inputRequired = new AgentResponse(
@@ -257,60 +269,150 @@ public class ReactEngine {
                 return inputRequired;
             }
 
-            String observation;
-            String mcpServerName = null;
-            AgentSkillConfig matchedSkill = findSkillByName(toolCall.getName(), skills);
+            // Append one assistant message carrying all tool calls for this step
+            messages.add(new LlmMessage("assistant", currentThought, toolCalls));
 
-            if (matchedSkill != null) {
-                // ── Skill execution ─────────────────────────────────────────
-                String taskArg = toolCall.getArguments() != null
-                        ? (String) toolCall.getArguments().getOrDefault("task", currentThought)
-                        : currentThought;
-                LOGGER.info("[Iteration {}] >>> Using skill '{}' | task: {}",
-                        iteration + 1, matchedSkill.getName(), taskArg);
-                mcpServerName = "skill:" + matchedSkill.getName();
-                try {
-                    observation = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
-                            iteration + 1, maxIterations - iteration, callback);
-                } catch (Exception e) {
-                    observation = "Skill execution failed: " + e.getMessage();
-                    toolFailureCount++;
-                    LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration + 1, matchedSkill.getName(), e.getMessage(), e);
+            // ── Execute tools: parallel when > 1, sequential when == 1 ──────────
+            if (toolCalls.size() > 1) {
+                LOGGER.info("[Iteration {}] Executing {} tools in parallel: {}",
+                        iteration + 1, toolCalls.size(),
+                        toolCalls.stream().map(ToolCall::getName).collect(Collectors.joining(", ")));
+
+                // Fire all "request" callbacks before launching parallel execution
+                if (callback != null) {
+                    for (ToolCall tc : toolCalls) {
+                        callback.onIteration(iteration + 1, tc.getName(), null);
+                    }
                 }
-                if (callback != null) callback.onIteration(iteration + 1, matchedSkill.getName(), observation);
-                toolCallRecords.add(new AgentResponse.ToolCallRecord(
-                        mcpServerName, toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
+
+                AtomicInteger parallelFailures = new AtomicInteger(0);
+                final int iterNum = iteration + 1;
+                final String capturedThought = currentThought;
+                final int remainingIter = maxIterations - iteration;
+                List<CompletableFuture<String>> futures = toolCalls.stream()
+                        .map(tc -> CompletableFuture.supplyAsync(() -> {
+                            AgentSkillConfig matchedSkillP = findSkillByName(tc.getName(), skills);
+                            if (matchedSkillP != null) {
+                                String taskArg = tc.getArguments() != null
+                                        ? (String) tc.getArguments().getOrDefault("task", capturedThought)
+                                        : capturedThought;
+                                LOGGER.info("[Iteration {}][Parallel] Skill '{}' | task={}",
+                                        iterNum, matchedSkillP.getName(), taskArg);
+                                try {
+                                    // Pass null callback to avoid concurrent callback calls in sub-loops
+                                    String obs = executeSkill(matchedSkillP, mcpTools, mcpServers, config,
+                                            taskArg, iterNum, remainingIter, null);
+                                    LOGGER.info("[Iteration {}][Parallel] Skill '{}' done | result={}",
+                                            iterNum, matchedSkillP.getName(), obs);
+                                    return obs;
+                                } catch (Exception e) {
+                                    parallelFailures.incrementAndGet();
+                                    LOGGER.warn("[Iteration {}][Parallel] Skill '{}' failed: {}",
+                                            iterNum, matchedSkillP.getName(), e.getMessage(), e);
+                                    return "Skill execution failed: " + e.getMessage();
+                                }
+                            } else {
+                                LOGGER.info("[Iteration {}][Parallel] Tool '{}' | args={}",
+                                        iterNum, tc.getName(), GSON.toJson(tc.getArguments()));
+                                try {
+                                    String obs = executeTool(tc, mcpTools, mcpServers);
+                                    LOGGER.info("[Iteration {}][Parallel] Tool '{}' done | result={}",
+                                            iterNum, tc.getName(), obs);
+                                    return obs;
+                                } catch (Exception e) {
+                                    parallelFailures.incrementAndGet();
+                                    LOGGER.warn("[Iteration {}][Parallel] Tool '{}' failed: {}",
+                                            iterNum, tc.getName(), e.getMessage(), e);
+                                    return "Tool execution failed: " + e.getMessage();
+                                }
+                            }
+                        }))
+                        .collect(Collectors.toList());
+
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                toolFailureCount += parallelFailures.get();
+
+                // Collect results, fire response callbacks, record tool calls, append tool_result messages
+                for (int t = 0; t < toolCalls.size(); t++) {
+                    ToolCall tc = toolCalls.get(t);
+                    String obs;
+                    try { obs = futures.get(t).get(); } catch (Exception e) { obs = "Error: " + e.getMessage(); }
+                    AgentSkillConfig matchedSkillP = findSkillByName(tc.getName(), skills);
+                    String serverName = matchedSkillP != null
+                            ? "skill:" + matchedSkillP.getName()
+                            : findMcpServerName(tc, mcpTools, mcpServers);
+                    if (callback != null) callback.onIteration(iteration + 1, tc.getName(), obs);
+                    toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                            serverName != null ? serverName : "unknown",
+                            tc.getName(), tc.getArguments(), obs, iteration + 1));
+                    messages.add(new LlmMessage("tool_result", obs, tc.getId(), tc.getName()));
+                }
+                toolCallsSinceCompression += toolCalls.size();
+
             } else {
-                // ── MCP tool execution ───────────────────────────────────────
-                mcpServerName = findMcpServerName(toolCall, mcpTools, mcpServers);
-                LOGGER.info("[Iteration {}] >>> Using tool '{}' (server: {}) | args: {}",
-                        iteration + 1, toolCall.getName(),
-                        mcpServerName != null ? mcpServerName : "unknown",
-                        toolCall.getArguments());
-                try {
-                    observation = executeTool(toolCall, mcpTools, mcpServers);
-                    LOGGER.debug("[Iteration {}] Tool '{}' observation: {}", iteration + 1, toolCall.getName(), observation);
-                    if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), observation);
+                // ── Single tool (sequential) ──────────────────────────────────────
+                ToolCall toolCall = toolCalls.get(0);
+                String observation;
+                String mcpServerName = null;
+                AgentSkillConfig matchedSkill = findSkillByName(toolCall.getName(), skills);
+
+                if (matchedSkill != null) {
+                    // ── Skill execution ───────────────────────────────────────────
+                    String taskArg = toolCall.getArguments() != null
+                            ? (String) toolCall.getArguments().getOrDefault("task", currentThought)
+                            : currentThought;
+                    LOGGER.info("[Iteration {}] >>> Using skill '{}' | task: {}",
+                            iteration + 1, matchedSkill.getName(), taskArg);
+                    mcpServerName = "skill:" + matchedSkill.getName();
+                    try {
+                        LOGGER.info("[Iteration {}] Skill request | name='{}' task={}", iteration + 1, matchedSkill.getName(), taskArg);
+                        if (callback != null) callback.onIteration(iteration + 1, matchedSkill.getName(), null);
+                        observation = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
+                                iteration + 1, maxIterations - iteration, callback);
+                        LOGGER.info("[Iteration {}] Skill response | name='{}' result={}", iteration + 1, matchedSkill.getName(), observation);
+                    } catch (Exception e) {
+                        observation = "Skill execution failed: " + e.getMessage();
+                        toolFailureCount++;
+                        LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration + 1, matchedSkill.getName(), e.getMessage(), e);
+                    }
+                    if (callback != null) callback.onIteration(iteration + 1, matchedSkill.getName(), observation);
                     toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                            mcpServerName, toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
+                } else {
+                    // ── MCP tool execution ────────────────────────────────────────
+                    mcpServerName = findMcpServerName(toolCall, mcpTools, mcpServers);
+                    LOGGER.info("[Iteration {}] >>> Using tool '{}' (server: {}) | args: {}",
+                            iteration + 1, toolCall.getName(),
                             mcpServerName != null ? mcpServerName : "unknown",
-                            toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
-                } catch (Exception e) {
-                    observation = "Tool execution failed: " + e.getMessage();
-                    toolFailureCount++;
-                    LOGGER.warn("[Iteration {}] Tool '{}' failed: {}", iteration + 1, toolCall.getName(), e.getMessage(), e);
-                    if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), observation);
-                    toolCallRecords.add(new AgentResponse.ToolCallRecord(
-                            mcpServerName != null ? mcpServerName : "unknown",
-                            toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
+                            toolCall.getArguments());
+                    try {
+                        LOGGER.info("[Iteration {}] Tool request | name='{}' args={}",
+                                iteration + 1, toolCall.getName(), GSON.toJson(toolCall.getArguments()));
+                        if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), null);
+                        observation = executeTool(toolCall, mcpTools, mcpServers);
+                        LOGGER.info("[Iteration {}] Tool response | name='{}' result={}", iteration + 1, toolCall.getName(), observation);
+                        if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), observation);
+                        toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                                mcpServerName != null ? mcpServerName : "unknown",
+                                toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
+                    } catch (Exception e) {
+                        observation = "Tool execution failed: " + e.getMessage();
+                        toolFailureCount++;
+                        LOGGER.warn("[Iteration {}] Tool '{}' failed: {}", iteration + 1, toolCall.getName(), e.getMessage(), e);
+                        if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), observation);
+                        toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                                mcpServerName != null ? mcpServerName : "unknown",
+                                toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
+                    }
                 }
+
+                messages.add(new LlmMessage("tool_result", observation, toolCall.getId(), toolCall.getName()));
+                toolCallsSinceCompression++;
             }
 
-            messages.add(new LlmMessage("tool_result", observation, toolCall.getId(), toolCall.getName()));
-
-            // ── Context compression ──────────────────────────────────────────
-            // Every 2 tool calls, summarise older messages to keep the context
-            // window manageable and avoid token-limit errors.
-            toolCallsSinceCompression++;
+            // ── Context compression ──────────────────────────────────────────────
+            // Every 2 tool calls (or batches), summarise older messages to keep the
+            // context window manageable and avoid token-limit errors.
             if (toolCallsSinceCompression >= 2) {
                 messages = compressHistory(llmClient, messages);
                 toolCallsSinceCompression = 0;

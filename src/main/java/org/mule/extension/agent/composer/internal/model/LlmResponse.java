@@ -1,16 +1,24 @@
 package org.mule.extension.agent.composer.internal.model;
 
+import java.util.Collections;
+import java.util.List;
+
 /**
  * Normalised response from an LLM inference call.
  *
  * Stop-reason semantics (provider-agnostic):
  *  - {@code "stop"}     – model reached a natural end; {@code content} is the final answer.
- *  - {@code "tool_use"} – model requested a tool call; inspect {@code toolCall}.
+ *  - {@code "tool_use"} – model requested one or more tool calls; inspect {@code toolCalls}.
  */
 public class LlmResponse {
 
     private String content;
-    private ToolCall toolCall;
+
+    /**
+     * All tool calls requested in this response. May contain multiple entries when the
+     * LLM requests parallel tool execution. Empty (never null) when there are no tool calls.
+     */
+    private List<ToolCall> toolCalls = Collections.emptyList();
 
     /**
      * Normalised stop reason:
@@ -32,20 +40,20 @@ public class LlmResponse {
 
     public LlmResponse(String content, ToolCall toolCall, String stopReason) {
         this.content = content;
-        this.toolCall = toolCall;
+        this.toolCalls = toolCall != null ? Collections.singletonList(toolCall) : Collections.emptyList();
         this.stopReason = stopReason;
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    /** Returns {@code true} when the LLM has produced a final text answer. */
+    /** Returns {@code true} when the LLM has produced a final text answer (no tool calls). */
     public boolean hasFinalAnswer() {
-        return toolCall == null;
+        return toolCalls == null || toolCalls.isEmpty();
     }
 
-    /** Returns {@code true} when the LLM is requesting a tool invocation. */
+    /** Returns {@code true} when the LLM is requesting one or more tool invocations. */
     public boolean hasToolCall() {
-        return toolCall != null;
+        return toolCalls != null && !toolCalls.isEmpty();
     }
 
     // ── getters / setters ─────────────────────────────────────────────────────
@@ -53,8 +61,27 @@ public class LlmResponse {
     public String getContent() { return content; }
     public void setContent(String content) { this.content = content; }
 
-    public ToolCall getToolCall() { return toolCall; }
-    public void setToolCall(ToolCall toolCall) { this.toolCall = toolCall; }
+    /**
+     * All tool calls in this response. Use this when you need to handle parallel tool execution.
+     * Returns an empty list (never null) when there are no tool calls.
+     */
+    public List<ToolCall> getToolCalls() {
+        return toolCalls != null ? toolCalls : Collections.emptyList();
+    }
+    public void setToolCalls(List<ToolCall> toolCalls) {
+        this.toolCalls = toolCalls != null ? toolCalls : Collections.emptyList();
+    }
+
+    /**
+     * Convenience accessor returning the first tool call, or {@code null} if none.
+     * Prefer {@link #getToolCalls()} for full parallel-tool support.
+     */
+    public ToolCall getToolCall() {
+        return (toolCalls != null && !toolCalls.isEmpty()) ? toolCalls.get(0) : null;
+    }
+    public void setToolCall(ToolCall toolCall) {
+        this.toolCalls = toolCall != null ? Collections.singletonList(toolCall) : Collections.emptyList();
+    }
 
     public String getStopReason() { return stopReason; }
     public void setStopReason(String stopReason) { this.stopReason = stopReason; }

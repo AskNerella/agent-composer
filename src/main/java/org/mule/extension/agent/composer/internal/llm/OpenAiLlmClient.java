@@ -121,7 +121,7 @@ public class OpenAiLlmClient implements LlmClient {
         String stopReason = root.has("stop_reason") ? root.get("stop_reason").getAsString() : "end_turn";
 
         String textContent = null;
-        ToolCall toolCall = null;
+        List<ToolCall> toolCalls = new java.util.ArrayList<>();
 
         JsonArray output = root.has("output") ? root.getAsJsonArray("output") : new JsonArray();
         for (JsonElement el : output) {
@@ -137,16 +137,17 @@ public class OpenAiLlmClient implements LlmClient {
                     }
                 }
                 textContent = sb.length() > 0 ? sb.toString() : null;
-            } else if ("function_call".equals(type) && toolCall == null) {
+            } else if ("function_call".equals(type)) {
                 String callId = item.get("call_id").getAsString();
                 String name   = item.get("name").getAsString();
                 String argsJson = item.has("arguments") ? item.get("arguments").getAsString() : "{}";
                 Map<String, Object> args = GSON.fromJson(argsJson, MAP_TYPE);
-                toolCall = new ToolCall(callId, name, args);
+                toolCalls.add(new ToolCall(callId, name, args));
             }
         }
 
-        LlmResponse llmResponse = new LlmResponse(textContent, toolCall, stopReason);
+        LlmResponse llmResponse = new LlmResponse(textContent, null, stopReason);
+        llmResponse.setToolCalls(toolCalls);
         if (root.has("usage") && root.get("usage").isJsonObject()) {
             JsonObject usage = root.getAsJsonObject("usage");
             llmResponse.setInputTokens(usage.has("input_tokens") ? usage.get("input_tokens").getAsInt() : 0);

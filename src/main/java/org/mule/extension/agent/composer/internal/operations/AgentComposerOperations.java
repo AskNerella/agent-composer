@@ -51,12 +51,12 @@ public class AgentComposerOperations {
 
             @DisplayName("User Message")
             @Summary("The user's input message for this conversation turn.")
-            @Optional(defaultValue = "#[payload]")
+            @Optional(defaultValue = "#[payload.params.message.parts[0].text]")
             String userMessage,
 
             @DisplayName("Conversation ID")
             @Summary("Key that scopes this conversation within the Object Store. Defaults to the A2A message.contextId when present, otherwise the Mule correlation ID.")
-            @Optional(defaultValue = "#[correlationId]")
+            @Optional(defaultValue = "#[payload.params.message.contextId]")
             String conversationId,
 
             @DisplayName("Max Iterations")

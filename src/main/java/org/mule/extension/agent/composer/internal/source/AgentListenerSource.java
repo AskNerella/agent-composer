@@ -319,7 +319,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         });
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── A2A + card helpers ────────────────────────────────────────────────────
 
     private RequestHandlerManager addCardHandler(String path, byte[] cardBytes) {
         return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
@@ -420,13 +420,21 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                             return;
                         }
                         try {
-                            String summary = "calling...".equals(observation)
-                                    ? "[Step " + iteration + "] Calling '" + actionName + "'"
-                                    : "[Step " + iteration + "] '" + actionName + "' completed";
-                            JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
-                            persistTask(workingTask);
-                            pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "working", summary, false, isJsonRpc, rpcIdJson)
-                                    .getBytes(StandardCharsets.UTF_8));
+                            if (observation == null) {
+                                // Tool request — emit a "tool-request" status update
+                                String summary = "[Step " + iteration + "] Calling '" + actionName + "'";
+                                JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
+                                persistTask(workingTask);
+                                pipedOut.write(buildToolRequestSseEvent(taskId, contextId, iteration, actionName, isJsonRpc, rpcIdJson)
+                                        .getBytes(StandardCharsets.UTF_8));
+                            } else {
+                                // Tool response — emit a "tool-response" status update
+                                String summary = "[Step " + iteration + "] '" + actionName + "' completed";
+                                JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
+                                persistTask(workingTask);
+                                pipedOut.write(buildToolResponseSseEvent(taskId, contextId, iteration, actionName, observation, isJsonRpc, rpcIdJson)
+                                        .getBytes(StandardCharsets.UTF_8));
+                            }
                             pipedOut.flush();
                         } catch (Exception e) {
                             LOGGER.warn("Could not write SSE event for task {}: {}", taskId, e.getMessage());
@@ -875,6 +883,70 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         update.addProperty("kind", "artifact-update");
         update.add("artifact", buildArtifact(taskId, payload));
         update.addProperty("lastChunk", true);
+        return wrapSseData(update, isJsonRpc, rpcIdJson);
+    }
+
+    private static String buildToolRequestSseEvent(String taskId, String contextId, int iteration,
+                                                   String toolName, boolean isJsonRpc, String rpcIdJson) {
+        JsonObject update = new JsonObject();
+        update.addProperty("taskId", taskId);
+        update.addProperty("contextId", contextId);
+        update.addProperty("kind", "status-update");
+        update.addProperty("final", false);
+        JsonObject status = new JsonObject();
+        status.addProperty("state", "working");
+        status.addProperty("timestamp", nowUtc());
+        JsonObject message = new JsonObject();
+        message.addProperty("role", "agent");
+        message.addProperty("messageId", UUID.randomUUID().toString());
+        message.addProperty("taskId", taskId);
+        message.addProperty("contextId", contextId);
+        message.addProperty("kind", "message");
+        JsonArray parts = new JsonArray();
+        JsonObject part = new JsonObject();
+        part.addProperty("kind", "data");
+        JsonObject data = new JsonObject();
+        data.addProperty("type", "tool-request");
+        data.addProperty("tool", toolName);
+        data.addProperty("step", iteration);
+        part.add("data", data);
+        parts.add(part);
+        message.add("parts", parts);
+        status.add("message", message);
+        update.add("status", status);
+        return wrapSseData(update, isJsonRpc, rpcIdJson);
+    }
+
+    private static String buildToolResponseSseEvent(String taskId, String contextId, int iteration,
+                                                    String toolName, String observation,
+                                                    boolean isJsonRpc, String rpcIdJson) {
+        JsonObject update = new JsonObject();
+        update.addProperty("taskId", taskId);
+        update.addProperty("contextId", contextId);
+        update.addProperty("kind", "status-update");
+        update.addProperty("final", false);
+        JsonObject status = new JsonObject();
+        status.addProperty("state", "working");
+        status.addProperty("timestamp", nowUtc());
+        JsonObject message = new JsonObject();
+        message.addProperty("role", "agent");
+        message.addProperty("messageId", UUID.randomUUID().toString());
+        message.addProperty("taskId", taskId);
+        message.addProperty("contextId", contextId);
+        message.addProperty("kind", "message");
+        JsonArray parts = new JsonArray();
+        JsonObject part = new JsonObject();
+        part.addProperty("kind", "data");
+        JsonObject data = new JsonObject();
+        data.addProperty("type", "tool-response");
+        data.addProperty("tool", toolName);
+        data.addProperty("step", iteration);
+        data.addProperty("result", observation != null ? observation : "");
+        part.add("data", data);
+        parts.add(part);
+        message.add("parts", parts);
+        status.add("message", message);
+        update.add("status", status);
         return wrapSseData(update, isJsonRpc, rpcIdJson);
     }
 

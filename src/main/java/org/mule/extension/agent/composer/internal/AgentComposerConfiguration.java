@@ -104,7 +104,7 @@ public class AgentComposerConfiguration {
   @DisplayName("Instructions")
   @Summary("System prompt / persona prepended to every LLM call.")
   @Text
-  @Optional
+  @Optional(defaultValue = "${file::agent/instructions.txt}")
   @Placement(tab = "Agent", order = 1)
   private String instructions;
 

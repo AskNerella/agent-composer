@@ -88,14 +88,27 @@ public class AnthropicLlmClient implements LlmClient {
                     break;
                 }
                 case "tool_result": {
-                    // Anthropic wraps tool results inside a user message
-                    JsonObject item = new JsonObject();
-                    item.addProperty("role", "user");
-                    JsonArray contentArr = new JsonArray();
+                    // Anthropic requires all tool_result blocks from a parallel batch
+                    // to be combined into a single user message.
                     JsonObject trBlock = new JsonObject();
                     trBlock.addProperty("type", "tool_result");
                     trBlock.addProperty("tool_use_id", msg.getToolCallId());
                     trBlock.addProperty("content", msg.getContent() != null ? msg.getContent() : "");
+                    // If the last message in the array is already a tool_result user message, append to it.
+                    if (msgsArr.size() > 0) {
+                        JsonObject lastItem = msgsArr.get(msgsArr.size() - 1).getAsJsonObject();
+                        if ("user".equals(lastItem.get("role").getAsString())
+                                && lastItem.get("content").isJsonArray()
+                                && lastItem.getAsJsonArray("content").size() > 0
+                                && "tool_result".equals(lastItem.getAsJsonArray("content")
+                                        .get(0).getAsJsonObject().get("type").getAsString())) {
+                            lastItem.getAsJsonArray("content").add(trBlock);
+                            break;
+                        }
+                    }
+                    JsonObject item = new JsonObject();
+                    item.addProperty("role", "user");
+                    JsonArray contentArr = new JsonArray();
                     contentArr.add(trBlock);
                     item.add("content", contentArr);
                     msgsArr.add(item);
@@ -136,23 +149,24 @@ public class AnthropicLlmClient implements LlmClient {
         String stopReason = root.has("stop_reason") ? root.get("stop_reason").getAsString() : "end_turn";
 
         StringBuilder textContent = new StringBuilder();
-        ToolCall toolCall = null;
+        List<ToolCall> toolCalls = new ArrayList<>();
 
         for (JsonElement el : root.getAsJsonArray("content")) {
             JsonObject block = el.getAsJsonObject();
             String type = block.get("type").getAsString();
             if ("text".equals(type)) {
                 textContent.append(block.get("text").getAsString());
-            } else if ("tool_use".equals(type) && toolCall == null) {
+            } else if ("tool_use".equals(type)) {
                 String id   = block.get("id").getAsString();
                 String name = block.get("name").getAsString();
                 Map<String, Object> input = GSON.fromJson(block.get("input"), MAP_TYPE);
-                toolCall = new ToolCall(id, name, input);
+                toolCalls.add(new ToolCall(id, name, input));
             }
         }
 
         String content = textContent.length() > 0 ? textContent.toString() : null;
-        LlmResponse llmResponse = new LlmResponse(content, toolCall, stopReason);
+        LlmResponse llmResponse = new LlmResponse(content, null, stopReason);
+        llmResponse.setToolCalls(toolCalls);
         if (root.has("usage") && root.get("usage").isJsonObject()) {
             JsonObject usage = root.getAsJsonObject("usage");
             llmResponse.setInputTokens(usage.has("input_tokens") ? usage.get("input_tokens").getAsInt() : 0);
