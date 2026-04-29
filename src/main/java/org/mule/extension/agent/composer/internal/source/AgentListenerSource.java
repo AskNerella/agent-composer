@@ -81,8 +81,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static final String IS_JSONRPC_VAR = "isJsonRpc";
     private static final String IS_STREAMING_VAR = "isStreaming";
     private static final String TASK_STORE_PREFIX = "a2a:task:";
-    private static final String WELL_KNOWN_CARD_PATH = "/.well-known/agent-card.json";
-    private static final String SCOPED_CARD_SUFFIX = "/.well-known/agent-card.json";
+    private static final String CARD_SUFFIX = "/.well-known/agent-card.json";
     private static final String LEGACY_CARD_SUFFIX = "/.well-known/agent.json";
 
     @Config
@@ -118,16 +117,11 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
 
-        // ── GET /.well-known/agent-card.json (plus scoped and legacy aliases) ───────────
-        String scopedCardPath = normalizedPath + SCOPED_CARD_SUFFIX;
+        // ── GET {agentPath}/.well-known/agent-card.json  +  {agentPath}/.well-known/agent.json ──
+        String scopedCardPath = normalizedPath + CARD_SUFFIX;
         String legacyCardPath = normalizedPath + LEGACY_CARD_SUFFIX;
-        cardHandlerManager = addCardHandler(WELL_KNOWN_CARD_PATH, cardBytes);
-        if (!WELL_KNOWN_CARD_PATH.equals(scopedCardPath)) {
-            scopedCardHandlerManager = addCardHandler(scopedCardPath, cardBytes);
-        }
-        if (!WELL_KNOWN_CARD_PATH.equals(legacyCardPath)) {
-            legacyCardHandlerManager = addCardHandler(legacyCardPath, cardBytes);
-        }
+        cardHandlerManager = addCardHandler(scopedCardPath, cardBytes);
+        scopedCardHandlerManager = addCardHandler(legacyCardPath, cardBytes);
 
         // ── POST {agentPath} ─────────────────────────────────────────────────
         agentHandlerManager = httpServer.addRequestHandler(normalizedPath, (requestCtx, responseCallback) -> {
@@ -227,7 +221,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         });
 
         LOGGER.info("Agent Listener attached to HTTP Listener Config '{}' | path={} card={}",
-                configName, normalizedPath, WELL_KNOWN_CARD_PATH);
+                configName, normalizedPath, scopedCardPath);
     }
 
     @Override
@@ -419,22 +413,16 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         if (isTaskCanceled(taskId)) {
                             return;
                         }
+                        // Only emit a status update when the tool response arrives (observation != null)
+                        if (observation == null) {
+                            return;
+                        }
                         try {
-                            if (observation == null) {
-                                // Tool request — emit a "tool-request" status update
-                                String summary = "[Step " + iteration + "] Calling '" + actionName + "'";
-                                JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
-                                persistTask(workingTask);
-                                pipedOut.write(buildToolRequestSseEvent(taskId, contextId, iteration, actionName, isJsonRpc, rpcIdJson)
-                                        .getBytes(StandardCharsets.UTF_8));
-                            } else {
-                                // Tool response — emit a "tool-response" status update
-                                String summary = "[Step " + iteration + "] '" + actionName + "' completed";
-                                JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
-                                persistTask(workingTask);
-                                pipedOut.write(buildToolResponseSseEvent(taskId, contextId, iteration, actionName, observation, isJsonRpc, rpcIdJson)
-                                        .getBytes(StandardCharsets.UTF_8));
-                            }
+                            String summary = "[Step " + iteration + "] '" + actionName + "' completed";
+                            JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
+                            persistTask(workingTask);
+                            pipedOut.write(buildWorkingSseEvent(taskId, contextId, summary, isJsonRpc, rpcIdJson)
+                                    .getBytes(StandardCharsets.UTF_8));
                             pipedOut.flush();
                         } catch (Exception e) {
                             LOGGER.warn("Could not write SSE event for task {}: {}", taskId, e.getMessage());
@@ -886,8 +874,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return wrapSseData(update, isJsonRpc, rpcIdJson);
     }
 
-    private static String buildToolRequestSseEvent(String taskId, String contextId, int iteration,
-                                                   String toolName, boolean isJsonRpc, String rpcIdJson) {
+    private static String buildWorkingSseEvent(String taskId, String contextId, String summary,
+                                               boolean isJsonRpc, String rpcIdJson) {
         JsonObject update = new JsonObject();
         update.addProperty("taskId", taskId);
         update.addProperty("contextId", contextId);
@@ -904,45 +892,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         message.addProperty("kind", "message");
         JsonArray parts = new JsonArray();
         JsonObject part = new JsonObject();
-        part.addProperty("kind", "data");
-        JsonObject data = new JsonObject();
-        data.addProperty("type", "tool-request");
-        data.addProperty("tool", toolName);
-        data.addProperty("step", iteration);
-        part.add("data", data);
-        parts.add(part);
-        message.add("parts", parts);
-        status.add("message", message);
-        update.add("status", status);
-        return wrapSseData(update, isJsonRpc, rpcIdJson);
-    }
-
-    private static String buildToolResponseSseEvent(String taskId, String contextId, int iteration,
-                                                    String toolName, String observation,
-                                                    boolean isJsonRpc, String rpcIdJson) {
-        JsonObject update = new JsonObject();
-        update.addProperty("taskId", taskId);
-        update.addProperty("contextId", contextId);
-        update.addProperty("kind", "status-update");
-        update.addProperty("final", false);
-        JsonObject status = new JsonObject();
-        status.addProperty("state", "working");
-        status.addProperty("timestamp", nowUtc());
-        JsonObject message = new JsonObject();
-        message.addProperty("role", "agent");
-        message.addProperty("messageId", UUID.randomUUID().toString());
-        message.addProperty("taskId", taskId);
-        message.addProperty("contextId", contextId);
-        message.addProperty("kind", "message");
-        JsonArray parts = new JsonArray();
-        JsonObject part = new JsonObject();
-        part.addProperty("kind", "data");
-        JsonObject data = new JsonObject();
-        data.addProperty("type", "tool-response");
-        data.addProperty("tool", toolName);
-        data.addProperty("step", iteration);
-        data.addProperty("result", observation != null ? observation : "");
-        part.add("data", data);
+        part.addProperty("kind", "text");
+        part.addProperty("text", summary);
         parts.add(part);
         message.add("parts", parts);
         status.add("message", message);
