@@ -23,14 +23,16 @@ import java.util.Map;
 /**
  * LlmClient implementation for the OpenAI Responses API (POST /v1/responses).
  *
- * stop_reason "tool_calls" → ToolCall populated; "end_turn" → final text answer.
+ * stop_reason "tool_calls" → ToolCall populated; "end_turn" → final text ans
+ * er.
  */
 public class OpenAiLlmClient implements LlmClient {
 
     private static final String RESPONSES_URL = "https://api.openai.com/v1/responses";
-    private static final String MODELS_URL    = "https://api.openai.com/v1/models";
+    private static final String MODELS_URL = "https://api.openai.com/v1/models";
     private static final Gson GSON = new Gson();
-    private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
+    private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {
+    }.getType();
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
     private final AgentComposerConfiguration config;
@@ -41,13 +43,20 @@ public class OpenAiLlmClient implements LlmClient {
 
     @Override
     public LlmResponse chat(String systemPrompt,
-                            List<LlmMessage> messages,
-                            List<ToolDefinition> tools) throws Exception {
+            List<LlmMessage> messages,
+            List<ToolDefinition> tools) throws Exception {
 
         JsonObject body = new JsonObject();
         body.addProperty("model", config.getModelName());
         body.addProperty("max_output_tokens", config.getMaxTokens());
-        body.addProperty("temperature", config.getTemperature());
+        if (supportsTemperature(config.getModelName())) {
+            body.addProperty("temperature", config.getTemperature());
+        }
+        if (isGpt5Model(config.getModelName())) {
+            JsonObject reasoning = new JsonObject();
+            reasoning.addProperty("effort", "low");
+            body.add("reasoning", reasoning);
+        }
         body.addProperty("instructions", systemPrompt);
 
         // Build input array
@@ -123,27 +132,71 @@ public class OpenAiLlmClient implements LlmClient {
         String textContent = null;
         List<ToolCall> toolCalls = new java.util.ArrayList<>();
 
+        // Fallback text collected from reasoning summary items when no message text is found.
+        StringBuilder reasoningFallback = new StringBuilder();
+
         JsonArray output = root.has("output") ? root.getAsJsonArray("output") : new JsonArray();
         for (JsonElement el : output) {
             JsonObject item = el.getAsJsonObject();
             String type = item.has("type") ? item.get("type").getAsString() : "";
+
             if ("message".equals(type)) {
-                JsonArray contentArr = item.getAsJsonArray("content");
+                // gpt-5.5 and similar models emit two message phases: "commentary" (chain of
+                // thought) and "final" (the actual answer).  Prefer the "final" phase if present,
+                // otherwise fall back to the first non-empty message content we find.
+                String phase = item.has("phase") ? item.get("phase").getAsString() : null;
+                JsonArray contentArr = item.has("content") ? item.getAsJsonArray("content") : new JsonArray();
                 StringBuilder sb = new StringBuilder();
                 for (JsonElement c : contentArr) {
                     JsonObject block = c.getAsJsonObject();
-                    if ("output_text".equals(block.get("type").getAsString())) {
+                    String blockType = block.has("type") ? block.get("type").getAsString() : "";
+                    // Accept both "output_text" (standard) and "text" (some model variants).
+                    if (("output_text".equals(blockType) || "text".equals(blockType))
+                            && block.has("text") && !block.get("text").isJsonNull()) {
                         sb.append(block.get("text").getAsString());
                     }
                 }
-                textContent = sb.length() > 0 ? sb.toString() : null;
+                String candidate = sb.length() > 0 ? sb.toString() : null;
+                if (candidate != null) {
+                    // Always prefer the "final" phase; keep the first non-null otherwise.
+                    if ("final".equals(phase) || textContent == null) {
+                        textContent = candidate;
+                    }
+                }
+
             } else if ("function_call".equals(type)) {
-                String callId = item.get("call_id").getAsString();
-                String name   = item.get("name").getAsString();
+                String callId = item.has("call_id") ? item.get("call_id").getAsString() : "";
+                String name   = item.has("name")    ? item.get("name").getAsString()    : "";
                 String argsJson = item.has("arguments") ? item.get("arguments").getAsString() : "{}";
                 Map<String, Object> args = GSON.fromJson(argsJson, MAP_TYPE);
                 toolCalls.add(new ToolCall(callId, name, args));
+
+            } else if ("reasoning".equals(type)) {
+                // Reasoning models (gpt-5-nano, o-series) emit their chain-of-thought here.
+                // Extract summary text as a fallback in case no message text is produced.
+                if (item.has("summary") && item.get("summary").isJsonArray()) {
+                    for (JsonElement s : item.getAsJsonArray("summary")) {
+                        JsonObject sBlock = s.getAsJsonObject();
+                        String sType = sBlock.has("type") ? sBlock.get("type").getAsString() : "";
+                        if (("text".equals(sType) || "output_text".equals(sType))
+                                && sBlock.has("text") && !sBlock.get("text").isJsonNull()) {
+                            reasoningFallback.append(sBlock.get("text").getAsString());
+                        }
+                    }
+                }
             }
+        }
+
+        // If the message produced no visible text but the reasoning summary has content, use that.
+        // This prevents the "no tool calls and no final text" loop for reasoning-only models.
+        if (textContent == null && reasoningFallback.length() > 0) {
+            textContent = reasoningFallback.toString();
+        }
+
+        if (textContent == null && toolCalls.isEmpty()) {
+            org.slf4j.LoggerFactory.getLogger(OpenAiLlmClient.class)
+                    .debug("OpenAI response yielded no text and no tool calls. stop_reason='{}' raw={}",
+                            stopReason, responseBody);
         }
 
         LlmResponse llmResponse = new LlmResponse(textContent, null, stopReason);
@@ -176,6 +229,33 @@ public class OpenAiLlmClient implements LlmClient {
         }
         ids.sort(String::compareTo);
         return ids;
+    }
+
+    private static boolean supportsTemperature(String modelName) {
+        if (modelName == null)
+            return true;
+
+        String m = modelName.trim().toLowerCase();
+
+        if (m.matches("^o\\d.*"))
+            return false;
+
+        if (m.startsWith("gpt-5-nano") || m.startsWith("gpt-5-mini")) {
+            return false;
+        }
+
+        if (m.matches("^gpt-5(-[a-z0-9]+)*-nano.*"))
+            return false;
+        if (m.matches("^gpt-5(-[a-z0-9]+)*-mini.*"))
+            return false;
+
+        return true;
+    }
+
+    private static boolean isGpt5Model(String modelName) {
+        if (modelName == null)
+            return false;
+        return modelName.trim().toLowerCase().startsWith("gpt-5");
     }
 
     private String post(String url, String body) throws Exception {

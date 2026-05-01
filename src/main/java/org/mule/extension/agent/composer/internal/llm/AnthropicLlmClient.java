@@ -50,7 +50,9 @@ public class AnthropicLlmClient implements LlmClient {
         JsonObject body = new JsonObject();
         body.addProperty("model", config.getModelName());
         body.addProperty("max_tokens", config.getMaxTokens());
-        body.addProperty("temperature", config.getTemperature());
+        if (supportsTemperature(config.getModelName())) {
+            body.addProperty("temperature", config.getTemperature());
+        }
         body.addProperty("system", systemPrompt);
 
         JsonArray msgsArr = new JsonArray();
@@ -173,6 +175,16 @@ public class AnthropicLlmClient implements LlmClient {
             llmResponse.setOutputTokens(usage.has("output_tokens") ? usage.get("output_tokens").getAsInt() : 0);
         }
         return llmResponse;
+    }
+
+    /**
+     * Returns {@code false} for Anthropic models that do not support the
+     * {@code temperature} parameter. Currently all released models support it,
+     * but this guard is here for forward-compatibility.
+     */
+    private static boolean supportsTemperature(String modelName) {
+        // All current Anthropic models support temperature; extend as needed.
+        return true;
     }
 
     public List<String> listModels() throws Exception {

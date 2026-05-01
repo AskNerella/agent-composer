@@ -27,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Arrays;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -52,6 +53,10 @@ public class ReactEngine {
     private static final Logger LOGGER = LoggerFactory.getLogger(ReactEngine.class);
     private static final Gson GSON = new Gson();
     private static final Type MSG_LIST_TYPE = new TypeToken<List<LlmMessage>>() {}.getType();
+    private static final int COMPRESSION_TOKEN_THRESHOLD = 300000;
+    private static final int TOOL_RESULT_CONTEXT_MAX_CHARS = 2000;
+    private static final int TOOL_RESULT_CONTEXT_HEAD_CHARS = 1300;
+    private static final int TOOL_RESULT_CONTEXT_TAIL_CHARS = 500;
 
     /** Verbs that indicate a create/update/delete intent — responses to these are not cached. */
     private static final List<String> MUTATION_VERBS = Arrays.asList(
@@ -200,7 +205,7 @@ public class ReactEngine {
         String bestFinalAnswer = null;
         int actualIterations = 0;
         int toolFailureCount = 0;
-        int toolCallsSinceCompression = 0; // compress every 2 tool calls
+        int tokensSinceCompression = 0; // compress when accumulated LLM token usage crosses threshold
 
         for (int iteration = 0; iteration < maxIterations; iteration++) {
             actualIterations = iteration + 1;
@@ -216,6 +221,7 @@ public class ReactEngine {
 
             LlmResponse response = callLlmWithSingleRetry(llmClient, instructions, messages, allTools, iteration + 1);
             currentThought = response.getContent() != null ? response.getContent() : "";
+            tokensSinceCompression += getTotalTokens(response);
 
             LOGGER.debug("[Iteration {}] Tokens used | input={} output={} total={}",
                     iteration + 1, response.getInputTokens(), response.getOutputTokens(),
@@ -226,18 +232,24 @@ public class ReactEngine {
             }
 
             if (response.hasFinalAnswer()) {
-                if (isBetterFinalAnswer(currentThought, bestFinalAnswer)) {
-                    bestFinalAnswer = currentThought;
-                }
-                finalAnswer = bestFinalAnswer;
-                LOGGER.debug("[Iteration {}] Final answer received.", iteration + 1);
-                messages.add(new LlmMessage("assistant", currentThought));
-                saveHistory(store, conversationId, messages);
+                if (hasText(currentThought)) {
+                    if (isBetterFinalAnswer(currentThought, bestFinalAnswer)) {
+                        bestFinalAnswer = currentThought;
+                    }
+                    finalAnswer = bestFinalAnswer;
+                    LOGGER.debug("[Iteration {}] Final answer received.", iteration + 1);
+                    messages.add(new LlmMessage("assistant", currentThought));
+                    saveHistory(store, conversationId, messages);
 
-                if (shouldStopAfterFinalAnswer(toolCallRecords, allTools)) {
                     LOGGER.info("[Iteration {}] Stopping early: grounded final answer is available.", iteration + 1);
                     break;
                 }
+
+                LOGGER.warn("[Iteration {}] LLM returned no tool calls and no final text; asking for a textual answer.", iteration + 1);
+                messages.add(new LlmMessage("user",
+                        "Provide the final answer to the user in text using the available tool results. "
+                                + "Do not call additional tools unless more information is truly required."));
+                saveHistory(store, conversationId, messages);
                 continue;
             }
 
@@ -278,11 +290,14 @@ public class ReactEngine {
                         iteration + 1, toolCalls.size(),
                         toolCalls.stream().map(ToolCall::getName).collect(Collectors.joining(", ")));
 
-                // Fire all "request" callbacks before launching parallel execution
+                // Emit a single request status for all tools in this parallel batch.
                 if (callback != null) {
-                    for (ToolCall tc : toolCalls) {
-                        callback.onIteration(iteration + 1, tc.getName(), null);
-                    }
+                    String joinedTools = toolCalls.stream()
+                            .map(ToolCall::getName)
+                            .collect(Collectors.joining(", "));
+                    callback.onIteration(iteration + 1,
+                            "Performing parallel tool requests",
+                            "Passing requests to tools: " + joinedTools + ".");
                 }
 
                 AtomicInteger parallelFailures = new AtomicInteger(0);
@@ -337,17 +352,22 @@ public class ReactEngine {
                     ToolCall tc = toolCalls.get(t);
                     String obs;
                     try { obs = futures.get(t).get(); } catch (Exception e) { obs = "Error: " + e.getMessage(); }
+                    saveFullToolOutput(store, conversationId, tc, obs);
+                    String obsForContext = compactToolObservation(tc.getName(), obs);
                     AgentSkillConfig matchedSkillP = findSkillByName(tc.getName(), skills);
                     String serverName = matchedSkillP != null
                             ? "skill:" + matchedSkillP.getName()
                             : findMcpServerName(tc, mcpTools, mcpServers);
-                    if (callback != null) callback.onIteration(iteration + 1, tc.getName(), obs);
+                        if (callback != null) {
+                        callback.onIteration(iteration + 1,
+                            "Received tool response",
+                            "Received data from tool '" + tc.getName() + "'; checking result.");
+                        }
                     toolCallRecords.add(new AgentResponse.ToolCallRecord(
                             serverName != null ? serverName : "unknown",
                             tc.getName(), tc.getArguments(), obs, iteration + 1));
-                    messages.add(new LlmMessage("tool_result", obs, tc.getId(), tc.getName()));
+                        messages.add(new LlmMessage("tool_result", obsForContext, tc.getId(), tc.getName()));
                 }
-                toolCallsSinceCompression += toolCalls.size();
 
             } else {
                 // ── Single tool (sequential) ──────────────────────────────────────
@@ -366,7 +386,11 @@ public class ReactEngine {
                     mcpServerName = "skill:" + matchedSkill.getName();
                     try {
                         LOGGER.info("[Iteration {}] Skill request | name='{}' task={}", iteration + 1, matchedSkill.getName(), taskArg);
-                        if (callback != null) callback.onIteration(iteration + 1, matchedSkill.getName(), null);
+                        if (callback != null) {
+                            callback.onIteration(iteration + 1,
+                                    "Performing skill execution",
+                                    "Passing request to skill '" + matchedSkill.getName() + "'.");
+                        }
                         observation = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
                                 iteration + 1, maxIterations - iteration, callback);
                         LOGGER.info("[Iteration {}] Skill response | name='{}' result={}", iteration + 1, matchedSkill.getName(), observation);
@@ -375,7 +399,11 @@ public class ReactEngine {
                         toolFailureCount++;
                         LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration + 1, matchedSkill.getName(), e.getMessage(), e);
                     }
-                    if (callback != null) callback.onIteration(iteration + 1, matchedSkill.getName(), observation);
+                        if (callback != null) {
+                        callback.onIteration(iteration + 1,
+                            "Received skill response",
+                            "Received data from skill '" + matchedSkill.getName() + "'; validating output.");
+                        }
                     toolCallRecords.add(new AgentResponse.ToolCallRecord(
                             mcpServerName, toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
                 } else {
@@ -388,10 +416,18 @@ public class ReactEngine {
                     try {
                         LOGGER.info("[Iteration {}] Tool request | name='{}' args={}",
                                 iteration + 1, toolCall.getName(), GSON.toJson(toolCall.getArguments()));
-                        if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), null);
+                        if (callback != null) {
+                            callback.onIteration(iteration + 1,
+                                "Performing tool invocation",
+                                "Passing request to tool '" + toolCall.getName() + "'.");
+                        }
                         observation = executeTool(toolCall, mcpTools, mcpServers);
                         LOGGER.info("[Iteration {}] Tool response | name='{}' result={}", iteration + 1, toolCall.getName(), observation);
-                        if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), observation);
+                        if (callback != null) {
+                            callback.onIteration(iteration + 1,
+                                "Received tool response",
+                                "Received data from tool '" + toolCall.getName() + "'; checking output.");
+                        }
                         toolCallRecords.add(new AgentResponse.ToolCallRecord(
                                 mcpServerName != null ? mcpServerName : "unknown",
                                 toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
@@ -399,23 +435,33 @@ public class ReactEngine {
                         observation = "Tool execution failed: " + e.getMessage();
                         toolFailureCount++;
                         LOGGER.warn("[Iteration {}] Tool '{}' failed: {}", iteration + 1, toolCall.getName(), e.getMessage(), e);
-                        if (callback != null) callback.onIteration(iteration + 1, toolCall.getName(), observation);
+                        if (callback != null) {
+                            callback.onIteration(iteration + 1,
+                                "Validating tool failure",
+                                "Received failure from tool '" + toolCall.getName() + "'; checking retry path.");
+                        }
                         toolCallRecords.add(new AgentResponse.ToolCallRecord(
                                 mcpServerName != null ? mcpServerName : "unknown",
                                 toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
                     }
                 }
 
-                messages.add(new LlmMessage("tool_result", observation, toolCall.getId(), toolCall.getName()));
-                toolCallsSinceCompression++;
+                saveFullToolOutput(store, conversationId, toolCall, observation);
+                String observationForContext = compactToolObservation(toolCall.getName(), observation);
+                messages.add(new LlmMessage("tool_result", observationForContext, toolCall.getId(), toolCall.getName()));
             }
 
             // ── Context compression ──────────────────────────────────────────────
-            // Every 2 tool calls (or batches), summarise older messages to keep the
+            // When accumulated token usage crosses the threshold, summarise older messages to keep the
             // context window manageable and avoid token-limit errors.
-            if (toolCallsSinceCompression >= 2) {
+            if (tokensSinceCompression >= COMPRESSION_TOKEN_THRESHOLD) {
+                if (callback != null) {
+                    callback.onIteration(iteration + 1,
+                            "Compacting conversation history",
+                            "Compacting conversation to reduce token usage.");
+                }
                 messages = compressHistory(llmClient, messages);
-                toolCallsSinceCompression = 0;
+                tokensSinceCompression = 0;
             }
 
             saveHistory(store, conversationId, messages);
@@ -621,12 +667,13 @@ public class ReactEngine {
         int consecutiveTextResponses = 0;
         final int MAX_TEXT_REPROMPTS = 3;
         boolean hasTools = !skillMcpTools.isEmpty();
-        int skillToolCallsSinceCompression = 0; // compress every 2 tool calls
+        int skillTokensSinceCompression = 0; // compress when accumulated LLM token usage crosses threshold
 
         for (int i = 0; i < maxSkillIterations; i++) {
             LOGGER.info("[Skill '{}' | Step {}/{}] Sending {} message(s) to LLM",
                     skill.getName(), i + 1, maxSkillIterations, skillMessages.size());
             LlmResponse response = llmClient.chat(skillInstructions, skillMessages, skillMcpTools);
+                skillTokensSinceCompression += getTotalTokens(response);
 
             LOGGER.debug("[Skill '{}' | Step {}/{}] Tokens used | input={} output={} total={}",
                     skill.getName(), i + 1, maxSkillIterations,
@@ -672,7 +719,8 @@ public class ReactEngine {
             // Notify before execution so SSE clients see the tool being invoked
             if (callback != null) {
                 callback.onIteration(parentIteration,
-                        skill.getName() + " → " + toolCall.getName(), "calling...");
+                        "Passing skill tool request",
+                        "Passing request from skill '" + skill.getName() + "' to tool '" + toolCall.getName() + "'.");
             }
 
             String obs;
@@ -690,16 +738,22 @@ public class ReactEngine {
             // Notify after execution with the actual observation
             if (callback != null) {
                 callback.onIteration(parentIteration,
-                        skill.getName() + " → " + toolCall.getName(), obs);
+                        "Received skill tool response",
+                        "Received data from tool '" + toolCall.getName() + "' for skill '" + skill.getName() + "'; validating result.");
             }
 
-            skillMessages.add(new LlmMessage("tool_result", obs, toolCall.getId(), toolCall.getName()));
+            String obsForContext = compactToolObservation(toolCall.getName(), obs);
+            skillMessages.add(new LlmMessage("tool_result", obsForContext, toolCall.getId(), toolCall.getName()));
 
             // ── Context compression (skill sub-loop) ─────────────────────────
-            skillToolCallsSinceCompression++;
-            if (skillToolCallsSinceCompression >= 2) {
+            if (skillTokensSinceCompression >= COMPRESSION_TOKEN_THRESHOLD) {
+                if (callback != null) {
+                    callback.onIteration(parentIteration,
+                            "Compacting skill conversation",
+                            "Compacting conversation to reduce token usage.");
+                }
                 skillMessages = compressHistory(llmClient, skillMessages);
-                skillToolCallsSinceCompression = 0;
+                skillTokensSinceCompression = 0;
             }
         }
 
@@ -725,6 +779,12 @@ public class ReactEngine {
 
         int keepTail = 2; // always keep the last 2 messages (most recent thought + tool result)
         int compressUpTo = messages.size() - keepTail;
+        
+        while (compressUpTo > 1 && "tool_result".equals(messages.get(compressUpTo).getRole())) {
+            compressUpTo--;
+        }
+        // If we couldn't find a safe cut point, leave the history untouched.
+        if (compressUpTo <= 1) return messages;
 
         try {
             StringBuilder sb = new StringBuilder();
@@ -836,35 +896,6 @@ public class ReactEngine {
                 + " | Tool calls: " + toolCallCount;
     }
 
-    private boolean shouldStopAfterFinalAnswer(List<AgentResponse.ToolCallRecord> toolCalls,
-                                               List<ToolDefinition> tools) {
-        if (tools == null || tools.isEmpty()) {
-            // No tools available — model can only answer from knowledge, so stop.
-            return true;
-        }
-        if (toolCalls == null || toolCalls.isEmpty()) {
-            // LLM answered directly without using any tools — stop immediately.
-            return true;
-        }
-        // Only stop when the MOST RECENT tool call in this iteration produced a
-        // good result.  Walking the whole list would stop the loop after the very
-        // first successful tool call, preventing subsequent iterations.
-        AgentResponse.ToolCallRecord last = toolCalls.get(toolCalls.size() - 1);
-        if (last == null) return false;
-        String response = last.getToolResponse();
-        return response != null && !response.trim().isEmpty() && !isLikelyToolError(response);
-    }
-
-    private boolean isLikelyToolError(String text) {
-        String lower = text.toLowerCase();
-        return lower.startsWith("tool execution failed")
-                || lower.startsWith("error calling tool")
-                || lower.contains(" server error")
-                || lower.contains("http error")
-                || lower.contains("connection refused")
-                || lower.contains("timed out");
-    }
-
     private boolean isBetterFinalAnswer(String candidate, String currentBest) {
         if (candidate == null || candidate.trim().isEmpty()) {
             return false;
@@ -889,6 +920,69 @@ public class ReactEngine {
             score -= 200;
         }
         return score;
+    }
+
+    private boolean hasText(String text) {
+        return text != null && !text.trim().isEmpty();
+    }
+
+    private int getTotalTokens(LlmResponse response) {
+        if (response == null) {
+            return 0;
+        }
+        return Math.max(0, response.getInputTokens()) + Math.max(0, response.getOutputTokens());
+    }
+
+    private String compactToolObservation(String toolName, String observation) {
+        if (observation == null) {
+            return "Tool '" + toolName + "' returned no data.";
+        }
+
+        String trimmed = observation.trim();
+        if (trimmed.length() <= TOOL_RESULT_CONTEXT_MAX_CHARS) {
+            return trimmed;
+        }
+
+        int headLen = Math.min(TOOL_RESULT_CONTEXT_HEAD_CHARS, trimmed.length());
+        int tailLen = Math.min(TOOL_RESULT_CONTEXT_TAIL_CHARS, Math.max(0, trimmed.length() - headLen));
+        String head = trimmed.substring(0, headLen);
+        String tail = tailLen > 0 ? trimmed.substring(trimmed.length() - tailLen) : "";
+
+        return "Tool '" + toolName + "' returned a large payload. "
+                + "Using compact view for context. Original chars=" + trimmed.length() + "\n"
+                + "--- BEGIN PREVIEW ---\n"
+                + head
+                + "\n--- PREVIEW TRUNCATED ---\n"
+                + (tail.isEmpty() ? "" : "--- END PREVIEW ---\n" + tail);
+    }
+
+    private void saveFullToolOutput(ObjectStore<Serializable> store,
+                                    String conversationId,
+                                    ToolCall toolCall,
+                                    String observation) {
+        if (store == null || conversationId == null || conversationId.trim().isEmpty() || toolCall == null) {
+            return;
+        }
+        String toolCallId = toolCall.getId() != null && !toolCall.getId().trim().isEmpty()
+                ? toolCall.getId()
+                : UUID.randomUUID().toString();
+        String key = "tool-output::" + conversationId + "::" + toolCallId;
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("conversationId", conversationId);
+        payload.put("toolCallId", toolCallId);
+        payload.put("toolName", toolCall.getName());
+        payload.put("toolArguments", toolCall.getArguments());
+        payload.put("response", observation);
+
+        try {
+            if (store.contains(key)) {
+                store.remove(key);
+            }
+            store.store(key, GSON.toJson(payload));
+        } catch (Exception e) {
+            LOGGER.warn("Could not persist full tool output for key '{}': {}", key, e.getMessage());
+        }
     }
 
     // ── Object Store helpers ──────────────────────────────────────────────────

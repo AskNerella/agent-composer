@@ -413,12 +413,13 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         if (isTaskCanceled(taskId)) {
                             return;
                         }
-                        // Only emit a status update when the tool response arrives (observation != null)
-                        if (observation == null) {
+                        String summary = observation != null && !observation.trim().isEmpty()
+                                ? observation
+                                : actionName;
+                        if (summary == null || summary.trim().isEmpty()) {
                             return;
                         }
                         try {
-                            String summary = "[Step " + iteration + "] '" + actionName + "' completed";
                             JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
                             persistTask(workingTask);
                             pipedOut.write(buildWorkingSseEvent(taskId, contextId, summary, isJsonRpc, rpcIdJson)
