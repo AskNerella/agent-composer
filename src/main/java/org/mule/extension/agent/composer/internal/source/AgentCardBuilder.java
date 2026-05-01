@@ -41,30 +41,34 @@ public class AgentCardBuilder {
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
 
-        // Resolve host from the bound server address when possible, then fall back
-        // to mule.host and finally localhost for wildcard listener bindings.
-        String host = System.getProperty("mule.host", "localhost");
-        int port = 8081;
-        try {
-            String mulePort = System.getProperty("mule.port");
-            if (mulePort != null && !mulePort.isEmpty()) {
-                port = Integer.parseInt(mulePort);
-            }
-        } catch (NumberFormatException ignored) {}
+        // Resolve host. If the caller explicitly configured agent-composer.host, honour it
+        // and force HTTPS (it is assumed to be a public/TLS endpoint). Otherwise fall back
+        // to the bound server address and then to localhost:8081 with plain HTTP.
+        String customHost = System.getProperty("agent-composer.host", "localhost");
+        boolean useCustomHost = !customHost.equals("localhost");
 
-        if (httpServer != null) {
-            try {
-                port = httpServer.getServerAddress().getPort();
-                String boundIp = httpServer.getServerAddress().getIp();
-                if (boundIp != null && !boundIp.isEmpty()
-                        && !boundIp.equals("0.0.0.0") && !boundIp.equals("::")) {
-                    host = boundIp;
-                }
-            } catch (Exception ignored) {}
+        String host = customHost.trim();
+        int port = 8081;
+
+        if (!useCustomHost) {
+            if (httpServer != null) {
+                try {
+                    port = httpServer.getServerAddress().getPort();
+                    String boundIp = httpServer.getServerAddress().getIp();
+                    if (boundIp != null && !boundIp.isEmpty()
+                            && !boundIp.equals("0.0.0.0") && !boundIp.equals("::")) {
+                        host = boundIp;
+                    }
+                } catch (Exception ignored) {}
+            }
         }
 
-        String scheme = (port == 443 || port == 8443) ? "https" : "http";
-        String agentUrl = scheme + "://" + host + ":" + port + normalizedPath;
+        String scheme = useCustomHost ? "https" : (port == 443 || port == 8443) ? "https" : "http";
+        // For custom hosts the port is omitted (assumed standard 443 for HTTPS).
+        // For localhost fallback, include the port explicitly.
+        String agentUrl = useCustomHost
+                ? scheme + "://" + host + normalizedPath
+                : scheme + "://" + host + ":" + port + normalizedPath;
 
         Map<String, Object> card = new LinkedHashMap<>();
         card.put("protocolVersion", "0.3.0");
