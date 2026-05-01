@@ -76,6 +76,7 @@ public class AgentCardBuilder {
         card.put("description", nonEmpty(config.getAgentDescription(), "A ReAct agent powered by Agent Composer."));
         card.put("version", nonEmpty(config.getAgentVersion(), "1.0.0"));
         card.put("url", agentUrl);
+        card.put("securitySchemes", Collections.emptyMap());
         card.put("preferredTransport", "JSONRPC");
         card.put("additionalInterfaces", Collections.singletonList(interfaceEntry(agentUrl, "JSONRPC")));
 
@@ -131,10 +132,13 @@ public class AgentCardBuilder {
                             continue; // skip non-whitelisted tools
                         }
                         Map<String, Object> skill = new LinkedHashMap<>();
+                        List<String> tags = new ArrayList<>();
+                        tags.add(nonEmpty(server.getName(), "unknown-mcp-server"));
+                        tags.add(tool.getName());
                         skill.put("id", tool.getName());
                         skill.put("name", tool.getName());
                         skill.put("description", nonEmpty(tool.getDescription(), ""));
-                        skill.put("tags", Collections.emptyList());
+                        skill.put("tags", tags);
                         skill.put("inputModes", Collections.singletonList("text/plain"));
                         skill.put("outputModes", List.of("text/plain", "application/json"));
                         skills.add(skill);
