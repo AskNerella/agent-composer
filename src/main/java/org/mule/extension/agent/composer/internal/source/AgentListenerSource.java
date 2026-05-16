@@ -126,20 +126,18 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         // ── POST {agentPath} ─────────────────────────────────────────────────
         agentHandlerManager = httpServer.addRequestHandler(normalizedPath, (requestCtx, responseCallback) -> {
             String method = requestCtx.getRequest().getMethod();
-            if (!requestCtx.getRequest().getPath().equals(normalizedPath)) {
-                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
-                return;
-            }
             if (!"POST".equalsIgnoreCase(method)) {
-                sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
+                sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
                 return;
             }
 
             String requestId = UUID.randomUUID().toString();
+            String body = "";
+            String rpcIdJson = null;
+            boolean isJsonRpc = false;
 
             try {
                 // Read request body
-                String body = "";
                 try (InputStream is = requestCtx.getRequest().getEntity().getContent()) {
                     body = new String(is.readAllBytes(), StandardCharsets.UTF_8);
                 } catch (IOException e) {
@@ -154,9 +152,16 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 String remoteAddr = requestCtx.getClientConnection() != null
                         ? requestCtx.getClientConnection().getRemoteHostAddress().toString() : "unknown";
 
-                String rpcIdJson = extractRpcIdJson(body);
-                boolean isJsonRpc = rpcIdJson != null;
+                rpcIdJson = extractRpcIdJson(body);
+                isJsonRpc = rpcIdJson != null;
                 String methodName = extractMethodName(body);
+                JsonObject requestRoot = parseJsonObject(body);
+                if (requestRoot != null && requestRoot.has("jsonrpc")
+                    && (methodName == null || methodName.trim().isEmpty())) {
+                    sendProtocolError(responseCallback, 400, -32600,
+                        "Invalid Request: missing required method.", true, rpcIdJson);
+                    return;
+                }
 
                 if (isTaskGetRequest(methodName)) {
                     handleTaskGetRequest(responseCallback, body, isJsonRpc, rpcIdJson);
@@ -216,7 +221,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
             } catch (Exception e) {
                 LOGGER.error("Error handling agent task {}: {}", requestId, e.getMessage(), e);
-                sendResponse(responseCallback, 500, "{\"error\":\"Internal server error\"}");
+                sendProtocolError(responseCallback, 500, -32000,
+                        "Internal server error", isJsonRpc, rpcIdJson);
             }
         });
 
@@ -317,12 +323,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
     private RequestHandlerManager addCardHandler(String path, byte[] cardBytes) {
         return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
-            if (!requestCtx.getRequest().getPath().equals(path)) {
-                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
-                return;
-            }
             if (!"GET".equalsIgnoreCase(requestCtx.getRequest().getMethod())) {
-                sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
+                sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
                 return;
             }
             sendResponseBytes(responseCallback, 200, cardBytes);
@@ -935,8 +937,10 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             return;
         }
 
-        errorBody.addProperty("code", code);
-        errorBody.addProperty("error", message);
+        JsonObject error = new JsonObject();
+        error.addProperty("code", code);
+        error.addProperty("message", message);
+        errorBody.add("error", error);
         sendResponse(responseCallback, httpStatus, errorBody.toString());
     }
 
