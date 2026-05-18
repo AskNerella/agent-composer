@@ -191,7 +191,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         requestId);
 
                 // Store HTTP callback in context so @OnSuccess / @OnError can send the response
-                persistTask(buildTask(taskId, contextId, "submitted", null, null));
+                persistTask(buildTask(taskId, contextId, "submitted", null, null, null));
 
                 // ── Streaming: message/stream or tasks/sendSubscribe ─────────
                 // These bypass the Mule flow so we can push SSE events per iteration.
@@ -268,13 +268,15 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             JsonObject agentResponse = parseJsonObject(rawPayload);
             if (isInputRequired(agentResponse)) {
                 String question = extractInputRequest(agentResponse, rawPayload);
-                JsonObject task = buildTask(taskId, contextId, "input-required", question, null);
+                JsonObject task = buildTask(taskId, contextId, "input-required", question, null, null);
                 persistTask(task);
                 sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
                 return;
             }
 
-            JsonObject task = buildTask(taskId, contextId, "completed", null, extractAgentOutput(rawPayload, agentResponse));
+            String agentOutput = extractAgentOutput(rawPayload, agentResponse);
+            String uiHtml = extractFirstUiHtml(agentResponse);
+            JsonObject task = buildTask(taskId, contextId, "completed", null, agentOutput, uiHtml);
             persistTask(task);
             sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
         });
@@ -293,7 +295,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
             JsonObject task = getCanceledTask(taskId);
             if (task == null) {
-                task = buildTask(taskId, contextId, "canceled", "Flow terminated before response was sent", null);
+                task = buildTask(taskId, contextId, "canceled", "Flow terminated before response was sent", null, null);
                 persistTask(task);
             }
             sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
@@ -312,7 +314,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
             JsonObject task = getCanceledTask(taskId);
             if (task == null) {
-                task = buildTask(taskId, contextId, "failed", msg, null);
+                task = buildTask(taskId, contextId, "failed", msg, null, null);
                 persistTask(task);
             }
             sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
@@ -379,7 +381,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         }
 
         JsonObject canceledTask = buildTask(taskId, extractTaskContextId(existingTask, taskId),
-                "canceled", "Task canceled by client request.", null);
+                "canceled", "Task canceled by client request.", null, null);
         if (existingTask.has("history")) {
             canceledTask.add("history", existingTask.get("history").deepCopy());
         }
@@ -399,7 +401,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             PipedOutputStream pipedOut = new PipedOutputStream();
             PipedInputStream pipedIn = new PipedInputStream(pipedOut, 131072);
 
-            JsonObject submittedTask = buildTask(taskId, contextId, "submitted", null, null);
+            JsonObject submittedTask = buildTask(taskId, contextId, "submitted", null, null, null);
             persistTask(submittedTask);
 
             try {
@@ -422,7 +424,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                             return;
                         }
                         try {
-                            JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
+                            JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null, null);
                             persistTask(workingTask);
                             pipedOut.write(buildWorkingSseEvent(taskId, contextId, summary, isJsonRpc, rpcIdJson)
                                     .getBytes(StandardCharsets.UTF_8));
@@ -438,7 +440,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     if (isTaskCanceled(taskId)) {
                         JsonObject canceledTask = getCanceledTask(taskId);
                         if (canceledTask == null) {
-                            canceledTask = buildTask(taskId, contextId, "canceled", "Task canceled by client request.", null);
+                            canceledTask = buildTask(taskId, contextId, "canceled", "Task canceled by client request.", null, null);
                             persistTask(canceledTask);
                         }
                         pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "canceled",
@@ -449,7 +451,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
                     if (result.isRequiresInput()) {
                         LOGGER.info("[SSE task {}] Agent requires input: {}", taskId, result.getInputRequest());
-                        JsonObject inputRequiredTask = buildTask(taskId, contextId, "input-required", result.getInputRequest(), null);
+                        JsonObject inputRequiredTask = buildTask(taskId, contextId, "input-required", result.getInputRequest(), null, null);
                         persistTask(inputRequiredTask);
                         pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "input-required",
                                 result.getInputRequest(), true, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
@@ -457,9 +459,11 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         return;
                     }
 
-                    JsonObject completedTask = buildTask(taskId, contextId, "completed", null, result.getResponse());
+                    String uiHtml = result.getFirstUiHtml();
+                    LOGGER.info("[SSE task {}] Agent completed — uiHtml present: {}", taskId, uiHtml != null);
+                    JsonObject completedTask = buildTask(taskId, contextId, "completed", null, result.getResponse(), uiHtml);
                     persistTask(completedTask);
-                    pipedOut.write(buildArtifactUpdateSseEvent(taskId, contextId, result.getResponse(), isJsonRpc, rpcIdJson)
+                    pipedOut.write(buildArtifactUpdateSseEvent(taskId, contextId, result.getResponse(), uiHtml, isJsonRpc, rpcIdJson)
                             .getBytes(StandardCharsets.UTF_8));
                     pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "completed", null, true, isJsonRpc, rpcIdJson)
                             .getBytes(StandardCharsets.UTF_8));
@@ -468,7 +472,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     LOGGER.error("Streaming agent error for task {}: {}", taskId, e.getMessage(), e);
                     try {
                         JsonObject failedTask = buildTask(taskId, contextId, "failed",
-                                "Agent execution failed: " + e.getMessage(), null);
+                                "Agent execution failed: " + e.getMessage(), null, null);
                         persistTask(failedTask);
                         pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "failed",
                                 "Agent execution failed: " + e.getMessage(), true, isJsonRpc, rpcIdJson)
@@ -501,7 +505,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
         } catch (Exception e) {
             LOGGER.error("Failed to set up SSE stream for task {}: {}", taskId, e.getMessage(), e);
-            JsonObject failedTask = buildTask(taskId, contextId, "failed", "Streaming setup failed: " + e.getMessage(), null);
+            JsonObject failedTask = buildTask(taskId, contextId, "failed", "Streaming setup failed: " + e.getMessage(), null, null);
             persistTask(failedTask);
             sendResponse(responseCallback, 200, wrapTaskResponse(failedTask, isJsonRpc, rpcIdJson));
         }
@@ -599,6 +603,25 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     : response.toString();
         }
         return rawPayload != null ? rawPayload : "";
+    }
+
+    /**
+     * Scans {@code agentResponse.toolCalls} for the first non-empty {@code uiHtml} value.
+     * Returns {@code null} when no tool in this response produced an MCP-UI HTML widget.
+     */
+    private static String extractFirstUiHtml(JsonObject agentResponse) {
+        if (agentResponse == null || !agentResponse.has("toolCalls")) return null;
+        JsonElement toolCallsEl = agentResponse.get("toolCalls");
+        if (!toolCallsEl.isJsonArray()) return null;
+        for (JsonElement el : toolCallsEl.getAsJsonArray()) {
+            if (!el.isJsonObject()) continue;
+            JsonObject record = el.getAsJsonObject();
+            if (record.has("uiHtml") && !record.get("uiHtml").isJsonNull()) {
+                String html = record.get("uiHtml").getAsString();
+                if (html != null && !html.isEmpty()) return html;
+            }
+        }
+        return null;
     }
 
     /**
@@ -772,15 +795,15 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return null;
     }
 
-    private static JsonObject buildTask(String taskId, String contextId, String state, String statusText, String artifactText) {
+    private static JsonObject buildTask(String taskId, String contextId, String state, String statusText, String artifactText, String artifactHtml) {
         String safeContextId = (contextId == null || contextId.trim().isEmpty()) ? taskId : contextId;
         JsonObject task = new JsonObject();
         task.addProperty("id", taskId);
         task.addProperty("contextId", safeContextId);
         task.add("status", buildStatus(state, statusText, taskId, safeContextId));
-        if (artifactText != null) {
+        if (artifactText != null || artifactHtml != null) {
             JsonArray artifacts = new JsonArray();
-            artifacts.add(buildArtifact(taskId, artifactText));
+            artifacts.add(buildArtifact(taskId, artifactText, artifactHtml));
             task.add("artifacts", artifacts);
         }
         task.addProperty("kind", "task");
@@ -810,12 +833,19 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return message;
     }
 
-    private static JsonObject buildArtifact(String taskId, String payload) {
+    private static JsonObject buildArtifact(String taskId, String payload, String uiHtml) {
         JsonObject artifact = new JsonObject();
         artifact.addProperty("artifactId", taskId + "-response");
         artifact.addProperty("name", "response");
         JsonArray parts = new JsonArray();
-        parts.add(buildPayloadPart(payload));
+        if (payload != null) {
+            parts.add(buildPayloadPart(payload));
+        }
+        if (uiHtml != null && !uiHtml.isEmpty()) {
+            // MCP Apps HTML widget — clients that understand text/html;profile=mcp-app
+            // should render this in a sandboxed iframe instead of displaying as text.
+            parts.add(buildTextPart(uiHtml, "text/html;profile=mcp-app"));
+        }
         artifact.add("parts", parts);
         return artifact;
     }
@@ -867,12 +897,13 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     }
 
     private static String buildArtifactUpdateSseEvent(String taskId, String contextId, String payload,
+                                                      String uiHtml,
                                                       boolean isJsonRpc, String rpcIdJson) {
         JsonObject update = new JsonObject();
         update.addProperty("taskId", taskId);
         update.addProperty("contextId", contextId);
         update.addProperty("kind", "artifact-update");
-        update.add("artifact", buildArtifact(taskId, payload));
+        update.add("artifact", buildArtifact(taskId, payload, uiHtml));
         update.addProperty("lastChunk", true);
         return wrapSseData(update, isJsonRpc, rpcIdJson);
     }

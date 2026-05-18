@@ -27,6 +27,14 @@ public class ToolDefinition implements Serializable {
      */
     private String serverUrl;
 
+    /**
+     * MCP Apps UI resource URI declared in the tool's {@code _meta.ui.resourceUri}
+     * field (returned by {@code tools/list}). When non-null the client should call
+     * {@code resources/read} with this URI to obtain the interactive HTML widget
+     * for this tool call.
+     */
+    private String uiResourceUri;
+
     // ── constructors ──────────────────────────────────────────────────────────
 
     public ToolDefinition() {}
@@ -52,4 +60,7 @@ public class ToolDefinition implements Serializable {
 
     public String getServerUrl() { return serverUrl; }
     public void setServerUrl(String serverUrl) { this.serverUrl = serverUrl; }
+
+    public String getUiResourceUri() { return uiResourceUri; }
+    public void setUiResourceUri(String uiResourceUri) { this.uiResourceUri = uiResourceUri; }
 }

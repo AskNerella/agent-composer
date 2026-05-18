@@ -23,7 +23,9 @@
           "toolName": { "type": "string" },
           "toolRequest": { "type": "object" },
           "toolResponse": { "type": "string" },
-          "iterationNumber": { "type": "integer" }
+          "iterationNumber": { "type": "integer" },
+          "uiResourceUri": { "type": ["string", "null"], "description": "URI of the MCP-UI resource returned by this tool (e.g. ui://...), if any." },
+          "uiHtml": { "type": ["string", "null"], "description": "Rendered HTML of the MCP-UI resource associated with this tool call, if any." }
         }
       }
     }

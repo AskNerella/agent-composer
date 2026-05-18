@@ -7,7 +7,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>com.k2</groupId>
     <artifactId>agent-composer</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.97-SNAPSHOT</version>
     <packaging>mule-extension</packaging>
     <name>Agent Composer</name>
     <description>
@@ -79,14 +79,14 @@
             </plugin>
         </plugins>
     </build>
-    <distributionManagement>
+    <!-- <distributionManagement>
         <repository>
             <id>anypoint-exchange-v3</id>
             <name>Corporate Repository</name>
             <url>https://maven.anypoint.mulesoft.com/api/v3/organizations/${project.groupId}/maven</url>
             <layout>default</layout>
         </repository>
-    </distributionManagement>
+    </distributionManagement> -->
 
     <dependencies>
         <dependency>

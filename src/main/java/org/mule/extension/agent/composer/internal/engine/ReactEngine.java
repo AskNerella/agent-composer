@@ -11,6 +11,7 @@ import org.mule.extension.agent.composer.internal.mcp.McpClient;
 import org.mule.extension.agent.composer.internal.model.AgentResponse;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
+import org.mule.extension.agent.composer.internal.model.McpToolResult;
 import org.mule.extension.agent.composer.internal.model.ToolCall;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
 import org.mule.runtime.api.store.ObjectStore;
@@ -29,6 +30,7 @@ import java.util.Map;
 import java.util.Arrays;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -54,9 +56,9 @@ public class ReactEngine {
     private static final Gson GSON = new Gson();
     private static final Type MSG_LIST_TYPE = new TypeToken<List<LlmMessage>>() {}.getType();
     private static final int COMPRESSION_TOKEN_THRESHOLD = 300000;
-    private static final int TOOL_RESULT_CONTEXT_MAX_CHARS = 2000;
-    private static final int TOOL_RESULT_CONTEXT_HEAD_CHARS = 1300;
-    private static final int TOOL_RESULT_CONTEXT_TAIL_CHARS = 500;
+    private static final int TOOL_RESULT_CONTEXT_MAX_CHARS = 30000;
+    private static final int TOOL_RESULT_CONTEXT_HEAD_CHARS = 20000;
+    private static final int TOOL_RESULT_CONTEXT_TAIL_CHARS = 8000;
 
     /** Verbs that indicate a create/update/delete intent — responses to these are not cached. */
     private static final List<String> MUTATION_VERBS = Arrays.asList(
@@ -84,8 +86,10 @@ public class ReactEngine {
         schema.put("required", Collections.singletonList("question"));
         REQUEST_CLARIFICATION_TOOL = new ToolDefinition(
                 "request_clarification",
-                "Use this tool when you lack critical information needed to complete the task. "
-                + "Ask the user a specific question. They will reply with the same conversationId to resume.",
+                "Use this tool ONLY when a required tool parameter is completely unknown and cannot be inferred — "
+                + "for example, a missing account ID that has no default. "
+                + "Do NOT use this to ask what format to return results in, offer options, or confirm next steps. "
+                + "Ask exactly one focused question. The user will reply to resume.",
                 schema, null);
     }
 
@@ -304,6 +308,8 @@ public class ReactEngine {
                 final int iterNum = iteration + 1;
                 final String capturedThought = currentThought;
                 final int remainingIter = maxIterations - iteration;
+                // Captures McpToolResult per tool-call ID so UI resource data is preserved
+                ConcurrentHashMap<String, McpToolResult> parallelUiResults = new ConcurrentHashMap<>();
                 List<CompletableFuture<String>> futures = toolCalls.stream()
                         .map(tc -> CompletableFuture.supplyAsync(() -> {
                             AgentSkillConfig matchedSkillP = findSkillByName(tc.getName(), skills);
@@ -330,7 +336,11 @@ public class ReactEngine {
                                 LOGGER.info("[Iteration {}][Parallel] Tool '{}' | args={}",
                                         iterNum, tc.getName(), GSON.toJson(tc.getArguments()));
                                 try {
-                                    String obs = executeTool(tc, mcpTools, mcpServers);
+                                    McpToolResult mcpResult = executeTool(tc, mcpTools, mcpServers);
+                                    if (mcpResult.hasUiResource()) {
+                                        parallelUiResults.put(tc.getId(), mcpResult);
+                                    }
+                                    String obs = mcpResult.getTextContent();
                                     LOGGER.info("[Iteration {}][Parallel] Tool '{}' done | result={}",
                                             iterNum, tc.getName(), obs);
                                     return obs;
@@ -363,9 +373,15 @@ public class ReactEngine {
                             "Received tool response",
                             "Received data from tool '" + tc.getName() + "'; checking result.");
                         }
-                    toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                    AgentResponse.ToolCallRecord parallelRecord = new AgentResponse.ToolCallRecord(
                             serverName != null ? serverName : "unknown",
-                            tc.getName(), tc.getArguments(), obs, iteration + 1));
+                            tc.getName(), tc.getArguments(), obs, iteration + 1);
+                    McpToolResult uiResult = parallelUiResults.get(tc.getId());
+                    if (uiResult != null) {
+                        parallelRecord.setUiResourceUri(uiResult.getUiResourceUri());
+                        parallelRecord.setUiHtml(uiResult.getUiHtml());
+                    }
+                    toolCallRecords.add(parallelRecord);
                         messages.add(new LlmMessage("tool_result", obsForContext, tc.getId(), tc.getName()));
                 }
 
@@ -421,16 +437,22 @@ public class ReactEngine {
                                 "Performing tool invocation",
                                 "Passing request to tool '" + toolCall.getName() + "'.");
                         }
-                        observation = executeTool(toolCall, mcpTools, mcpServers);
+                        McpToolResult toolResult = executeTool(toolCall, mcpTools, mcpServers);
+                        observation = toolResult.getTextContent();
                         LOGGER.info("[Iteration {}] Tool response | name='{}' result={}", iteration + 1, toolCall.getName(), observation);
                         if (callback != null) {
                             callback.onIteration(iteration + 1,
                                 "Received tool response",
                                 "Received data from tool '" + toolCall.getName() + "'; checking output.");
                         }
-                        toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                        AgentResponse.ToolCallRecord seqRecord = new AgentResponse.ToolCallRecord(
                                 mcpServerName != null ? mcpServerName : "unknown",
-                                toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
+                                toolCall.getName(), toolCall.getArguments(), observation, iteration + 1);
+                        if (toolResult.hasUiResource()) {
+                            seqRecord.setUiResourceUri(toolResult.getUiResourceUri());
+                            seqRecord.setUiHtml(toolResult.getUiHtml());
+                        }
+                        toolCallRecords.add(seqRecord);
                     } catch (Exception e) {
                         observation = "Tool execution failed: " + e.getMessage();
                         toolFailureCount++;
@@ -538,7 +560,7 @@ public class ReactEngine {
 
     // ── tool execution ────────────────────────────────────────────────────────
 
-    private String executeTool(ToolCall toolCall, List<ToolDefinition> tools,
+    private McpToolResult executeTool(ToolCall toolCall, List<ToolDefinition> tools,
                                List<McpServerConfig> mcpServers) throws Exception {
         ToolDefinition toolDef = tools.stream()
                 .filter(t -> t.getName().equals(toolCall.getName()))
@@ -550,7 +572,8 @@ public class ReactEngine {
                 .findFirst()
                 .orElseThrow(() -> new RuntimeException("No MCP server for URL: " + toolDef.getServerUrl()));
 
-        return mcpClient.callTool(server, toolCall.getName(), toolCall.getArguments());
+        return mcpClient.callTool(server, toolCall.getName(), toolCall.getArguments(),
+                toolDef.getUiResourceUri());
     }
 
     private LlmResponse callLlmWithSingleRetry(LlmClient llmClient,
@@ -725,9 +748,15 @@ public class ReactEngine {
 
             String obs;
             try {
-                obs = executeTool(toolCall, skillMcpTools, mcpServers);
-                toolCallRecords.add(new AgentResponse.ToolCallRecord(
-                        skill.getName(), toolCall.getName(), toolCall.getArguments(), obs, parentIteration));
+                McpToolResult skillToolResult = executeTool(toolCall, skillMcpTools, mcpServers);
+                obs = skillToolResult.getTextContent();
+                AgentResponse.ToolCallRecord skillRecord = new AgentResponse.ToolCallRecord(
+                        skill.getName(), toolCall.getName(), toolCall.getArguments(), obs, parentIteration);
+                if (skillToolResult.hasUiResource()) {
+                    skillRecord.setUiResourceUri(skillToolResult.getUiResourceUri());
+                    skillRecord.setUiHtml(skillToolResult.getUiHtml());
+                }
+                toolCallRecords.add(skillRecord);
             } catch (Exception e) {
                 obs = "Tool execution failed: " + e.getMessage();
                 LOGGER.warn("[Skill '{}'] Tool '{}' failed: {}", skill.getName(), toolCall.getName(), e.getMessage());
@@ -948,11 +977,11 @@ public class ReactEngine {
         String head = trimmed.substring(0, headLen);
         String tail = tailLen > 0 ? trimmed.substring(trimmed.length() - tailLen) : "";
 
-        return "Tool '" + toolName + "' returned a large payload. "
-                + "Using compact view for context. Original chars=" + trimmed.length() + "\n"
+        return "Tool '" + toolName + "' returned a large payload (" + trimmed.length() + " chars). "
+                + "The full result has been saved. Do NOT call this tool again — use the preview below to continue.\n"
                 + "--- BEGIN PREVIEW ---\n"
                 + head
-                + "\n--- PREVIEW TRUNCATED ---\n"
+                + "\n--- PREVIEW TRUNCATED (" + (trimmed.length() - headLen - tailLen) + " chars omitted) ---\n"
                 + (tail.isEmpty() ? "" : "--- END PREVIEW ---\n" + tail);
     }
 

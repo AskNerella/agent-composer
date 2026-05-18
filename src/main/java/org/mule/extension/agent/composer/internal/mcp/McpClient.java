@@ -9,6 +9,7 @@ import com.google.gson.reflect.TypeToken;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.error.AgentComposerErrors;
 import org.mule.sdk.api.exception.ModuleException;
+import org.mule.extension.agent.composer.internal.model.McpToolResult;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,7 +82,23 @@ public class McpClient {
                 Map<String, Object> schema = tool.has("inputSchema")
                         ? GSON.fromJson(tool.get("inputSchema"), MAP_TYPE)
                         : Collections.emptyMap();
-                definitions.add(new ToolDefinition(name, description, schema, server.getServerUrl()));
+                ToolDefinition def = new ToolDefinition(name, description, schema, server.getServerUrl());
+
+                // MCP Apps: extract _meta.ui.resourceUri from the tool definition
+                // so the client knows to fetch the interactive HTML widget for this tool.
+                if (tool.has("_meta")) {
+                    JsonObject meta = tool.getAsJsonObject("_meta");
+                    if (meta.has("ui")) {
+                        JsonObject ui = meta.getAsJsonObject("ui");
+                        if (ui.has("resourceUri")) {
+                            String uiUri = ui.get("resourceUri").getAsString();
+                            def.setUiResourceUri(uiUri);
+                            LOGGER.info("[MCP Apps] Tool '{}' has uiResourceUri: {}", name, uiUri);
+                        }
+                    }
+                }
+
+                definitions.add(def);
             }
             return definitions;
 
@@ -100,14 +117,29 @@ public class McpClient {
     /**
      * Calls {@code tools/call} on the MCP server that owns the given tool.
      *
-     * @param server    the MCP server config whose {@code serverUrl} matches the tool's origin
-     * @param toolName  name of the tool to invoke
-     * @param arguments deserialized argument map as produced by the LLM
-     * @return textual observation returned by the tool
+     * <p>Supports both MCP-UI patterns:
+     * <ul>
+     *   <li><b>MCP Apps pattern</b> – the tool definition (from {@code tools/list})
+     *       carries {@code _meta.ui.resourceUri}; the client fetches that resource
+     *       via {@code resources/read} and returns its HTML.  If the call result
+     *       itself also contains {@code _meta.ui.resourceUri} it is used as a
+     *       fallback when no definition-level URI was supplied.</li>
+     *   <li><b>Legacy MCP-UI pattern</b> – if a content block of type
+     *       {@code resource} carries {@code mimeType: "text/html;profile=mcp-app"},
+     *       the HTML is extracted directly from the response.</li>
+     * </ul>
+     *
+     * @param server           the MCP server config whose {@code serverUrl} matches the tool's origin
+     * @param toolName         name of the tool to invoke
+     * @param arguments        deserialized argument map as produced by the LLM
+     * @param defUiResourceUri optional {@code _meta.ui.resourceUri} from the tool definition
+     *                         (populated by {@link #listTools}); {@code null} for plain tools
+     * @return {@link McpToolResult} with text content and optional UI resource fields
      * @throws Exception on HTTP or JSON-RPC errors
      */
-    public String callTool(McpServerConfig server, String toolName,
-                           Map<String, Object> arguments) throws Exception {
+    public McpToolResult callTool(McpServerConfig server, String toolName,
+                           Map<String, Object> arguments,
+                           String defUiResourceUri) throws Exception {
 
         JsonObject params = new JsonObject();
         params.addProperty("name", toolName);
@@ -126,25 +158,139 @@ public class McpClient {
 
         JsonElement resultEl = root.get("result");
         if (resultEl == null || resultEl.isJsonNull()) {
-            return "";
+            return new McpToolResult("");
         }
         JsonObject result = resultEl.getAsJsonObject();
 
-        // MCP tools/call result: { content: [ { type: "text", text: "..." } ], isError: false }
-        if (result.has("content") && result.get("content").isJsonArray()) {
-            JsonArray contentArr = result.getAsJsonArray("content");
-            StringBuilder sb = new StringBuilder();
-            for (JsonElement block : contentArr) {
-                JsonObject blockObj = block.getAsJsonObject();
-                if (blockObj.has("type") && "text".equals(blockObj.get("type").getAsString())) {
-                    sb.append(blockObj.get("text").getAsString());
+        // ── MCP Apps pattern: _meta.ui.resourceUri ────────────────────────────
+        // Primary source: URI from the tool definition (tools/list).
+        // Fallback: URI echoed back in the call result (some servers include both).
+        String mcpAppsUiResourceUri = defUiResourceUri;
+        if (mcpAppsUiResourceUri == null && result.has("_meta")) {
+            JsonObject meta = result.getAsJsonObject("_meta");
+            if (meta.has("ui")) {
+                JsonObject ui = meta.getAsJsonObject("ui");
+                if (ui.has("resourceUri")) {
+                    mcpAppsUiResourceUri = ui.get("resourceUri").getAsString();
                 }
             }
-            return sb.toString();
         }
 
-        // Fallback: return the raw result as a string
-        return GSON.toJson(result);
+        // ── Parse content blocks ──────────────────────────────────────────────
+        StringBuilder textBuilder = new StringBuilder();
+        String legacyUiHtml = null;
+        String legacyUiResourceUri = null;
+        String legacyUiMimeType = null;
+
+        if (result.has("content") && result.get("content").isJsonArray()) {
+            JsonArray contentArr = result.getAsJsonArray("content");
+            for (JsonElement block : contentArr) {
+                JsonObject blockObj = block.getAsJsonObject();
+                String type = blockObj.has("type") ? blockObj.get("type").getAsString() : "";
+
+                if ("text".equals(type)) {
+                    textBuilder.append(blockObj.get("text").getAsString());
+
+                } else if ("resource".equals(type) && blockObj.has("resource")) {
+                    // Legacy MCP-UI: resource block embedded directly in tool response
+                    JsonObject res = blockObj.getAsJsonObject("resource");
+                    String mimeType = res.has("mimeType") ? res.get("mimeType").getAsString() : "";
+                    if (mimeType.startsWith("text/html")) {
+                        legacyUiMimeType = mimeType;
+                        legacyUiResourceUri = res.has("uri") ? res.get("uri").getAsString() : null;
+                        if (res.has("text")) {
+                            legacyUiHtml = res.get("text").getAsString();
+                        } else if (res.has("blob")) {
+                            // Base64-encoded HTML content
+                            legacyUiHtml = new String(
+                                    java.util.Base64.getDecoder().decode(res.get("blob").getAsString()),
+                                    java.nio.charset.StandardCharsets.UTF_8);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: return the raw result as a string
+            textBuilder.append(GSON.toJson(result));
+        }
+
+        String textContent = textBuilder.toString();
+
+        // ── Resolve UI resource ───────────────────────────────────────────────
+        if (mcpAppsUiResourceUri != null) {
+            // MCP Apps pattern: fetch resource via resources/read
+            LOGGER.info("[MCP Apps] Fetching UI resource for tool '{}' via resources/read: {}", toolName, mcpAppsUiResourceUri);
+            try {
+                McpToolResult uiResource = readResource(server, mcpAppsUiResourceUri);
+                String fetchedHtml = uiResource.getUiHtml();
+                LOGGER.info("[MCP Apps] UI resource fetched for tool '{}': mimeType={}, htmlLength={}",
+                        toolName, uiResource.getUiMimeType(), fetchedHtml != null ? fetchedHtml.length() : 0);
+                return new McpToolResult(textContent, mcpAppsUiResourceUri,
+                        fetchedHtml, uiResource.getUiMimeType());
+            } catch (Exception e) {
+                LOGGER.warn("[MCP Apps] Failed to fetch UI resource '{}' from '{}': {}",
+                        mcpAppsUiResourceUri, server.getName(), e.getMessage());
+                return new McpToolResult(textContent, mcpAppsUiResourceUri, null, null);
+            }
+        }
+
+        if (legacyUiHtml != null) {
+            // Legacy MCP-UI pattern: HTML was embedded directly in the response
+            return new McpToolResult(textContent, legacyUiResourceUri, legacyUiHtml, legacyUiMimeType);
+        }
+
+        return new McpToolResult(textContent);
+    }
+
+    /**
+     * Calls {@code resources/read} on the MCP server to fetch a UI resource by URI.
+     *
+     * @param server      the MCP server to query
+     * @param resourceUri the {@code ui://} URI of the resource to fetch
+     * @return {@link McpToolResult} with {@code uiHtml} and {@code uiMimeType} populated
+     * @throws Exception on HTTP or JSON-RPC errors
+     */
+    public McpToolResult readResource(McpServerConfig server, String resourceUri) throws Exception {
+        JsonObject params = new JsonObject();
+        params.addProperty("uri", resourceUri);
+
+        String responseBody = sendRpc(server, "resources/read", params);
+        JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+
+        if (root.has("error")) {
+            JsonObject err = root.getAsJsonObject("error");
+            throw new RuntimeException(
+                    "MCP resources/read error (code=" + err.get("code").getAsInt()
+                    + "): " + err.get("message").getAsString());
+        }
+
+        JsonElement resultEl = root.get("result");
+        if (resultEl == null || resultEl.isJsonNull()) {
+            throw new RuntimeException("MCP resources/read returned empty result for URI: " + resourceUri);
+        }
+
+        JsonObject result = resultEl.getAsJsonObject();
+        JsonArray contents = result.has("contents") ? result.getAsJsonArray("contents") : new JsonArray();
+
+        for (JsonElement c : contents) {
+            JsonObject content = c.getAsJsonObject();
+            String mimeType = content.has("mimeType") ? content.get("mimeType").getAsString() : "";
+            if (mimeType.startsWith("text/html")) {
+                String html = null;
+                if (content.has("text")) {
+                    html = content.get("text").getAsString();
+                } else if (content.has("blob")) {
+                    html = new String(
+                            java.util.Base64.getDecoder().decode(content.get("blob").getAsString()),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                }
+                if (html != null) {
+                    return new McpToolResult(null, resourceUri, html, mimeType);
+                }
+            }
+        }
+
+        throw new RuntimeException("MCP resources/read returned no HTML content for URI: " + resourceUri);
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
@@ -174,6 +320,15 @@ public class McpClient {
         params.add("clientInfo", clientInfo);
 
         JsonObject capabilities = new JsonObject();
+        // Declare MCP Apps / MCP-UI extension support (SEP-1724 pattern).
+        // This signals to MCP servers that the client can render HTML UI resources
+        // with MIME type "text/html;profile=mcp-app" and will call resources/read
+        // on the URIs advertised in each tool's _meta.ui.resourceUri field.
+        JsonObject extensions = new JsonObject();
+        JsonObject uiCapability = new JsonObject();
+        uiCapability.addProperty("uiProtocolVersion", "1.0");
+        extensions.add("ui", uiCapability);
+        capabilities.add("extensions", extensions);
         params.add("capabilities", capabilities);
 
         JsonObject payload = new JsonObject();

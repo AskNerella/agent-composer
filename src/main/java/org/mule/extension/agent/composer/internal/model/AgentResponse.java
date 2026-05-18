@@ -76,6 +76,14 @@ public class AgentResponse {
         this.toolCalls.add(record);
     }
 
+    /** Returns the HTML of the first tool call that produced an MCP-UI widget, or {@code null}. */
+    public String getFirstUiHtml() {
+        for (ToolCallRecord r : toolCalls) {
+            if (r.getUiHtml() != null && !r.getUiHtml().isEmpty()) return r.getUiHtml();
+        }
+        return null;
+    }
+
     public String toJson() {
         return new Gson().toJson(this);
     }
@@ -89,6 +97,10 @@ public class AgentResponse {
         private Map<String, Object> toolRequest;
         private String toolResponse;
         private int iterationNumber;
+        /** URI of the MCP-UI resource returned by this tool call, if any (e.g. {@code ui://...}). */
+        private String uiResourceUri;
+        /** Rendered HTML of the MCP-UI resource associated with this tool call, if any. */
+        private String uiHtml;
 
         public ToolCallRecord(String mcpClientName, String toolName, 
                             Map<String, Object> toolRequest, String toolResponse,
@@ -106,5 +118,11 @@ public class AgentResponse {
         public Map<String, Object> getToolRequest() { return toolRequest; }
         public String getToolResponse() { return toolResponse; }
         public int getIterationNumber() { return iterationNumber; }
+        public String getUiResourceUri() { return uiResourceUri; }
+        public String getUiHtml() { return uiHtml; }
+
+        // Setters
+        public void setUiResourceUri(String uiResourceUri) { this.uiResourceUri = uiResourceUri; }
+        public void setUiHtml(String uiHtml) { this.uiHtml = uiHtml; }
     }
 }
