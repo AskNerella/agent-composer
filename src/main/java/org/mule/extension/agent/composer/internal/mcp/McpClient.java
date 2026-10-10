@@ -21,10 +21,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 
 /**
  * Thin JSON-RPC 2.0 client for MCP (Model Context Protocol) servers.
@@ -129,15 +131,19 @@ public class McpClient {
      *       the HTML is extracted directly from the response.</li>
      * </ul>
      *
+     * <p>If the server pauses the call with an {@code elicitation/create} request (MCP Elicitation),
+     * the returned {@link McpToolResult.CallOutcome} carries the elicitation details instead of a
+     * result; resume with {@link #resolveElicitation}.
+     *
      * @param server           the MCP server config whose {@code serverUrl} matches the tool's origin
      * @param toolName         name of the tool to invoke
      * @param arguments        deserialized argument map as produced by the LLM
      * @param defUiResourceUri optional {@code _meta.ui.resourceUri} from the tool definition
      *                         (populated by {@link #listTools}); {@code null} for plain tools
-     * @return {@link McpToolResult} with text content and optional UI resource fields
+     * @return outcome wrapping either the {@link McpToolResult} or a pending elicitation request
      * @throws Exception on HTTP or JSON-RPC errors
      */
-    public McpToolResult callTool(McpServerConfig server, String toolName,
+    public McpToolResult.CallOutcome callTool(McpServerConfig server, String toolName,
                            Map<String, Object> arguments,
                            String defUiResourceUri) throws Exception {
 
@@ -145,18 +151,88 @@ public class McpClient {
         params.addProperty("name", toolName);
         params.add("arguments", GSON.toJsonTree(arguments));
 
-        String responseBody = sendRpc(server, "tools/call", params);
-        JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+        long requestId = idCounter.getAndIncrement();
+        JsonObject message = sendStreamingRpc(server, requestId, "tools/call", params);
 
-        // JSON-RPC error object
-        if (root.has("error")) {
-            JsonObject err = root.getAsJsonObject("error");
+        if (isElicitationRequest(message)) {
+            String elicitationId = message.get("id").getAsString();
+            JsonObject elicitationParams = message.has("params") ? message.getAsJsonObject("params") : new JsonObject();
+            String prompt = elicitationParams.has("message") ? elicitationParams.get("message").getAsString() : "";
+            Map<String, Object> schema = elicitationParams.has("requestedSchema")
+                    ? GSON.fromJson(elicitationParams.get("requestedSchema"), MAP_TYPE)
+                    : Collections.emptyMap();
+            LOGGER.info("[Elicitation] MCP server '{}' paused tool '{}' | requestId={} message={}",
+                    server.getName(), toolName, elicitationId, prompt);
+            return McpToolResult.CallOutcome.elicitationRequired(new McpToolResult.ElicitationRequest(
+                    elicitationId, requestId, prompt, schema, server.getName(), server.getServerUrl(),
+                    toolName, arguments, defUiResourceUri));
+        }
+
+        return McpToolResult.CallOutcome.completed(
+                buildToolResult(message, toolName, defUiResourceUri, server));
+    }
+
+    /**
+     * Resumes a tool call previously paused by {@link #callTool} with an {@code elicitation/create}
+     * request. Sends the user's answer back to the MCP server as a JSON-RPC <em>response</em>
+     * correlated by the elicitation's request id, then keeps reading the same logical exchange for
+     * either the original tool's final result or another (chained) elicitation request.
+     *
+     * <p>Stateless by design: {@code server} and {@code pending} must be supplied by the caller
+     * (persisted across the pause/resume turn, e.g. in an Object Store) since a new {@link McpClient}
+     * is created per agent invocation and cannot rely on in-memory state surviving between turns.
+     *
+     * <p><b>Compatibility note:</b> this relies on the MCP server supporting a resumable
+     * Streamable-HTTP session — i.e. tolerating the gap between sending the elicitation request and
+     * receiving this out-of-band response on a new HTTP connection. Servers that keep the original
+     * {@code tools/call} connection open and expect the response on that same connection are not
+     * supported by this pause/resume model.
+     *
+     * @param server  the MCP server that issued the elicitation request
+     * @param pending the elicitation request being answered (as returned from {@link #callTool})
+     * @param answer  structured answer matching the requested schema
+     */
+    public McpToolResult.CallOutcome resolveElicitation(McpServerConfig server,
+                                                        McpToolResult.ElicitationRequest pending,
+                                                        Object answer) throws Exception {
+        JsonObject responsePayload = new JsonObject();
+        responsePayload.addProperty("jsonrpc", "2.0");
+        responsePayload.add("id", parseJsonRpcId(pending.getRequestId()));
+        JsonObject result = new JsonObject();
+        result.addProperty("action", "accept");
+        result.add("content", GSON.toJsonTree(answer));
+        responsePayload.add("result", result);
+
+        JsonObject message = postStreamingAndAwait(server, responsePayload, pending.getOriginalRequestId());
+
+        if (isElicitationRequest(message)) {
+            String nextElicitationId = message.get("id").getAsString();
+            JsonObject elicitationParams = message.has("params") ? message.getAsJsonObject("params") : new JsonObject();
+            String prompt = elicitationParams.has("message") ? elicitationParams.get("message").getAsString() : "";
+            Map<String, Object> schema = elicitationParams.has("requestedSchema")
+                    ? GSON.fromJson(elicitationParams.get("requestedSchema"), MAP_TYPE)
+                    : Collections.emptyMap();
+            return McpToolResult.CallOutcome.elicitationRequired(new McpToolResult.ElicitationRequest(
+                    nextElicitationId, pending.getOriginalRequestId(), prompt, schema,
+                    pending.getServerName(), pending.getServerUrl(), pending.getToolName(),
+                    pending.getToolArguments(), pending.getDefUiResourceUri()));
+        }
+
+        return McpToolResult.CallOutcome.completed(
+                buildToolResult(message, pending.getToolName(), pending.getDefUiResourceUri(), server));
+    }
+
+    /** Builds the {@link McpToolResult} (text + optional UI resource) from a {@code tools/call} JSON-RPC message. */
+    private McpToolResult buildToolResult(JsonObject message, String toolName, String defUiResourceUri,
+                                          McpServerConfig server) throws Exception {
+        if (message.has("error")) {
+            JsonObject err = message.getAsJsonObject("error");
             throw new RuntimeException(
                     "MCP tool call error (code=" + err.get("code").getAsInt()
                     + "): " + err.get("message").getAsString());
         }
 
-        JsonElement resultEl = root.get("result");
+        JsonElement resultEl = message.get("result");
         if (resultEl == null || resultEl.isJsonNull()) {
             return new McpToolResult("");
         }
@@ -240,6 +316,20 @@ public class McpClient {
         }
 
         return new McpToolResult(textContent);
+    }
+
+    /** A server-to-client request (has both {@code id} and {@code method}) asking the client to elicit input, as opposed to our own response. */
+    private static boolean isElicitationRequest(JsonObject message) {
+        return message.has("id") && message.has("method")
+                && "elicitation/create".equals(message.get("method").getAsString());
+    }
+
+    private static JsonElement parseJsonRpcId(String rawId) {
+        try {
+            return JsonParser.parseString(rawId);
+        } catch (Exception e) {
+            return new com.google.gson.JsonPrimitive(rawId);
+        }
     }
 
     /**
@@ -329,6 +419,9 @@ public class McpClient {
         uiCapability.addProperty("uiProtocolVersion", "1.0");
         extensions.add("ui", uiCapability);
         capabilities.add("extensions", extensions);
+        // Declare elicitation support: servers may pause tools/call with an elicitation/create
+        // request; see callTool()/resolveElicitation() for the client-side handling.
+        capabilities.add("elicitation", new JsonObject());
         params.add("capabilities", capabilities);
 
         JsonObject payload = new JsonObject();
@@ -445,5 +538,120 @@ public class McpClient {
         }
         // Return as-is and let the caller's JsonParser produce a descriptive error
         return raw;
+    }
+
+    // ── streaming RPC (tools/call elicitation support) ──────────────────────
+
+    /** Sends a JSON-RPC request and reads the response until the matching result/error or an elicitation request appears. */
+    private JsonObject sendStreamingRpc(McpServerConfig server, long requestId, String method, JsonObject params) throws Exception {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("jsonrpc", "2.0");
+        payload.addProperty("id", requestId);
+        payload.addProperty("method", method);
+        payload.add("params", params);
+        return postStreamingAndAwait(server, payload, requestId);
+    }
+
+    /**
+     * POSTs {@code payload} and reads the response line-by-line so a mid-stream
+     * {@code elicitation/create} request can be detected before the final result arrives.
+     * Retries once with a fresh session on a session-expiry (400) response, mirroring {@link #sendRpc}.
+     */
+    private JsonObject postStreamingAndAwait(McpServerConfig server, JsonObject payload, long awaitRequestId) throws Exception {
+        String sessionId = getOrInitSession(server);
+        HttpResponse<Stream<String>> response = postForLines(server, payload, sessionId);
+
+        if (response.statusCode() == 400) {
+            LOGGER.warn("MCP session invalid for '{}', re-initializing...", server.getName());
+            sessionIds.remove(server.getServerUrl());
+            sessionId = getOrInitSession(server);
+            response = postForLines(server, payload, sessionId);
+        }
+
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new RuntimeException("MCP HTTP error " + response.statusCode() + " from " + server.getServerUrl());
+        }
+
+        return readUntilMatch(response.body(), awaitRequestId);
+    }
+
+    private HttpResponse<Stream<String>> postForLines(McpServerConfig server, JsonObject payload, String sessionId) throws Exception {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(server.getServerUrl()))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(payload)));
+        if (sessionId != null && !sessionId.isEmpty()) {
+            builder.header("Mcp-Session-Id", sessionId);
+        }
+        if (server.getAuthToken() != null && !server.getAuthToken().isEmpty()) {
+            builder.header("Authorization", "Bearer " + server.getAuthToken());
+        }
+        return HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofLines());
+    }
+
+    /**
+     * Reads SSE {@code data:} events (or, as a fallback, a single plain-JSON body) until either
+     * an {@code elicitation/create} request or the response matching {@code awaitRequestId} appears.
+     */
+    private JsonObject readUntilMatch(Stream<String> lineStream, long awaitRequestId) throws Exception {
+        StringBuilder sseEvent = new StringBuilder();
+        StringBuilder rawBody = new StringBuilder();
+        boolean sawSseData = false;
+        try (Stream<String> lines = lineStream) {
+            Iterator<String> it = lines.iterator();
+            while (it.hasNext()) {
+                String line = it.next();
+                if (line.startsWith("data:")) {
+                    sawSseData = true;
+                    sseEvent.append(line.substring(5).stripLeading());
+                } else if (line.isEmpty()) {
+                    JsonObject msg = flushSseEvent(sseEvent, sawSseData);
+                    if (msg != null && (isElicitationRequest(msg) || matchesId(msg, awaitRequestId))) {
+                        return msg;
+                    }
+                } else if (line.startsWith(":") || line.startsWith("event:") || line.startsWith("id:") || line.startsWith("retry:")) {
+                    // SSE metadata/comment lines — not part of the JSON payload
+                } else if (!sawSseData) {
+                    // Non-SSE server: accumulate the plain JSON body across lines
+                    rawBody.append(line);
+                }
+            }
+            JsonObject trailing = flushSseEvent(sseEvent, sawSseData);
+            if (trailing != null && (isElicitationRequest(trailing) || matchesId(trailing, awaitRequestId))) {
+                return trailing;
+            }
+            if (!sawSseData && rawBody.length() > 0) {
+                JsonObject msg = tryParseObject(rawBody.toString());
+                if (msg != null) return msg;
+            }
+        }
+        throw new RuntimeException("MCP server closed the connection without returning a result for request id " + awaitRequestId);
+    }
+
+    private static JsonObject flushSseEvent(StringBuilder sseEvent, boolean sawSseData) {
+        if (!sawSseData || sseEvent.length() == 0) return null;
+        JsonObject msg = tryParseObject(sseEvent.toString());
+        sseEvent.setLength(0);
+        return msg;
+    }
+
+    private static JsonObject tryParseObject(String json) {
+        try {
+            JsonElement el = JsonParser.parseString(json);
+            return el.isJsonObject() ? el.getAsJsonObject() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean matchesId(JsonObject msg, long id) {
+        if (!msg.has("id") || msg.get("id").isJsonNull()) return false;
+        if (!msg.has("result") && !msg.has("error")) return false;
+        try {
+            return msg.get("id").getAsLong() == id;
+        } catch (Exception e) {
+            return false;
+        }
     }
 }

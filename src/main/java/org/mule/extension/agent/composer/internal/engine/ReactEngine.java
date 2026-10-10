@@ -8,6 +8,7 @@ import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.llm.LlmClient;
 import org.mule.extension.agent.composer.internal.llm.LlmClientFactory;
 import org.mule.extension.agent.composer.internal.mcp.McpClient;
+import org.mule.extension.agent.composer.internal.model.AgentIterationEvent;
 import org.mule.extension.agent.composer.internal.model.AgentResponse;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
@@ -30,7 +31,9 @@ import java.util.Map;
 import java.util.Arrays;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -59,6 +62,14 @@ public class ReactEngine {
     private static final int TOOL_RESULT_CONTEXT_MAX_CHARS = 30000;
     private static final int TOOL_RESULT_CONTEXT_HEAD_CHARS = 20000;
     private static final int TOOL_RESULT_CONTEXT_TAIL_CHARS = 8000;
+
+    /**
+     * Shared pool for I/O-bound MCP calls (tool discovery, parallel tool/skill execution).
+     * A dedicated pool is used instead of {@code ForkJoinPool.commonPool()} (the default for
+     * {@link CompletableFuture#supplyAsync(java.util.function.Supplier)}) so blocking HTTP calls
+     * never starve common-pool work elsewhere in the Mule runtime. Daemon threads avoid blocking JVM shutdown.
+     */
+    private static final ExecutorService MCP_IO_EXECUTOR = Executors.newCachedThreadPool(daemonThreadFactory("agent-composer-mcp-io"));
 
     /** Verbs that indicate a create/update/delete intent — responses to these are not cached. */
     private static final List<String> MUTATION_VERBS = Arrays.asList(
@@ -96,13 +107,8 @@ public class ReactEngine {
     /** Callback invoked before and after each tool or skill execution in the ReAct loop. */
     @FunctionalInterface
     public interface IterationCallback {
-        /**
-         * @param iteration   current ReAct iteration (1-based)
-         * @param actionName  tool or skill name being invoked
-         * @param observation {@code null} when the tool request is being sent;
-         *                    the actual result string when the response is received
-         */
-        void onIteration(int iteration, String actionName, String observation);
+        /** Receives a structured event for every loop step (tool/skill call, result, compression, etc). */
+        void onEvent(AgentIterationEvent event);
     }
 
     private final ObjectStoreManager objectStoreManager;
@@ -112,6 +118,15 @@ public class ReactEngine {
     public ReactEngine(ObjectStoreManager objectStoreManager) {
         this.objectStoreManager = objectStoreManager;
         this.mcpClient = new McpClient();
+    }
+
+    private static ThreadFactory daemonThreadFactory(String namePrefix) {
+        AtomicInteger counter = new AtomicInteger(1);
+        return runnable -> {
+            Thread thread = new Thread(runnable, namePrefix + "-" + counter.getAndIncrement());
+            thread.setDaemon(true);
+            return thread;
+        };
     }
 
     // ── main entry point ──────────────────────────────────────────────────────
@@ -279,6 +294,7 @@ public class ReactEngine {
                         userMessage, question, maxIterations, actualIterations, false, conversationId);
                 inputRequired.setRequiresInput(true);
                 inputRequired.setInputRequest(question);
+                inputRequired.setInputKind("clarification");
                 inputRequired.setResumedSession(resumedSession);
                 inputRequired.setReturnReason("input required");
                 inputRequired.setToolCalls(toolCallRecords);
@@ -294,182 +310,113 @@ public class ReactEngine {
                         iteration + 1, toolCalls.size(),
                         toolCalls.stream().map(ToolCall::getName).collect(Collectors.joining(", ")));
 
-                // Emit a single request status for all tools in this parallel batch.
+                // Emit a single batch event for all tools in this parallel group.
                 if (callback != null) {
-                    String joinedTools = toolCalls.stream()
-                            .map(ToolCall::getName)
-                            .collect(Collectors.joining(", "));
-                    callback.onIteration(iteration + 1,
-                            "Performing parallel tool requests",
-                            "Passing requests to tools: " + joinedTools + ".");
+                    callback.onEvent(AgentIterationEvent.parallelBatch(iteration + 1,
+                            toolCalls.stream().map(ToolCall::getName).collect(Collectors.toList())));
                 }
 
-                AtomicInteger parallelFailures = new AtomicInteger(0);
                 final int iterNum = iteration + 1;
                 final String capturedThought = currentThought;
                 final int remainingIter = maxIterations - iteration;
-                // Captures McpToolResult per tool-call ID so UI resource data is preserved
-                ConcurrentHashMap<String, McpToolResult> parallelUiResults = new ConcurrentHashMap<>();
-                List<CompletableFuture<String>> futures = toolCalls.stream()
-                        .map(tc -> CompletableFuture.supplyAsync(() -> {
-                            AgentSkillConfig matchedSkillP = findSkillByName(tc.getName(), skills);
-                            if (matchedSkillP != null) {
-                                String taskArg = tc.getArguments() != null
-                                        ? (String) tc.getArguments().getOrDefault("task", capturedThought)
-                                        : capturedThought;
-                                LOGGER.info("[Iteration {}][Parallel] Skill '{}' | task={}",
-                                        iterNum, matchedSkillP.getName(), taskArg);
-                                try {
-                                    // Pass null callback to avoid concurrent callback calls in sub-loops
-                                    String obs = executeSkill(matchedSkillP, mcpTools, mcpServers, config,
-                                            taskArg, iterNum, remainingIter, null);
-                                    LOGGER.info("[Iteration {}][Parallel] Skill '{}' done | result={}",
-                                            iterNum, matchedSkillP.getName(), obs);
-                                    return obs;
-                                } catch (Exception e) {
-                                    parallelFailures.incrementAndGet();
-                                    LOGGER.warn("[Iteration {}][Parallel] Skill '{}' failed: {}",
-                                            iterNum, matchedSkillP.getName(), e.getMessage(), e);
-                                    return "Skill execution failed: " + e.getMessage();
-                                }
-                            } else {
-                                LOGGER.info("[Iteration {}][Parallel] Tool '{}' | args={}",
-                                        iterNum, tc.getName(), GSON.toJson(tc.getArguments()));
-                                try {
-                                    McpToolResult mcpResult = executeTool(tc, mcpTools, mcpServers);
-                                    if (mcpResult.hasUiResource()) {
-                                        parallelUiResults.put(tc.getId(), mcpResult);
-                                    }
-                                    String obs = mcpResult.getTextContent();
-                                    LOGGER.info("[Iteration {}][Parallel] Tool '{}' done | result={}",
-                                            iterNum, tc.getName(), obs);
-                                    return obs;
-                                } catch (Exception e) {
-                                    parallelFailures.incrementAndGet();
-                                    LOGGER.warn("[Iteration {}][Parallel] Tool '{}' failed: {}",
-                                            iterNum, tc.getName(), e.getMessage(), e);
-                                    return "Tool execution failed: " + e.getMessage();
-                                }
-                            }
-                        }))
+                // Pass null callback: the skill sub-loop must not emit concurrently from multiple threads.
+                List<CompletableFuture<ExecutionOutcome>> futures = toolCalls.stream()
+                        .map(tc -> CompletableFuture.supplyAsync(
+                                () -> executeToolOrSkill(tc, mcpTools, mcpServers, config, skills,
+                                        capturedThought, iterNum, remainingIter, null),
+                                MCP_IO_EXECUTOR))
                         .collect(Collectors.toList());
 
                 CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-                toolFailureCount += parallelFailures.get();
 
                 // Collect results, fire response callbacks, record tool calls, append tool_result messages
+                McpToolResult.ElicitationRequest pendingElicitation = null;
                 for (int t = 0; t < toolCalls.size(); t++) {
                     ToolCall tc = toolCalls.get(t);
-                    String obs;
-                    try { obs = futures.get(t).get(); } catch (Exception e) { obs = "Error: " + e.getMessage(); }
-                    saveFullToolOutput(store, conversationId, tc, obs);
-                    String obsForContext = compactToolObservation(tc.getName(), obs);
-                    AgentSkillConfig matchedSkillP = findSkillByName(tc.getName(), skills);
-                    String serverName = matchedSkillP != null
-                            ? "skill:" + matchedSkillP.getName()
-                            : findMcpServerName(tc, mcpTools, mcpServers);
-                        if (callback != null) {
-                        callback.onIteration(iteration + 1,
-                            "Received tool response",
-                            "Received data from tool '" + tc.getName() + "'; checking result.");
-                        }
+                    ExecutionOutcome outcome;
+                    try {
+                        outcome = futures.get(t).get();
+                    } catch (Exception e) {
+                        outcome = new ExecutionOutcome("Error: " + e.getMessage(), null, true, null, null);
+                    }
+
+                    if (outcome.elicitation != null) {
+                        // One paused tool call pauses the whole iteration; still record a tool_result
+                        // placeholder for every tool_use so the LLM message history stays well-formed.
+                        if (pendingElicitation == null) pendingElicitation = outcome.elicitation;
+                        messages.add(new LlmMessage("tool_result", "Waiting for user input (elicitation).", tc.getId(), tc.getName()));
+                        continue;
+                    }
+
+                    if (outcome.failed) toolFailureCount++;
+                    saveFullToolOutput(store, conversationId, tc, outcome.observation);
+                    String obsForContext = compactToolObservation(tc.getName(), outcome.observation);
+                    boolean isSkill = findSkillByName(tc.getName(), skills) != null;
+                    if (callback != null) {
+                        callback.onEvent(isSkill
+                                ? AgentIterationEvent.skillResult(iteration + 1, tc.getName(), tc.getArguments(), outcome.observation)
+                                : AgentIterationEvent.toolResult(iteration + 1, tc.getName(), tc.getArguments(), outcome.observation, outcome.serverName));
+                    }
                     AgentResponse.ToolCallRecord parallelRecord = new AgentResponse.ToolCallRecord(
-                            serverName != null ? serverName : "unknown",
-                            tc.getName(), tc.getArguments(), obs, iteration + 1);
-                    McpToolResult uiResult = parallelUiResults.get(tc.getId());
-                    if (uiResult != null) {
-                        parallelRecord.setUiResourceUri(uiResult.getUiResourceUri());
-                        parallelRecord.setUiHtml(uiResult.getUiHtml());
+                            outcome.serverName != null ? outcome.serverName : "unknown",
+                            tc.getName(), tc.getArguments(), outcome.observation, iteration + 1);
+                    if (outcome.uiHtml != null) {
+                        parallelRecord.setUiResourceUri(outcome.uiResourceUri);
+                        parallelRecord.setUiHtml(outcome.uiHtml);
                     }
                     toolCallRecords.add(parallelRecord);
-                        messages.add(new LlmMessage("tool_result", obsForContext, tc.getId(), tc.getName()));
+                    messages.add(new LlmMessage("tool_result", obsForContext, tc.getId(), tc.getName()));
+                }
+
+                if (pendingElicitation != null) {
+                    saveHistory(store, conversationId, messages);
+                    savePendingElicitation(store, conversationId, pendingElicitation);
+                    return buildElicitationResponse(pendingElicitation, userMessage, maxIterations,
+                            actualIterations, conversationId, resumedSession, toolCallRecords);
                 }
 
             } else {
-                // ── Single tool (sequential) ──────────────────────────────────────
+                // ── Single tool/skill (sequential) ────────────────────────────────
                 ToolCall toolCall = toolCalls.get(0);
-                String observation;
-                String mcpServerName = null;
-                AgentSkillConfig matchedSkill = findSkillByName(toolCall.getName(), skills);
+                boolean isSkill = findSkillByName(toolCall.getName(), skills) != null;
 
-                if (matchedSkill != null) {
-                    // ── Skill execution ───────────────────────────────────────────
-                    String taskArg = toolCall.getArguments() != null
-                            ? (String) toolCall.getArguments().getOrDefault("task", currentThought)
-                            : currentThought;
-                    LOGGER.info("[Iteration {}] >>> Using skill '{}' | task: {}",
-                            iteration + 1, matchedSkill.getName(), taskArg);
-                    mcpServerName = "skill:" + matchedSkill.getName();
-                    try {
-                        LOGGER.info("[Iteration {}] Skill request | name='{}' task={}", iteration + 1, matchedSkill.getName(), taskArg);
-                        if (callback != null) {
-                            callback.onIteration(iteration + 1,
-                                    "Performing skill execution",
-                                    "Passing request to skill '" + matchedSkill.getName() + "'.");
-                        }
-                        observation = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
-                                iteration + 1, maxIterations - iteration, callback);
-                        LOGGER.info("[Iteration {}] Skill response | name='{}' result={}", iteration + 1, matchedSkill.getName(), observation);
-                    } catch (Exception e) {
-                        observation = "Skill execution failed: " + e.getMessage();
-                        toolFailureCount++;
-                        LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration + 1, matchedSkill.getName(), e.getMessage(), e);
-                    }
-                        if (callback != null) {
-                        callback.onIteration(iteration + 1,
-                            "Received skill response",
-                            "Received data from skill '" + matchedSkill.getName() + "'; validating output.");
-                        }
-                    toolCallRecords.add(new AgentResponse.ToolCallRecord(
-                            mcpServerName, toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
-                } else {
-                    // ── MCP tool execution ────────────────────────────────────────
-                    mcpServerName = findMcpServerName(toolCall, mcpTools, mcpServers);
-                    LOGGER.info("[Iteration {}] >>> Using tool '{}' (server: {}) | args: {}",
-                            iteration + 1, toolCall.getName(),
-                            mcpServerName != null ? mcpServerName : "unknown",
-                            toolCall.getArguments());
-                    try {
-                        LOGGER.info("[Iteration {}] Tool request | name='{}' args={}",
-                                iteration + 1, toolCall.getName(), GSON.toJson(toolCall.getArguments()));
-                        if (callback != null) {
-                            callback.onIteration(iteration + 1,
-                                "Performing tool invocation",
-                                "Passing request to tool '" + toolCall.getName() + "'.");
-                        }
-                        McpToolResult toolResult = executeTool(toolCall, mcpTools, mcpServers);
-                        observation = toolResult.getTextContent();
-                        LOGGER.info("[Iteration {}] Tool response | name='{}' result={}", iteration + 1, toolCall.getName(), observation);
-                        if (callback != null) {
-                            callback.onIteration(iteration + 1,
-                                "Received tool response",
-                                "Received data from tool '" + toolCall.getName() + "'; checking output.");
-                        }
-                        AgentResponse.ToolCallRecord seqRecord = new AgentResponse.ToolCallRecord(
-                                mcpServerName != null ? mcpServerName : "unknown",
-                                toolCall.getName(), toolCall.getArguments(), observation, iteration + 1);
-                        if (toolResult.hasUiResource()) {
-                            seqRecord.setUiResourceUri(toolResult.getUiResourceUri());
-                            seqRecord.setUiHtml(toolResult.getUiHtml());
-                        }
-                        toolCallRecords.add(seqRecord);
-                    } catch (Exception e) {
-                        observation = "Tool execution failed: " + e.getMessage();
-                        toolFailureCount++;
-                        LOGGER.warn("[Iteration {}] Tool '{}' failed: {}", iteration + 1, toolCall.getName(), e.getMessage(), e);
-                        if (callback != null) {
-                            callback.onIteration(iteration + 1,
-                                "Validating tool failure",
-                                "Received failure from tool '" + toolCall.getName() + "'; checking retry path.");
-                        }
-                        toolCallRecords.add(new AgentResponse.ToolCallRecord(
-                                mcpServerName != null ? mcpServerName : "unknown",
-                                toolCall.getName(), toolCall.getArguments(), observation, iteration + 1));
-                    }
+                if (callback != null) {
+                    callback.onEvent(isSkill
+                            ? AgentIterationEvent.skillCall(iteration + 1, toolCall.getName(), toolCall.getArguments())
+                            : AgentIterationEvent.toolCall(iteration + 1, toolCall.getName(), toolCall.getArguments(),
+                                    findMcpServerName(toolCall, mcpTools, mcpServers)));
                 }
 
-                saveFullToolOutput(store, conversationId, toolCall, observation);
-                String observationForContext = compactToolObservation(toolCall.getName(), observation);
+                ExecutionOutcome outcome = executeToolOrSkill(toolCall, mcpTools, mcpServers, config, skills,
+                        currentThought, iteration + 1, maxIterations - iteration, callback);
+
+                if (outcome.elicitation != null) {
+                    messages.add(new LlmMessage("tool_result", "Waiting for user input (elicitation).", toolCall.getId(), toolCall.getName()));
+                    saveHistory(store, conversationId, messages);
+                    savePendingElicitation(store, conversationId, outcome.elicitation);
+                    return buildElicitationResponse(outcome.elicitation, userMessage, maxIterations,
+                            actualIterations, conversationId, resumedSession, toolCallRecords);
+                }
+
+                if (outcome.failed) toolFailureCount++;
+
+                if (callback != null) {
+                    callback.onEvent(isSkill
+                            ? AgentIterationEvent.skillResult(iteration + 1, toolCall.getName(), toolCall.getArguments(), outcome.observation)
+                            : AgentIterationEvent.toolResult(iteration + 1, toolCall.getName(), toolCall.getArguments(), outcome.observation, outcome.serverName));
+                }
+
+                AgentResponse.ToolCallRecord record = new AgentResponse.ToolCallRecord(
+                        outcome.serverName != null ? outcome.serverName : "unknown",
+                        toolCall.getName(), toolCall.getArguments(), outcome.observation, iteration + 1);
+                if (outcome.uiHtml != null) {
+                    record.setUiResourceUri(outcome.uiResourceUri);
+                    record.setUiHtml(outcome.uiHtml);
+                }
+                toolCallRecords.add(record);
+
+                saveFullToolOutput(store, conversationId, toolCall, outcome.observation);
+                String observationForContext = compactToolObservation(toolCall.getName(), outcome.observation);
                 messages.add(new LlmMessage("tool_result", observationForContext, toolCall.getId(), toolCall.getName()));
             }
 
@@ -478,9 +425,7 @@ public class ReactEngine {
             // context window manageable and avoid token-limit errors.
             if (tokensSinceCompression >= COMPRESSION_TOKEN_THRESHOLD) {
                 if (callback != null) {
-                    callback.onIteration(iteration + 1,
-                            "Compacting conversation history",
-                            "Compacting conversation to reduce token usage.");
+                    callback.onEvent(AgentIterationEvent.compression(iteration + 1));
                 }
                 messages = compressHistory(llmClient, messages);
                 tokensSinceCompression = 0;
@@ -541,26 +486,131 @@ public class ReactEngine {
     private List<ToolDefinition> discoverMcpTools(List<McpServerConfig> mcpServers) throws Exception {
         if (mcpServers == null || mcpServers.isEmpty()) return Collections.emptyList();
 
+        // Independent per-server discovery calls — fan out instead of querying servers one at a time.
+        List<CompletableFuture<List<ToolDefinition>>> futures = mcpServers.stream()
+                .map(server -> CompletableFuture.supplyAsync(() -> {
+                    LOGGER.debug("Fetching MCP tools for client '{}' from {}", server.getName(), server.getServerUrl());
+                    List<ToolDefinition> serverTools = mcpClient.listTools(server);
+                    List<String> filter = server.getToolFilterList();
+                    if (!filter.isEmpty()) {
+                        serverTools = serverTools.stream()
+                                .filter(t -> filter.contains(t.getName()))
+                                .collect(Collectors.toList());
+                    }
+                    LOGGER.debug("Fetched {} tool(s) for client '{}': {}", serverTools.size(), server.getName(),
+                            serverTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
+                    return serverTools;
+                }, MCP_IO_EXECUTOR))
+                .collect(Collectors.toList());
+
         List<ToolDefinition> all = new ArrayList<>();
-        for (McpServerConfig server : mcpServers) {
-            LOGGER.debug("Fetching MCP tools for client '{}' from {}", server.getName(), server.getServerUrl());
-            List<ToolDefinition> serverTools = mcpClient.listTools(server);
-            List<String> filter = server.getToolFilterList();
-            if (!filter.isEmpty()) {
-                serverTools = serverTools.stream()
-                        .filter(t -> filter.contains(t.getName()))
-                        .collect(Collectors.toList());
-            }
-            LOGGER.debug("Fetched {} tool(s) for client '{}': {}", serverTools.size(), server.getName(),
-                    serverTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
-            all.addAll(serverTools);
+        for (CompletableFuture<List<ToolDefinition>> future : futures) {
+            all.addAll(future.join());
         }
         return all;
     }
 
     // ── tool execution ────────────────────────────────────────────────────────
 
-    private McpToolResult executeTool(ToolCall toolCall, List<ToolDefinition> tools,
+    /** Outcome of a single tool or skill invocation, shared by the sequential and parallel execution paths. */
+    private static final class ExecutionOutcome {
+        final String observation;
+        final String serverName;
+        final boolean failed;
+        final String uiResourceUri;
+        final String uiHtml;
+        /** Non-null when the MCP server paused this call with an elicitation/create request. */
+        final McpToolResult.ElicitationRequest elicitation;
+
+        ExecutionOutcome(String observation, String serverName, boolean failed, String uiResourceUri, String uiHtml) {
+            this.observation = observation;
+            this.serverName = serverName;
+            this.failed = failed;
+            this.uiResourceUri = uiResourceUri;
+            this.uiHtml = uiHtml;
+            this.elicitation = null;
+        }
+
+        private ExecutionOutcome(McpToolResult.ElicitationRequest elicitation) {
+            this.observation = null;
+            this.serverName = elicitation.getServerName();
+            this.failed = false;
+            this.uiResourceUri = null;
+            this.uiHtml = null;
+            this.elicitation = elicitation;
+        }
+
+        static ExecutionOutcome paused(McpToolResult.ElicitationRequest elicitation) {
+            return new ExecutionOutcome(elicitation);
+        }
+    }
+
+    /** Internal signal used to bubble an MCP elicitation pause up through a skill's sub-loop without being mistaken for a tool failure. */
+    private static final class ElicitationPauseSignal extends RuntimeException {
+        final McpToolResult.ElicitationRequest request;
+        ElicitationPauseSignal(McpToolResult.ElicitationRequest request) { this.request = request; }
+    }
+
+    /**
+     * Routes a tool call to either a configured skill's sub-loop or a direct MCP tool invocation.
+     * Used by both the sequential (single tool call) and parallel (multiple tool calls) branches
+     * of the main loop so the routing/error-handling logic exists in exactly one place.
+     *
+     * @param subLoopCallback callback for nested skill tool-call events; pass {@code null} when invoked
+     *                        concurrently (parallel branch) to avoid concurrent callback invocations
+     */
+    private ExecutionOutcome executeToolOrSkill(ToolCall toolCall,
+                                                List<ToolDefinition> mcpTools,
+                                                List<McpServerConfig> mcpServers,
+                                                AgentComposerConfiguration config,
+                                                List<AgentSkillConfig> skills,
+                                                String currentThought,
+                                                int iteration,
+                                                int remainingIterations,
+                                                IterationCallback subLoopCallback) {
+        AgentSkillConfig matchedSkill = findSkillByName(toolCall.getName(), skills);
+        if (matchedSkill != null) {
+            String taskArg = toolCall.getArguments() != null
+                    ? (String) toolCall.getArguments().getOrDefault("task", currentThought)
+                    : currentThought;
+            String serverName = "skill:" + matchedSkill.getName();
+            LOGGER.info("[Iteration {}] >>> Using skill '{}' | task: {}", iteration, matchedSkill.getName(), taskArg);
+            try {
+                String obs = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
+                        iteration, remainingIterations, subLoopCallback);
+                LOGGER.info("[Iteration {}] Skill response | name='{}' result={}", iteration, matchedSkill.getName(), obs);
+                return new ExecutionOutcome(obs, serverName, false, null, null);
+            } catch (ElicitationPauseSignal pause) {
+                LOGGER.info("[Iteration {}] Skill '{}' paused for user input (MCP elicitation) | requestId={}",
+                        iteration, matchedSkill.getName(), pause.request.getRequestId());
+                return ExecutionOutcome.paused(pause.request);
+            } catch (Exception e) {
+                LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration, matchedSkill.getName(), e.getMessage(), e);
+                return new ExecutionOutcome("Skill execution failed: " + e.getMessage(), serverName, true, null, null);
+            }
+        }
+
+        String serverName = findMcpServerName(toolCall, mcpTools, mcpServers);
+        LOGGER.info("[Iteration {}] >>> Using tool '{}' (server: {}) | args: {}",
+                iteration, toolCall.getName(), serverName != null ? serverName : "unknown", toolCall.getArguments());
+        try {
+            McpToolResult.CallOutcome outcome = executeTool(toolCall, mcpTools, mcpServers);
+            if (outcome.isElicitationRequired()) {
+                LOGGER.info("[Iteration {}] Tool '{}' paused for user input (MCP elicitation) | requestId={}",
+                        iteration, toolCall.getName(), outcome.getElicitation().getRequestId());
+                return ExecutionOutcome.paused(outcome.getElicitation());
+            }
+            McpToolResult result = outcome.getResult();
+            LOGGER.info("[Iteration {}] Tool response | name='{}' result={}", iteration, toolCall.getName(), result.getTextContent());
+            return new ExecutionOutcome(result.getTextContent(), serverName, false,
+                    result.getUiResourceUri(), result.getUiHtml());
+        } catch (Exception e) {
+            LOGGER.warn("[Iteration {}] Tool '{}' failed: {}", iteration, toolCall.getName(), e.getMessage(), e);
+            return new ExecutionOutcome("Tool execution failed: " + e.getMessage(), serverName, true, null, null);
+        }
+    }
+
+    private McpToolResult.CallOutcome executeTool(ToolCall toolCall, List<ToolDefinition> tools,
                                List<McpServerConfig> mcpServers) throws Exception {
         ToolDefinition toolDef = tools.stream()
                 .filter(t -> t.getName().equals(toolCall.getName()))
@@ -741,14 +791,16 @@ public class ReactEngine {
 
             // Notify before execution so SSE clients see the tool being invoked
             if (callback != null) {
-                callback.onIteration(parentIteration,
-                        "Passing skill tool request",
-                        "Passing request from skill '" + skill.getName() + "' to tool '" + toolCall.getName() + "'.");
+                callback.onEvent(AgentIterationEvent.toolCall(parentIteration, toolCall.getName(), toolCall.getArguments(), "skill:" + skill.getName()));
             }
 
             String obs;
             try {
-                McpToolResult skillToolResult = executeTool(toolCall, skillMcpTools, mcpServers);
+                McpToolResult.CallOutcome toolOutcome = executeTool(toolCall, skillMcpTools, mcpServers);
+                if (toolOutcome.isElicitationRequired()) {
+                    throw new ElicitationPauseSignal(toolOutcome.getElicitation());
+                }
+                McpToolResult skillToolResult = toolOutcome.getResult();
                 obs = skillToolResult.getTextContent();
                 AgentResponse.ToolCallRecord skillRecord = new AgentResponse.ToolCallRecord(
                         skill.getName(), toolCall.getName(), toolCall.getArguments(), obs, parentIteration);
@@ -757,6 +809,8 @@ public class ReactEngine {
                     skillRecord.setUiHtml(skillToolResult.getUiHtml());
                 }
                 toolCallRecords.add(skillRecord);
+            } catch (ElicitationPauseSignal pause) {
+                throw pause;
             } catch (Exception e) {
                 obs = "Tool execution failed: " + e.getMessage();
                 LOGGER.warn("[Skill '{}'] Tool '{}' failed: {}", skill.getName(), toolCall.getName(), e.getMessage());
@@ -766,9 +820,7 @@ public class ReactEngine {
 
             // Notify after execution with the actual observation
             if (callback != null) {
-                callback.onIteration(parentIteration,
-                        "Received skill tool response",
-                        "Received data from tool '" + toolCall.getName() + "' for skill '" + skill.getName() + "'; validating result.");
+                callback.onEvent(AgentIterationEvent.toolResult(parentIteration, toolCall.getName(), toolCall.getArguments(), obs, "skill:" + skill.getName()));
             }
 
             String obsForContext = compactToolObservation(toolCall.getName(), obs);
@@ -777,9 +829,7 @@ public class ReactEngine {
             // ── Context compression (skill sub-loop) ─────────────────────────
             if (skillTokensSinceCompression >= COMPRESSION_TOKEN_THRESHOLD) {
                 if (callback != null) {
-                    callback.onIteration(parentIteration,
-                            "Compacting skill conversation",
-                            "Compacting conversation to reduce token usage.");
+                    callback.onEvent(AgentIterationEvent.compression(parentIteration));
                 }
                 skillMessages = compressHistory(llmClient, skillMessages);
                 skillTokensSinceCompression = 0;

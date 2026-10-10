@@ -1,5 +1,6 @@
 package org.mule.extension.agent.composer.internal.source;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -19,14 +20,18 @@ import org.mule.runtime.http.api.domain.message.response.HttpResponse;
 import org.mule.runtime.http.api.server.HttpServer;
 import org.mule.runtime.http.api.server.RequestHandlerManager;
 import org.mule.runtime.http.api.server.async.HttpResponseReadyCallback;
+import org.mule.extension.agent.composer.internal.model.AgentIterationEvent;
 import org.mule.runtime.api.message.Error;
 import org.mule.runtime.extension.api.annotation.param.Content;
+import org.mule.runtime.extension.api.annotation.param.Optional;
+import org.mule.runtime.extension.api.annotation.param.display.Summary;
 import org.mule.sdk.api.annotation.Alias;
 import org.mule.sdk.api.annotation.execution.OnError;
 import org.mule.sdk.api.annotation.execution.OnSuccess;
 import org.mule.sdk.api.annotation.execution.OnTerminate;
 import org.mule.sdk.api.annotation.param.MediaType;
 import org.mule.sdk.api.annotation.param.Config;
+import org.mule.sdk.api.annotation.param.Parameter;
 import org.mule.sdk.api.annotation.param.display.DisplayName;
 import org.mule.sdk.api.annotation.source.EmitsResponse;
 import org.mule.sdk.api.runtime.operation.Result;
@@ -73,6 +78,7 @@ import java.util.UUID;
 public class AgentListenerSource extends Source<String, AgentListenerAttributes> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(AgentListenerSource.class);
+    private static final Gson GSON = new Gson();
     private static final String RESPONSE_CALLBACK_VAR = "responseCallback";
     private static final String REQUEST_VAR = "requestId";
     private static final String TASK_ID_VAR = "taskId";
@@ -86,6 +92,12 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
     @Config
     private AgentComposerConfiguration config;
+
+    @Parameter
+    @DisplayName("Max Iterations")
+    @Summary("Hard cap on Reason-Act cycles before returning a fallback answer, used for streaming (message/stream, tasks/sendSubscribe) requests.")
+    @Optional(defaultValue = "5")
+    private Integer maxIterations;
 
     @Inject
     private HttpService httpService;
@@ -154,6 +166,16 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
                 rpcIdJson = extractRpcIdJson(body);
                 isJsonRpc = rpcIdJson != null;
+
+                // A2A-Version negotiation (Section 3.6): empty/absent means 0.3; only 0.3 and 1.0 are understood.
+                // The wire payload shape (status/artifact event objects) is unchanged across both versions.
+                String a2aVersion = resolveA2aVersion(requestCtx.getRequest());
+                if (!isSupportedA2aVersion(a2aVersion)) {
+                    sendProtocolError(responseCallback, 400, -32009,
+                            "A2A protocol version '" + a2aVersion + "' is not supported by this agent.", isJsonRpc, rpcIdJson);
+                    return;
+                }
+
                 String methodName = extractMethodName(body);
                 JsonObject requestRoot = parseJsonObject(body);
                 if (requestRoot != null && requestRoot.has("jsonrpc")
@@ -413,20 +435,14 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             Thread thread = new Thread(() -> {
                 try {
                     ReactEngine engine = new ReactEngine(objectStoreManager);
-                    ReactEngine.IterationCallback callback = (iteration, actionName, observation) -> {
+                    ReactEngine.IterationCallback callback = event -> {
                         if (isTaskCanceled(taskId)) {
                             return;
                         }
-                        String summary = observation != null && !observation.trim().isEmpty()
-                                ? observation
-                                : actionName;
-                        if (summary == null || summary.trim().isEmpty()) {
-                            return;
-                        }
                         try {
-                            JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null, null);
+                            JsonObject workingTask = buildTask(taskId, contextId, "working", describeEvent(event), null, null);
                             persistTask(workingTask);
-                            pipedOut.write(buildWorkingSseEvent(taskId, contextId, summary, isJsonRpc, rpcIdJson)
+                            pipedOut.write(buildToolEventSseEvent(taskId, contextId, event, isJsonRpc, rpcIdJson)
                                     .getBytes(StandardCharsets.UTF_8));
                             pipedOut.flush();
                         } catch (Exception e) {
@@ -434,8 +450,9 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         }
                     };
 
+                    int effectiveMaxIterations = maxIterations != null ? maxIterations : 5;
                     org.mule.extension.agent.composer.internal.model.AgentResponse result =
-                            engine.run(config, userMessage, contextId, 5, callback);
+                            engine.run(config, userMessage, contextId, effectiveMaxIterations, callback);
 
                     if (isTaskCanceled(taskId)) {
                         JsonObject canceledTask = getCanceledTask(taskId);
@@ -679,20 +696,24 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return null;
     }
 
+    // Method names accept both the legacy 0.3.x slash-style ('message/stream') and the
+    // A2A 1.0 PascalCase style ('SendStreamingMessage') for the same operation.
     private static boolean isStreamingRequest(String methodName) {
-        return "message/stream".equals(methodName) || "tasks/sendSubscribe".equals(methodName);
+        return "message/stream".equals(methodName) || "tasks/sendSubscribe".equals(methodName)
+                || "SendStreamingMessage".equals(methodName) || "SubscribeToTask".equals(methodName);
     }
 
     private static boolean isTaskGetRequest(String methodName) {
-        return "tasks/get".equals(methodName);
+        return "tasks/get".equals(methodName) || "GetTask".equals(methodName);
     }
 
     private static boolean isTaskCancelRequest(String methodName) {
-        return "tasks/cancel".equals(methodName);
+        return "tasks/cancel".equals(methodName) || "CancelTask".equals(methodName);
     }
 
     private static boolean isMessageSendRequest(String methodName) {
-        return methodName == null || "message/send".equals(methodName) || "tasks/send".equals(methodName);
+        return methodName == null || "message/send".equals(methodName) || "tasks/send".equals(methodName)
+                || "SendMessage".equals(methodName);
     }
 
     private static String extractMessageTaskId(String body) {
@@ -908,8 +929,13 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return wrapSseData(update, isJsonRpc, rpcIdJson);
     }
 
-    private static String buildWorkingSseEvent(String taskId, String contextId, String summary,
-                                               boolean isJsonRpc, String rpcIdJson) {
+    /**
+     * Builds an A2A status-update event whose agent {@code Message} carries a structured
+     * {@code DataPart} describing the ReAct step (tool/skill call, result, compression, …)
+     * instead of flattening it into narrative text.
+     */
+    private static String buildToolEventSseEvent(String taskId, String contextId, AgentIterationEvent event,
+                                                  boolean isJsonRpc, String rpcIdJson) {
         JsonObject update = new JsonObject();
         update.addProperty("taskId", taskId);
         update.addProperty("contextId", contextId);
@@ -925,14 +951,46 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         message.addProperty("contextId", contextId);
         message.addProperty("kind", "message");
         JsonArray parts = new JsonArray();
-        JsonObject part = new JsonObject();
-        part.addProperty("kind", "text");
-        part.addProperty("text", summary);
-        parts.add(part);
+        parts.add(buildEventDataPart(event));
         message.add("parts", parts);
         status.add("message", message);
         update.add("status", status);
         return wrapSseData(update, isJsonRpc, rpcIdJson);
+    }
+
+    private static JsonObject buildEventDataPart(AgentIterationEvent event) {
+        JsonObject data = new JsonObject();
+        data.addProperty("eventKind", event.getKind().name().toLowerCase(java.util.Locale.ROOT).replace('_', '-'));
+        data.addProperty("iteration", event.getIteration());
+        if (event.getName() != null) {
+            data.addProperty("name", event.getName());
+        }
+        if (event.getServerName() != null) {
+            data.addProperty("server", event.getServerName());
+        }
+        if (event.getArguments() != null) {
+            data.add("arguments", GSON.toJsonTree(event.getArguments()));
+        }
+        if (event.getResult() != null) {
+            data.addProperty("result", event.getResult());
+        }
+        JsonObject part = new JsonObject();
+        part.addProperty("kind", "data");
+        part.add("data", data);
+        return part;
+    }
+
+    /** Short human-readable label used only for the persisted {@code Task.status.message} snapshot. */
+    private static String describeEvent(AgentIterationEvent event) {
+        switch (event.getKind()) {
+            case TOOL_CALL: return "Calling tool '" + event.getName() + "'";
+            case TOOL_RESULT: return "Received result from tool '" + event.getName() + "'";
+            case SKILL_CALL: return "Invoking skill '" + event.getName() + "'";
+            case SKILL_RESULT: return "Received result from skill '" + event.getName() + "'";
+            case PARALLEL_BATCH: return "Executing tools in parallel: " + event.getName();
+            case COMPRESSION: return "Compacting conversation history";
+            default: return "Working";
+        }
     }
 
     private static String wrapSseData(JsonObject result, boolean isJsonRpc, String rpcIdJson) {
@@ -1016,6 +1074,22 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 || "failed".equals(state)
                 || "canceled".equals(state)
                 || "rejected".equals(state);
+    }
+
+    /** Reads the {@code A2A-Version} header, falling back to the query parameter; empty/absent means 0.3. */
+    private static String resolveA2aVersion(org.mule.runtime.http.api.domain.message.request.HttpRequest request) {
+        String header = request.getHeaderValue("A2A-Version");
+        if (header != null && !header.trim().isEmpty()) {
+            return header.trim();
+        }
+        String queryParam = request.getQueryParams().get("A2A-Version");
+        return (queryParam != null && !queryParam.trim().isEmpty()) ? queryParam.trim() : "0.3";
+    }
+
+    /** Only Major.Minor is compared per spec \u00a73.6; patch versions (e.g. "1.0.0") are ignored. */
+    private static boolean isSupportedA2aVersion(String version) {
+        String majorMinor = version.length() > 3 ? version.substring(0, 3) : version;
+        return "0.3".equals(majorMinor) || "1.0".equals(majorMinor);
     }
 
     private static String nowUtc() {

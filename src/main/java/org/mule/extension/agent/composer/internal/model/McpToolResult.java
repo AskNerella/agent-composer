@@ -1,5 +1,7 @@
 package org.mule.extension.agent.composer.internal.model;
 
+import java.util.Map;
+
 /**
  * Result of a {@code tools/call} MCP JSON-RPC invocation, augmented with
  * optional MCP-UI resource data.
@@ -61,4 +63,71 @@ public class McpToolResult {
 
     /** Returns {@code true} when this result carries a rendered MCP-UI resource. */
     public boolean hasUiResource() { return uiHtml != null && !uiHtml.isEmpty(); }
+
+    /**
+     * A server-initiated {@code elicitation/create} request received mid-{@code tools/call},
+     * asking the client to collect additional structured input from the end user before the
+     * MCP server can finish executing the tool.
+     *
+     * <p>Carries everything needed to resume the paused call later (possibly from a fresh
+     * {@code McpClient} instance in a new agent invocation): the elicitation's own JSON-RPC id,
+     * the original {@code tools/call} id it is blocking, and the tool/server identity.
+     */
+    public static final class ElicitationRequest {
+        private final String requestId;
+        private final long originalRequestId;
+        private final String message;
+        private final Map<String, Object> requestedSchema;
+        private final String serverName;
+        private final String serverUrl;
+        private final String toolName;
+        private final Map<String, Object> toolArguments;
+        private final String defUiResourceUri;
+
+        public ElicitationRequest(String requestId, long originalRequestId, String message,
+                                   Map<String, Object> requestedSchema, String serverName, String serverUrl,
+                                   String toolName, Map<String, Object> toolArguments, String defUiResourceUri) {
+            this.requestId = requestId;
+            this.originalRequestId = originalRequestId;
+            this.message = message;
+            this.requestedSchema = requestedSchema;
+            this.serverName = serverName;
+            this.serverUrl = serverUrl;
+            this.toolName = toolName;
+            this.toolArguments = toolArguments;
+            this.defUiResourceUri = defUiResourceUri;
+        }
+
+        public String getRequestId() { return requestId; }
+        public long getOriginalRequestId() { return originalRequestId; }
+        public String getMessage() { return message; }
+        public Map<String, Object> getRequestedSchema() { return requestedSchema; }
+        public String getServerName() { return serverName; }
+        public String getServerUrl() { return serverUrl; }
+        public String getToolName() { return toolName; }
+        public Map<String, Object> getToolArguments() { return toolArguments; }
+        public String getDefUiResourceUri() { return defUiResourceUri; }
+    }
+
+    /**
+     * Outcome of a {@code tools/call} invocation: either the tool finished ({@link #getResult()}
+     * populated) or the server paused mid-call to ask the user a question via MCP Elicitation
+     * ({@link #getElicitation()} populated). Exactly one of the two is non-null.
+     */
+    public static final class CallOutcome {
+        private final McpToolResult result;
+        private final ElicitationRequest elicitation;
+
+        private CallOutcome(McpToolResult result, ElicitationRequest elicitation) {
+            this.result = result;
+            this.elicitation = elicitation;
+        }
+
+        public static CallOutcome completed(McpToolResult result) { return new CallOutcome(result, null); }
+        public static CallOutcome elicitationRequired(ElicitationRequest elicitation) { return new CallOutcome(null, elicitation); }
+
+        public boolean isElicitationRequired() { return elicitation != null; }
+        public McpToolResult getResult() { return result; }
+        public ElicitationRequest getElicitation() { return elicitation; }
+    }
 }
