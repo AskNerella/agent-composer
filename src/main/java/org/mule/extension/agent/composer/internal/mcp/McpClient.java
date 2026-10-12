@@ -44,6 +44,7 @@ public class McpClient {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(McpClient.class);
     private static final Gson GSON = new Gson();
+    private static final String MCP_PROTOCOL_VERSION = "2025-11-25";
     private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
@@ -52,6 +53,16 @@ public class McpClient {
 
     /** Session IDs cached per server URL, obtained during MCP initialization handshake. */
     private final ConcurrentHashMap<String, String> sessionIds = new ConcurrentHashMap<>();
+    /** Protocol version negotiated for each initialized server. */
+    private final ConcurrentHashMap<String, String> protocolVersions = new ConcurrentHashMap<>();
+
+    /**
+     * Live originating Streamable-HTTP responses, retained while a tool is paused for elicitation.
+     * The durable Object Store state remains authoritative; this registry only preserves the open
+     * SSE channel required by standards-compliant MCP servers that deliver the eventual tool result
+     * on the original {@code tools/call} response rather than on the later elicitation-response POST.
+     */
+    private static final ConcurrentHashMap<String, LiveResponse> LIVE_RESPONSES = new ConcurrentHashMap<>();
 
     // ── public API ────────────────────────────────────────────────────────────
 
@@ -165,7 +176,8 @@ public class McpClient {
                     server.getName(), toolName, elicitationId, prompt);
             return McpToolResult.CallOutcome.elicitationRequired(new McpToolResult.ElicitationRequest(
                     elicitationId, requestId, prompt, schema, server.getName(), server.getServerUrl(),
-                    toolName, arguments, defUiResourceUri));
+                    toolName, arguments, defUiResourceUri, sessionIds.get(server.getServerUrl()),
+                    protocolVersions.get(server.getServerUrl())));
         }
 
         return McpToolResult.CallOutcome.completed(
@@ -182,11 +194,10 @@ public class McpClient {
      * (persisted across the pause/resume turn, e.g. in an Object Store) since a new {@link McpClient}
      * is created per agent invocation and cannot rely on in-memory state surviving between turns.
      *
-     * <p><b>Compatibility note:</b> this relies on the MCP server supporting a resumable
-     * Streamable-HTTP session — i.e. tolerating the gap between sending the elicitation request and
-     * receiving this out-of-band response on a new HTTP connection. Servers that keep the original
-     * {@code tools/call} connection open and expect the response on that same connection are not
-     * supported by this pause/resume model.
+     * <p><b>Compatibility note:</b> both known Streamable-HTTP continuation behaviors are supported:
+     * a final result returned on the later response POST, and a final result delivered on the retained
+     * originating {@code tools/call} SSE stream. The latter stream is process-local, so after a runtime
+     * restart only a server that supports the later-POST behavior can complete the persisted request.
      *
      * @param server  the MCP server that issued the elicitation request
      * @param pending the elicitation request being answered (as returned from {@link #callTool})
@@ -194,16 +205,23 @@ public class McpClient {
      */
     public McpToolResult.CallOutcome resolveElicitation(McpServerConfig server,
                                                         McpToolResult.ElicitationRequest pending,
+                                                        String action,
                                                         Object answer) throws Exception {
+        if (pending.getProtocolVersion() != null && !pending.getProtocolVersion().isEmpty()) {
+            protocolVersions.put(server.getServerUrl(), pending.getProtocolVersion());
+        }
         JsonObject responsePayload = new JsonObject();
         responsePayload.addProperty("jsonrpc", "2.0");
         responsePayload.add("id", parseJsonRpcId(pending.getRequestId()));
         JsonObject result = new JsonObject();
-        result.addProperty("action", "accept");
-        result.add("content", GSON.toJsonTree(answer));
+        result.addProperty("action", action);
+        if ("accept".equals(action)) {
+            result.add("content", GSON.toJsonTree(answer));
+        }
         responsePayload.add("result", result);
 
-        JsonObject message = postStreamingAndAwait(server, responsePayload, pending.getOriginalRequestId());
+        JsonObject message = postStreamingAndAwaitSavedSession(
+                server, responsePayload, pending.getOriginalRequestId(), pending.getSessionId());
 
         if (isElicitationRequest(message)) {
             String nextElicitationId = message.get("id").getAsString();
@@ -215,7 +233,8 @@ public class McpClient {
             return McpToolResult.CallOutcome.elicitationRequired(new McpToolResult.ElicitationRequest(
                     nextElicitationId, pending.getOriginalRequestId(), prompt, schema,
                     pending.getServerName(), pending.getServerUrl(), pending.getToolName(),
-                    pending.getToolArguments(), pending.getDefUiResourceUri()));
+                    pending.getToolArguments(), pending.getDefUiResourceUri(), pending.getSessionId(),
+                    pending.getProtocolVersion()));
         }
 
         return McpToolResult.CallOutcome.completed(
@@ -402,7 +421,7 @@ public class McpClient {
 
     private String initializeSession(McpServerConfig server) throws Exception {
         JsonObject params = new JsonObject();
-        params.addProperty("protocolVersion", "2024-11-05");
+        params.addProperty("protocolVersion", MCP_PROTOCOL_VERSION);
 
         JsonObject clientInfo = new JsonObject();
         clientInfo.addProperty("name", "agent-composer");
@@ -421,7 +440,9 @@ public class McpClient {
         capabilities.add("extensions", extensions);
         // Declare elicitation support: servers may pause tools/call with an elicitation/create
         // request; see callTool()/resolveElicitation() for the client-side handling.
-        capabilities.add("elicitation", new JsonObject());
+        JsonObject elicitation = new JsonObject();
+        elicitation.add("form", new JsonObject());
+        capabilities.add("elicitation", elicitation);
         params.add("capabilities", capabilities);
 
         JsonObject payload = new JsonObject();
@@ -447,12 +468,39 @@ public class McpClient {
         }
 
         String sessionId = response.headers().firstValue("Mcp-Session-Id").orElse(null);
+        String negotiatedVersion = MCP_PROTOCOL_VERSION;
+        try {
+            JsonObject initialized = JsonParser.parseString(extractJson(response.body())).getAsJsonObject();
+            if (initialized.has("result") && initialized.get("result").isJsonObject()) {
+                JsonObject initResult = initialized.getAsJsonObject("result");
+                if (initResult.has("protocolVersion")) {
+                    negotiatedVersion = initResult.get("protocolVersion").getAsString();
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.debug("MCP server '{}' did not expose a parseable negotiated protocol version", server.getName());
+        }
+        protocolVersions.put(server.getServerUrl(), negotiatedVersion);
         if (sessionId != null) {
             LOGGER.info("MCP session established for '{}': sessionId={}", server.getName(), sessionId);
         } else {
             LOGGER.info("MCP server '{}' did not return a session ID — proceeding without one.", server.getName());
         }
-        return sessionId != null ? sessionId : "";
+        String safeSessionId = sessionId != null ? sessionId : "";
+        sendInitializedNotification(server, safeSessionId, negotiatedVersion);
+        return safeSessionId;
+    }
+
+    private void sendInitializedNotification(McpServerConfig server, String sessionId,
+                                             String protocolVersion) throws Exception {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("jsonrpc", "2.0");
+        payload.addProperty("method", "notifications/initialized");
+        HttpRequest.Builder builder = requestBuilder(server, payload, sessionId, protocolVersion);
+        HttpResponse<String> response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new RuntimeException("MCP initialized notification failed with HTTP " + response.statusCode());
+        }
     }
 
     private String sendRpc(McpServerConfig server, String method, JsonObject params) throws Exception {
@@ -470,6 +518,7 @@ public class McpClient {
                 .uri(URI.create(server.getServerUrl()))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", protocolVersions.getOrDefault(server.getServerUrl(), MCP_PROTOCOL_VERSION))
                 .POST(HttpRequest.BodyPublishers.ofString(body));
 
         if (!sessionId.isEmpty()) {
@@ -493,6 +542,7 @@ public class McpClient {
                         .uri(URI.create(server.getServerUrl()))
                         .header("Content-Type", "application/json")
                         .header("Accept", "application/json, text/event-stream")
+                        .header("MCP-Protocol-Version", protocolVersions.getOrDefault(server.getServerUrl(), MCP_PROTOCOL_VERSION))
                         .POST(HttpRequest.BodyPublishers.ofString(body));
                 if (!sessionId.isEmpty()) {
                     builder.header("Mcp-Session-Id", sessionId);
@@ -562,6 +612,7 @@ public class McpClient {
         HttpResponse<Stream<String>> response = postForLines(server, payload, sessionId);
 
         if (response.statusCode() == 400) {
+            response.body().close();
             LOGGER.warn("MCP session invalid for '{}', re-initializing...", server.getName());
             sessionIds.remove(server.getServerUrl());
             sessionId = getOrInitSession(server);
@@ -569,10 +620,92 @@ public class McpClient {
         }
 
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            response.body().close();
             throw new RuntimeException("MCP HTTP error " + response.statusCode() + " from " + server.getServerUrl());
         }
 
-        return readUntilMatch(response.body(), awaitRequestId);
+        LiveResponse live = new LiveResponse(response.body());
+        try {
+            JsonObject message = live.readUntilMatch(awaitRequestId);
+            if (isElicitationRequest(message)) {
+                String key = liveResponseKey(server.getServerUrl(), sessionId, awaitRequestId);
+                LiveResponse previous = LIVE_RESPONSES.put(key, live);
+                if (previous != null) previous.close();
+            } else {
+                live.close();
+            }
+            return message;
+        } catch (Exception e) {
+            live.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Continues an already-paused call on the exact session that issued the elicitation.
+     * A missing or expired session is terminal: creating a new session would lose the
+     * original request and could cause an unsafe replay by callers.
+     */
+    private JsonObject postStreamingAndAwaitSavedSession(McpServerConfig server, JsonObject payload,
+                                                         long awaitRequestId, String savedSessionId) throws Exception {
+        if (savedSessionId == null) {
+            throw new RuntimeException("Cannot resume MCP elicitation: the original MCP session ID was not persisted");
+        }
+        sessionIds.put(server.getServerUrl(), savedSessionId);
+        HttpResponse<Stream<String>> response = postForLines(server, payload, savedSessionId);
+        String liveKey = liveResponseKey(server.getServerUrl(), savedSessionId, awaitRequestId);
+        if (response.statusCode() == 400 || response.statusCode() == 404) {
+            response.body().close();
+            discardLiveResponse(liveKey);
+            throw new RuntimeException("Cannot resume MCP elicitation: the original MCP session expired or was rejected");
+        }
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            response.body().close();
+            throw new RuntimeException("MCP HTTP error " + response.statusCode() + " from " + server.getServerUrl());
+        }
+
+        // Some servers return the continued tools/call result directly on this POST. Prefer that
+        // when present, preserving the connector's existing resumable later-POST behavior.
+        LiveResponse postedResponse = new LiveResponse(response.body());
+        JsonObject message;
+        try {
+            message = postedResponse.readUntilMatchOrNull(awaitRequestId);
+        } finally {
+            postedResponse.close();
+        }
+        if (message != null) {
+            discardLiveResponse(liveKey);
+            return message;
+        }
+
+        // Standards-compliant Streamable-HTTP servers acknowledge the response POST (usually 202)
+        // and finish tools/call on its original SSE channel. Continue consuming that retained stream.
+        LiveResponse originatingResponse = LIVE_RESPONSES.get(liveKey);
+        if (originatingResponse == null) {
+            throw new RuntimeException("MCP server acknowledged the elicitation response but the original "
+                    + "tools/call stream is no longer available for request id " + awaitRequestId);
+        }
+        try {
+            message = originatingResponse.readUntilMatch(awaitRequestId);
+            if (!isElicitationRequest(message)) {
+                LIVE_RESPONSES.remove(liveKey, originatingResponse);
+                originatingResponse.close();
+            }
+            return message;
+        } catch (Exception e) {
+            LIVE_RESPONSES.remove(liveKey, originatingResponse);
+            originatingResponse.close();
+            throw e;
+        }
+    }
+
+    private static String liveResponseKey(String serverUrl, String sessionId, long requestId) {
+        return serverUrl + "\n" + (sessionId != null ? sessionId : "") + "\n" + requestId;
+    }
+
+    private static void discardLiveResponse(String key) {
+        LiveResponse live = LIVE_RESPONSES.remove(key);
+        if (live != null) live.close();
     }
 
     private HttpResponse<Stream<String>> postForLines(McpServerConfig server, JsonObject payload, String sessionId) throws Exception {
@@ -580,6 +713,7 @@ public class McpClient {
                 .uri(URI.create(server.getServerUrl()))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", protocolVersions.getOrDefault(server.getServerUrl(), MCP_PROTOCOL_VERSION))
                 .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(payload)));
         if (sessionId != null && !sessionId.isEmpty()) {
             builder.header("Mcp-Session-Id", sessionId);
@@ -590,43 +724,88 @@ public class McpClient {
         return HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofLines());
     }
 
+    private HttpRequest.Builder requestBuilder(McpServerConfig server, JsonObject payload,
+                                               String sessionId, String protocolVersion) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(server.getServerUrl()))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", protocolVersion != null ? protocolVersion : MCP_PROTOCOL_VERSION)
+                .POST(HttpRequest.BodyPublishers.ofString(GSON.toJson(payload)));
+        if (sessionId != null && !sessionId.isEmpty()) {
+            builder.header("Mcp-Session-Id", sessionId);
+        }
+        if (server.getAuthToken() != null && !server.getAuthToken().isEmpty()) {
+            builder.header("Authorization", "Bearer " + server.getAuthToken());
+        }
+        return builder;
+    }
+
     /**
      * Reads SSE {@code data:} events (or, as a fallback, a single plain-JSON body) until either
      * an {@code elicitation/create} request or the response matching {@code awaitRequestId} appears.
      */
-    private JsonObject readUntilMatch(Stream<String> lineStream, long awaitRequestId) throws Exception {
-        StringBuilder sseEvent = new StringBuilder();
-        StringBuilder rawBody = new StringBuilder();
-        boolean sawSseData = false;
-        try (Stream<String> lines = lineStream) {
-            Iterator<String> it = lines.iterator();
-            while (it.hasNext()) {
-                String line = it.next();
+    private static final class LiveResponse {
+        private final Stream<String> stream;
+        private final Iterator<String> lines;
+        private final StringBuilder sseEvent = new StringBuilder();
+        private final StringBuilder rawBody = new StringBuilder();
+        private boolean sawSseData;
+        private boolean closed;
+
+        private LiveResponse(Stream<String> stream) {
+            this.stream = stream;
+            this.lines = stream.iterator();
+        }
+
+        private synchronized JsonObject readUntilMatch(long awaitRequestId) {
+            JsonObject message = readUntilMatchOrNull(awaitRequestId);
+            if (message == null) {
+                throw new RuntimeException("MCP server closed the connection without returning a result for request id "
+                        + awaitRequestId);
+            }
+            return message;
+        }
+
+        private synchronized JsonObject readUntilMatchOrNull(long awaitRequestId) {
+            while (lines.hasNext()) {
+                String line = lines.next();
                 if (line.startsWith("data:")) {
                     sawSseData = true;
                     sseEvent.append(line.substring(5).stripLeading());
                 } else if (line.isEmpty()) {
-                    JsonObject msg = flushSseEvent(sseEvent, sawSseData);
-                    if (msg != null && (isElicitationRequest(msg) || matchesId(msg, awaitRequestId))) {
-                        return msg;
+                    JsonObject message = flushSseEvent(sseEvent, sawSseData);
+                    if (message != null && (isElicitationRequest(message) || matchesId(message, awaitRequestId))) {
+                        return message;
                     }
-                } else if (line.startsWith(":") || line.startsWith("event:") || line.startsWith("id:") || line.startsWith("retry:")) {
-                    // SSE metadata/comment lines — not part of the JSON payload
+                } else if (line.startsWith(":") || line.startsWith("event:") || line.startsWith("id:")
+                        || line.startsWith("retry:")) {
+                    // SSE metadata/comment line.
                 } else if (!sawSseData) {
-                    // Non-SSE server: accumulate the plain JSON body across lines
                     rawBody.append(line);
                 }
             }
+
             JsonObject trailing = flushSseEvent(sseEvent, sawSseData);
             if (trailing != null && (isElicitationRequest(trailing) || matchesId(trailing, awaitRequestId))) {
                 return trailing;
             }
             if (!sawSseData && rawBody.length() > 0) {
-                JsonObject msg = tryParseObject(rawBody.toString());
-                if (msg != null) return msg;
+                JsonObject message = tryParseObject(rawBody.toString());
+                rawBody.setLength(0);
+                if (message != null && (isElicitationRequest(message) || matchesId(message, awaitRequestId))) {
+                    return message;
+                }
+            }
+            return null;
+        }
+
+        private synchronized void close() {
+            if (!closed) {
+                closed = true;
+                stream.close();
             }
         }
-        throw new RuntimeException("MCP server closed the connection without returning a result for request id " + awaitRequestId);
     }
 
     private static JsonObject flushSseEvent(StringBuilder sseEvent, boolean sawSseData) {

@@ -291,6 +291,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             if (isInputRequired(agentResponse)) {
                 String question = extractInputRequest(agentResponse, rawPayload);
                 JsonObject task = buildTask(taskId, contextId, "input-required", question, null, null);
+                addInputRequiredMetadata(task, agentResponse);
                 persistTask(task);
                 sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
                 return;
@@ -451,6 +452,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     };
 
                     int effectiveMaxIterations = maxIterations != null ? maxIterations : 5;
+                    LOGGER.info("[SSE task {}] Starting ReAct loop | contextId='{}' maxIterations={}",
+                            taskId, contextId, effectiveMaxIterations);
                     org.mule.extension.agent.composer.internal.model.AgentResponse result =
                             engine.run(config, userMessage, contextId, effectiveMaxIterations, callback);
 
@@ -469,9 +472,12 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     if (result.isRequiresInput()) {
                         LOGGER.info("[SSE task {}] Agent requires input: {}", taskId, result.getInputRequest());
                         JsonObject inputRequiredTask = buildTask(taskId, contextId, "input-required", result.getInputRequest(), null, null);
+                        JsonObject resultJson = GSON.toJsonTree(result).getAsJsonObject();
+                        addInputRequiredMetadata(inputRequiredTask, resultJson);
                         persistTask(inputRequiredTask);
-                        pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "input-required",
-                                result.getInputRequest(), true, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
+                        pipedOut.write(buildInputRequiredStatusUpdateSseEvent(taskId, contextId,
+                                result.getInputRequest(), resultJson, isJsonRpc, rpcIdJson)
+                                .getBytes(StandardCharsets.UTF_8));
                         pipedOut.flush();
                         return;
                     }
@@ -831,6 +837,33 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return task;
     }
 
+    private static void addInputRequiredMetadata(JsonObject task, JsonObject agentResponse) {
+        if (task == null || agentResponse == null || !task.has("status")) return;
+        JsonObject status = task.getAsJsonObject("status");
+        if (!status.has("message")) return;
+        JsonObject message = status.getAsJsonObject("message");
+        JsonArray parts = message.getAsJsonArray("parts");
+        if (parts == null) {
+            parts = new JsonArray();
+            message.add("parts", parts);
+        }
+        JsonObject data = new JsonObject();
+        copyIfPresent(agentResponse, data, "inputKind");
+        copyIfPresent(agentResponse, data, "elicitationServerName");
+        copyIfPresent(agentResponse, data, "elicitationToolName");
+        copyIfPresent(agentResponse, data, "elicitationSchema");
+        JsonObject part = new JsonObject();
+        part.addProperty("kind", "data");
+        part.add("data", data);
+        parts.add(part);
+    }
+
+    private static void copyIfPresent(JsonObject source, JsonObject target, String field) {
+        if (source.has(field) && !source.get(field).isJsonNull()) {
+            target.add(field, source.get(field).deepCopy());
+        }
+    }
+
     private static JsonObject buildStatus(String state, String text, String taskId, String contextId) {
         JsonObject status = new JsonObject();
         status.addProperty("state", state);
@@ -914,6 +947,20 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         update.addProperty("kind", "status-update");
         update.add("status", buildStatus(state, text, taskId, contextId));
         update.addProperty("final", isFinal);
+        return wrapSseData(update, isJsonRpc, rpcIdJson);
+    }
+
+    private static String buildInputRequiredStatusUpdateSseEvent(
+            String taskId, String contextId, String text, JsonObject agentResponse,
+            boolean isJsonRpc, String rpcIdJson) {
+        JsonObject task = buildTask(taskId, contextId, "input-required", text, null, null);
+        addInputRequiredMetadata(task, agentResponse);
+        JsonObject update = new JsonObject();
+        update.addProperty("taskId", taskId);
+        update.addProperty("contextId", contextId);
+        update.addProperty("kind", "status-update");
+        update.add("status", task.getAsJsonObject("status"));
+        update.addProperty("final", true);
         return wrapSseData(update, isJsonRpc, rpcIdJson);
     }
 

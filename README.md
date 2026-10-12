@@ -27,6 +27,7 @@ Add this dependency to your application `pom.xml`:
 | **MCP Tool Integration** | Connects to one or more MCP servers; tools are automatically discovered and made available to the LLM |
 | **A2A Server** | Built-in HTTP listener exposes the agent as an A2A-compliant endpoint, serving an agent card and accepting task requests |
 | **Conversation Memory** | Persists turn-by-turn history in a Mule Object Store; supports multi-turn sessions via Conversation ID |
+| **MCP Form Elicitation** | Pauses direct tools or nested skills for schema-driven user input and durably resumes them with the same Conversation ID |
 | **Response Caching** | Identical requests reuse cached responses, avoiding redundant LLM calls |
 | **Agent Evaluation** | Built-in LLM-based evaluator scores agent responses (verdict, score, confidence, improvements) |
 

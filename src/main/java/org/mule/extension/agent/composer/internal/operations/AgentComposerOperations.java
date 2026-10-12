@@ -64,8 +64,11 @@ public class AgentComposerOperations {
             @Optional(defaultValue = "5")
             Integer maxIterations) throws Exception {
 
+        int effectiveMaxIterations = maxIterations != null ? maxIterations : DEFAULT_MAX_ITERATIONS;
+        LOGGER.info("Execute Agent starting | conversationId='{}' maxIterations={}",
+                conversationId, effectiveMaxIterations);
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        AgentResponse response = engine.run(config, userMessage, conversationId, maxIterations);
+        AgentResponse response = engine.run(config, userMessage, conversationId, effectiveMaxIterations);
         return GSON.toJson(response);
     }
 

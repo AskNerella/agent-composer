@@ -13,6 +13,7 @@ import org.mule.extension.agent.composer.internal.model.AgentResponse;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 import org.mule.extension.agent.composer.internal.model.McpToolResult;
+import org.mule.extension.agent.composer.internal.model.PendingElicitationState;
 import org.mule.extension.agent.composer.internal.model.ToolCall;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
 import org.mule.runtime.api.store.ObjectStore;
@@ -35,6 +36,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+import java.net.URI;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.util.stream.Collectors;
 
 /**
@@ -113,11 +118,15 @@ public class ReactEngine {
 
     private final ObjectStoreManager objectStoreManager;
     private final McpClient mcpClient;
-    private final List<AgentResponse.ToolCallRecord> toolCallRecords = new ArrayList<>();
+    private final List<AgentResponse.ToolCallRecord> toolCallRecords = Collections.synchronizedList(new ArrayList<>());
 
     public ReactEngine(ObjectStoreManager objectStoreManager) {
+        this(objectStoreManager, new McpClient());
+    }
+
+    ReactEngine(ObjectStoreManager objectStoreManager, McpClient mcpClient) {
         this.objectStoreManager = objectStoreManager;
-        this.mcpClient = new McpClient();
+        this.mcpClient = mcpClient;
     }
 
     private static ThreadFactory daemonThreadFactory(String namePrefix) {
@@ -193,40 +202,66 @@ public class ReactEngine {
         toolCallRecords.clear();
 
         boolean resumedSession = hasConversationHistory(store, conversationId);
+        PendingElicitationState pendingState = loadPendingElicitation(store, conversationId);
+        List<LlmMessage> messages;
+        int startIteration = 0;
+        int toolFailureCount = 0;
 
-        String requestSignature = buildRequestSignature(config, userMessage, mcpServers);
-        String solvedCacheKeyScoped = buildSolvedCacheKey(conversationId, requestSignature);
-        String solvedCacheKeyGlobal = buildSolvedCacheKey(null, requestSignature);
-
-        if (!resumedSession) {
-            AgentResponse cached = loadSolvedResponse(store, solvedCacheKeyScoped);
-            if (cached == null) {
-                cached = loadSolvedResponse(store, solvedCacheKeyGlobal);
+        if (pendingState != null) {
+            String elicitationAnswer = userMessage;
+            resumedSession = true;
+            pendingState.setResumedSession(true);
+            userMessage = pendingState.getRootUserTask();
+            int configuredMaxIterations = maxIterations;
+            int persistedMaxIterations = pendingState.getMaxIterations();
+            maxIterations = reconcilePendingIterationBudget(pendingState, configuredMaxIterations);
+            LOGGER.info("Resuming MCP elicitation | conversationId='{}' configuredMaxIterations={} "
+                            + "persistedMaxIterations={} effectiveMaxIterations={}",
+                    conversationId, configuredMaxIterations, persistedMaxIterations, maxIterations);
+            startIteration = pendingState.getActualIterations();
+            toolFailureCount = pendingState.getFailureCount();
+            toolCallRecords.addAll(pendingState.getToolCallRecords());
+            ResumeResult resume = resumePendingElicitation(store, conversationId, pendingState,
+                    elicitationAnswer, config, skills, mcpTools, mcpServers, callback);
+            if (resume.response != null) {
+                return resume.response;
             }
-            if (cached != null) {
-                cached.setCacheHit(true);
-                cached.setResumedSession(false);
-                if (cached.getSessionId() == null || cached.getSessionId().trim().isEmpty()) {
-                    cached.setSessionId(conversationId);
+            messages = resume.messages;
+            toolFailureCount = pendingState.getFailureCount();
+        } else {
+            String requestSignatureForCache = buildRequestSignature(config, userMessage, mcpServers, maxIterations);
+            String scopedCache = buildSolvedCacheKey(conversationId, requestSignatureForCache);
+            String globalCache = buildSolvedCacheKey(null, requestSignatureForCache);
+            if (!resumedSession) {
+                AgentResponse cached = loadSolvedResponse(store, scopedCache);
+                if (cached == null) cached = loadSolvedResponse(store, globalCache);
+                if (cached != null) {
+                    cached.setCacheHit(true);
+                    cached.setResumedSession(false);
+                    if (cached.getSessionId() == null || cached.getSessionId().trim().isEmpty()) {
+                        cached.setSessionId(conversationId);
+                    }
+                    if (cached.getReturnReason() == null || cached.getReturnReason().trim().isEmpty()) {
+                        cached.setReturnReason(cached.isComplete() ? "completed successfully" : "incomplete cached response");
+                    }
+                    return cached;
                 }
-                if (cached.getReturnReason() == null || cached.getReturnReason().trim().isEmpty()) {
-                    cached.setReturnReason(cached.isComplete() ? "completed successfully" : "incomplete cached response");
-                }
-                return cached;
             }
+            messages = loadHistory(store, conversationId);
+            messages.add(new LlmMessage("user", userMessage));
         }
 
-        List<LlmMessage> messages = loadHistory(store, conversationId);
-        messages.add(new LlmMessage("user", userMessage));
+        String requestSignature = buildRequestSignature(config, userMessage, mcpServers, maxIterations);
+        String solvedCacheKeyScoped = buildSolvedCacheKey(conversationId, requestSignature);
+        String solvedCacheKeyGlobal = buildSolvedCacheKey(null, requestSignature);
 
         String currentThought = userMessage;
         String finalAnswer = null;
         String bestFinalAnswer = null;
-        int actualIterations = 0;
-        int toolFailureCount = 0;
+        int actualIterations = startIteration;
         int tokensSinceCompression = 0; // compress when accumulated LLM token usage crosses threshold
 
-        for (int iteration = 0; iteration < maxIterations; iteration++) {
+        for (int iteration = startIteration; iteration < maxIterations; iteration++) {
             actualIterations = iteration + 1;
             LOGGER.info("--- ReAct Iteration {}/{} | conversationId='{}' ---", iteration + 1, maxIterations, conversationId);
             LOGGER.debug("[Iteration {}] What am I trying to do? {}", iteration + 1, currentThought);
@@ -330,7 +365,7 @@ public class ReactEngine {
                 CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
                 // Collect results, fire response callbacks, record tool calls, append tool_result messages
-                McpToolResult.ElicitationRequest pendingElicitation = null;
+                List<PendingElicitationState.Continuation> pausedContinuations = new ArrayList<>();
                 for (int t = 0; t < toolCalls.size(); t++) {
                     ToolCall tc = toolCalls.get(t);
                     ExecutionOutcome outcome;
@@ -339,11 +374,11 @@ public class ReactEngine {
                     } catch (Exception e) {
                         outcome = new ExecutionOutcome("Error: " + e.getMessage(), null, true, null, null);
                     }
+                    toolCallRecords.addAll(outcome.nestedRecords);
 
                     if (outcome.elicitation != null) {
-                        // One paused tool call pauses the whole iteration; still record a tool_result
-                        // placeholder for every tool_use so the LLM message history stays well-formed.
-                        if (pendingElicitation == null) pendingElicitation = outcome.elicitation;
+                        pausedContinuations.add(buildContinuation(
+                                outcome.elicitation, tc, iteration + 1, outcome.skillState));
                         messages.add(new LlmMessage("tool_result", "Waiting for user input (elicitation).", tc.getId(), tc.getName()));
                         continue;
                     }
@@ -368,11 +403,12 @@ public class ReactEngine {
                     messages.add(new LlmMessage("tool_result", obsForContext, tc.getId(), tc.getName()));
                 }
 
-                if (pendingElicitation != null) {
+                if (!pausedContinuations.isEmpty()) {
                     saveHistory(store, conversationId, messages);
-                    savePendingElicitation(store, conversationId, pendingElicitation);
-                    return buildElicitationResponse(pendingElicitation, userMessage, maxIterations,
-                            actualIterations, conversationId, resumedSession, toolCallRecords);
+                    PendingElicitationState state = buildPendingState(userMessage, maxIterations,
+                            actualIterations, toolFailureCount, resumedSession, pausedContinuations);
+                    savePendingElicitation(store, conversationId, state);
+                    return buildElicitationResponse(state, conversationId, null);
                 }
 
             } else {
@@ -389,13 +425,18 @@ public class ReactEngine {
 
                 ExecutionOutcome outcome = executeToolOrSkill(toolCall, mcpTools, mcpServers, config, skills,
                         currentThought, iteration + 1, maxIterations - iteration, callback);
+                toolCallRecords.addAll(outcome.nestedRecords);
 
                 if (outcome.elicitation != null) {
                     messages.add(new LlmMessage("tool_result", "Waiting for user input (elicitation).", toolCall.getId(), toolCall.getName()));
                     saveHistory(store, conversationId, messages);
-                    savePendingElicitation(store, conversationId, outcome.elicitation);
-                    return buildElicitationResponse(outcome.elicitation, userMessage, maxIterations,
-                            actualIterations, conversationId, resumedSession, toolCallRecords);
+                    PendingElicitationState.Continuation continuation = buildContinuation(
+                            outcome.elicitation, toolCall, iteration + 1, outcome.skillState);
+                    PendingElicitationState state = buildPendingState(userMessage, maxIterations,
+                            actualIterations, toolFailureCount, resumedSession,
+                            Collections.singletonList(continuation));
+                    savePendingElicitation(store, conversationId, state);
+                    return buildElicitationResponse(state, conversationId, null);
                 }
 
                 if (outcome.failed) toolFailureCount++;
@@ -519,8 +560,10 @@ public class ReactEngine {
         final boolean failed;
         final String uiResourceUri;
         final String uiHtml;
+        final List<AgentResponse.ToolCallRecord> nestedRecords;
         /** Non-null when the MCP server paused this call with an elicitation/create request. */
         final McpToolResult.ElicitationRequest elicitation;
+        final PendingElicitationState.SkillState skillState;
 
         ExecutionOutcome(String observation, String serverName, boolean failed, String uiResourceUri, String uiHtml) {
             this.observation = observation;
@@ -529,26 +572,52 @@ public class ReactEngine {
             this.uiResourceUri = uiResourceUri;
             this.uiHtml = uiHtml;
             this.elicitation = null;
+            this.skillState = null;
+            this.nestedRecords = Collections.emptyList();
         }
 
-        private ExecutionOutcome(McpToolResult.ElicitationRequest elicitation) {
+        private ExecutionOutcome(McpToolResult.ElicitationRequest elicitation,
+                                 PendingElicitationState.SkillState skillState,
+                                 List<AgentResponse.ToolCallRecord> nestedRecords) {
             this.observation = null;
             this.serverName = elicitation.getServerName();
             this.failed = false;
             this.uiResourceUri = null;
             this.uiHtml = null;
             this.elicitation = elicitation;
+            this.skillState = skillState;
+            this.nestedRecords = nestedRecords != null ? nestedRecords : Collections.emptyList();
         }
 
-        static ExecutionOutcome paused(McpToolResult.ElicitationRequest elicitation) {
-            return new ExecutionOutcome(elicitation);
+        private ExecutionOutcome(String observation, String serverName, boolean failed,
+                                 String uiResourceUri, String uiHtml,
+                                 List<AgentResponse.ToolCallRecord> nestedRecords) {
+            this.observation = observation;
+            this.serverName = serverName;
+            this.failed = failed;
+            this.uiResourceUri = uiResourceUri;
+            this.uiHtml = uiHtml;
+            this.elicitation = null;
+            this.skillState = null;
+            this.nestedRecords = nestedRecords != null ? nestedRecords : Collections.emptyList();
+        }
+
+        static ExecutionOutcome paused(McpToolResult.ElicitationRequest elicitation,
+                                       PendingElicitationState.SkillState skillState,
+                                       List<AgentResponse.ToolCallRecord> nestedRecords) {
+            return new ExecutionOutcome(elicitation, skillState, nestedRecords);
         }
     }
 
     /** Internal signal used to bubble an MCP elicitation pause up through a skill's sub-loop without being mistaken for a tool failure. */
     private static final class ElicitationPauseSignal extends RuntimeException {
         final McpToolResult.ElicitationRequest request;
-        ElicitationPauseSignal(McpToolResult.ElicitationRequest request) { this.request = request; }
+        final PendingElicitationState.SkillState skillState;
+        ElicitationPauseSignal(McpToolResult.ElicitationRequest request,
+                               PendingElicitationState.SkillState skillState) {
+            this.request = request;
+            this.skillState = skillState;
+        }
     }
 
     /**
@@ -570,6 +639,7 @@ public class ReactEngine {
                                                 IterationCallback subLoopCallback) {
         AgentSkillConfig matchedSkill = findSkillByName(toolCall.getName(), skills);
         if (matchedSkill != null) {
+            List<AgentResponse.ToolCallRecord> nestedRecords = new ArrayList<>();
             String taskArg = toolCall.getArguments() != null
                     ? (String) toolCall.getArguments().getOrDefault("task", currentThought)
                     : currentThought;
@@ -577,16 +647,16 @@ public class ReactEngine {
             LOGGER.info("[Iteration {}] >>> Using skill '{}' | task: {}", iteration, matchedSkill.getName(), taskArg);
             try {
                 String obs = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
-                        iteration, remainingIterations, subLoopCallback);
+                        iteration, remainingIterations, subLoopCallback, nestedRecords);
                 LOGGER.info("[Iteration {}] Skill response | name='{}' result={}", iteration, matchedSkill.getName(), obs);
-                return new ExecutionOutcome(obs, serverName, false, null, null);
+                return new ExecutionOutcome(obs, serverName, false, null, null, nestedRecords);
             } catch (ElicitationPauseSignal pause) {
                 LOGGER.info("[Iteration {}] Skill '{}' paused for user input (MCP elicitation) | requestId={}",
                         iteration, matchedSkill.getName(), pause.request.getRequestId());
-                return ExecutionOutcome.paused(pause.request);
+                return ExecutionOutcome.paused(pause.request, pause.skillState, nestedRecords);
             } catch (Exception e) {
                 LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration, matchedSkill.getName(), e.getMessage(), e);
-                return new ExecutionOutcome("Skill execution failed: " + e.getMessage(), serverName, true, null, null);
+                return new ExecutionOutcome("Skill execution failed: " + e.getMessage(), serverName, true, null, null, nestedRecords);
             }
         }
 
@@ -598,7 +668,7 @@ public class ReactEngine {
             if (outcome.isElicitationRequired()) {
                 LOGGER.info("[Iteration {}] Tool '{}' paused for user input (MCP elicitation) | requestId={}",
                         iteration, toolCall.getName(), outcome.getElicitation().getRequestId());
-                return ExecutionOutcome.paused(outcome.getElicitation());
+                return ExecutionOutcome.paused(outcome.getElicitation(), null, Collections.emptyList());
             }
             McpToolResult result = outcome.getResult();
             LOGGER.info("[Iteration {}] Tool response | name='{}' result={}", iteration, toolCall.getName(), result.getTextContent());
@@ -715,7 +785,8 @@ public class ReactEngine {
                                 String task,
                                 int parentIteration,
                                 int remainingIterations,
-                                IterationCallback callback) throws Exception {
+                                IterationCallback callback,
+                                List<AgentResponse.ToolCallRecord> recordSink) throws Exception {
         // Skill gets MCP tools only when the config flag says so.
         List<ToolDefinition> skillMcpTools = config.isIncludeMcpToolsAsSkills() ? allMcpTools : Collections.emptyList();
 
@@ -798,7 +869,15 @@ public class ReactEngine {
             try {
                 McpToolResult.CallOutcome toolOutcome = executeTool(toolCall, skillMcpTools, mcpServers);
                 if (toolOutcome.isElicitationRequired()) {
-                    throw new ElicitationPauseSignal(toolOutcome.getElicitation());
+                    PendingElicitationState.SkillState state = new PendingElicitationState.SkillState();
+                    state.setSkillName(skill.getName());
+                    state.setTask(task);
+                    state.setMessages(new ArrayList<>(skillMessages));
+                    state.setNextStep(i + 1);
+                    state.setMaxSteps(maxSkillIterations);
+                    state.setConsecutiveTextResponses(consecutiveTextResponses);
+                    state.setTokensSinceCompression(skillTokensSinceCompression);
+                    throw new ElicitationPauseSignal(toolOutcome.getElicitation(), state);
                 }
                 McpToolResult skillToolResult = toolOutcome.getResult();
                 obs = skillToolResult.getTextContent();
@@ -808,13 +887,13 @@ public class ReactEngine {
                     skillRecord.setUiResourceUri(skillToolResult.getUiResourceUri());
                     skillRecord.setUiHtml(skillToolResult.getUiHtml());
                 }
-                toolCallRecords.add(skillRecord);
+                recordSink.add(skillRecord);
             } catch (ElicitationPauseSignal pause) {
                 throw pause;
             } catch (Exception e) {
                 obs = "Tool execution failed: " + e.getMessage();
                 LOGGER.warn("[Skill '{}'] Tool '{}' failed: {}", skill.getName(), toolCall.getName(), e.getMessage());
-                toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                recordSink.add(new AgentResponse.ToolCallRecord(
                         skill.getName(), toolCall.getName(), toolCall.getArguments(), obs, parentIteration));
             }
 
@@ -922,11 +1001,16 @@ public class ReactEngine {
 
     private String buildRequestSignature(AgentComposerConfiguration config,
                                          String userMessage,
-                                         List<McpServerConfig> mcpServers) {
+                                         List<McpServerConfig> mcpServers,
+                                         int maxIterations) {
         StringBuilder sb = new StringBuilder();
         sb.append(config.getProvider() == null ? "" : config.getProvider().name()).append("|")
           .append(config.getModelName() == null ? "" : config.getModelName().trim().toLowerCase()).append("|")
-          .append(userMessage == null ? "" : userMessage.trim().toLowerCase()).append("|");
+          .append(userMessage == null ? "" : userMessage.trim().toLowerCase()).append("|")
+          // The iteration budget changes execution semantics and is reported in AgentResponse.
+          // Including it prevents a response produced with the default budget (for example 5)
+          // from being returned after the application is reconfigured with a larger budget.
+          .append("maxIterations=").append(maxIterations).append("|");
 
         if (mcpServers != null && !mcpServers.isEmpty()) {
             String servers = mcpServers.stream()
@@ -1061,6 +1145,554 @@ public class ReactEngine {
             store.store(key, GSON.toJson(payload));
         } catch (Exception e) {
             LOGGER.warn("Could not persist full tool output for key '{}': {}", key, e.getMessage());
+        }
+    }
+
+    // ── MCP elicitation continuation ────────────────────────────────────────
+
+    private static final String ELICITATION_STORE_PREFIX = "mcp:elicitation:";
+
+    private static final class ResumeResult {
+        final AgentResponse response;
+        final List<LlmMessage> messages;
+
+        private ResumeResult(AgentResponse response, List<LlmMessage> messages) {
+            this.response = response;
+            this.messages = messages;
+        }
+
+        static ResumeResult waiting(AgentResponse response) { return new ResumeResult(response, null); }
+        static ResumeResult completed(List<LlmMessage> messages) { return new ResumeResult(null, messages); }
+    }
+
+    private static final class ParsedElicitationAnswer {
+        String action;
+        Map<String, Object> content;
+        String error;
+    }
+
+    private static final class SkillResumeResult {
+        String answer;
+        McpToolResult.ElicitationRequest elicitation;
+        PendingElicitationState.SkillState state;
+    }
+
+    private PendingElicitationState.Continuation buildContinuation(
+            McpToolResult.ElicitationRequest request, ToolCall outerToolCall, int parentIteration,
+            PendingElicitationState.SkillState skillState) {
+        PendingElicitationState.Continuation continuation = new PendingElicitationState.Continuation();
+        continuation.setRequest(request);
+        continuation.setOuterToolCall(outerToolCall);
+        continuation.setParentIteration(parentIteration);
+        continuation.setSkillState(skillState);
+        return continuation;
+    }
+
+    private PendingElicitationState buildPendingState(
+            String rootUserTask, int maxIterations, int actualIterations, int failureCount,
+            boolean resumedSession, List<PendingElicitationState.Continuation> queue) {
+        PendingElicitationState state = new PendingElicitationState();
+        state.setRootUserTask(rootUserTask);
+        state.setMaxIterations(maxIterations);
+        state.setActualIterations(actualIterations);
+        state.setFailureCount(failureCount);
+        state.setResumedSession(resumedSession);
+        synchronized (toolCallRecords) {
+            state.setToolCallRecords(new ArrayList<>(toolCallRecords));
+        }
+        state.setQueue(new ArrayList<>(queue));
+        return state;
+    }
+
+    /**
+     * Keeps a pending continuation's original iteration budget authoritative when the
+     * application is reconfigured with a lower value, while allowing an explicit budget
+     * increase to take effect on resume. Paused skill loops receive the same additional
+     * budget so they do not retain an obsolete lower cap.
+     */
+    static int reconcilePendingIterationBudget(PendingElicitationState state,
+                                               int configuredMaxIterations) {
+        int persistedMaxIterations = state.getMaxIterations();
+        int effectiveMaxIterations = Math.max(persistedMaxIterations, configuredMaxIterations);
+        int addedIterations = effectiveMaxIterations - persistedMaxIterations;
+        if (addedIterations > 0) {
+            state.setMaxIterations(effectiveMaxIterations);
+            if (state.getQueue() != null) {
+                for (PendingElicitationState.Continuation continuation : state.getQueue()) {
+                    PendingElicitationState.SkillState skillState = continuation.getSkillState();
+                    if (skillState != null) {
+                        skillState.setMaxSteps(skillState.getMaxSteps() + addedIterations);
+                    }
+                }
+            }
+        }
+        return effectiveMaxIterations;
+    }
+
+    private ResumeResult resumePendingElicitation(
+            ObjectStore<Serializable> store,
+            String conversationId,
+            PendingElicitationState state,
+            String elicitationAnswer,
+            AgentComposerConfiguration config,
+            List<AgentSkillConfig> skills,
+            List<ToolDefinition> mcpTools,
+            List<McpServerConfig> mcpServers,
+            IterationCallback callback) {
+        List<LlmMessage> messages = loadHistory(store, conversationId);
+        if (state.getVersion() != PendingElicitationState.CURRENT_VERSION
+                || state.getQueue() == null || state.getQueue().isEmpty()) {
+            removePendingElicitation(store, conversationId);
+            throw new IllegalStateException("Stored MCP elicitation state is missing or uses an unsupported version");
+        }
+
+        PendingElicitationState.Continuation active = state.getQueue().get(0);
+        ParsedElicitationAnswer parsed = parseElicitationAnswer(
+                active.getRequest().getRequestedSchema(), elicitationAnswer);
+        if (parsed.error != null) {
+            savePendingElicitation(store, conversationId, state);
+            return ResumeResult.waiting(buildElicitationResponse(state, conversationId, parsed.error));
+        }
+
+        McpToolResult result = null;
+        String failure = null;
+        try {
+            McpServerConfig server = findMcpServer(active.getRequest(), mcpServers);
+            McpToolResult.CallOutcome outcome = mcpClient.resolveElicitation(
+                    server, active.getRequest(), parsed.action, parsed.content);
+            if (outcome.isElicitationRequired()) {
+                active.setRequest(outcome.getElicitation());
+                savePendingElicitation(store, conversationId, state);
+                return ResumeResult.waiting(buildElicitationResponse(state, conversationId, null));
+            }
+            result = outcome.getResult();
+        } catch (Exception e) {
+            failure = "Tool execution failed while resuming MCP elicitation: " + e.getMessage();
+            state.setFailureCount(state.getFailureCount() + 1);
+            LOGGER.warn("Could not resume MCP elicitation for conversation '{}': {}",
+                    conversationId, e.getMessage(), e);
+        }
+
+        String observation = failure != null ? failure : result.getTextContent();
+        McpToolResult.ElicitationRequest request = active.getRequest();
+
+        if (active.isSkill()) {
+            PendingElicitationState.SkillState skillState = active.getSkillState();
+            ToolCall nestedCall = lastToolCall(skillState.getMessages());
+            if (nestedCall == null) {
+                nestedCall = new ToolCall(null, request.getToolName(), request.getToolArguments());
+            }
+            AgentResponse.ToolCallRecord nestedRecord = new AgentResponse.ToolCallRecord(
+                    skillState.getSkillName(), request.getToolName(), request.getToolArguments(),
+                    observation, active.getParentIteration());
+            if (result != null && result.hasUiResource()) {
+                nestedRecord.setUiResourceUri(result.getUiResourceUri());
+                nestedRecord.setUiHtml(result.getUiHtml());
+            }
+            toolCallRecords.add(nestedRecord);
+            skillState.getMessages().add(new LlmMessage("tool_result",
+                    compactToolObservation(request.getToolName(), observation),
+                    nestedCall.getId(), nestedCall.getName()));
+            if (callback != null) {
+                callback.onEvent(AgentIterationEvent.toolResult(active.getParentIteration(),
+                        request.getToolName(), request.getToolArguments(), observation,
+                        "skill:" + skillState.getSkillName()));
+            }
+
+            try {
+                SkillResumeResult skillResult = continueSkill(skillState, mcpTools, mcpServers,
+                        config, active.getParentIteration(), callback);
+                if (skillResult.elicitation != null) {
+                    active.setRequest(skillResult.elicitation);
+                    active.setSkillState(skillResult.state);
+                    state.setToolCallRecords(snapshotToolCallRecords());
+                    savePendingElicitation(store, conversationId, state);
+                    return ResumeResult.waiting(buildElicitationResponse(state, conversationId, null));
+                }
+                observation = skillResult.answer;
+                replaceToolResult(messages, active.getOuterToolCall(), observation);
+                toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                        "skill:" + skillState.getSkillName(), active.getOuterToolCall().getName(),
+                        active.getOuterToolCall().getArguments(), observation, active.getParentIteration()));
+                if (callback != null) {
+                    callback.onEvent(AgentIterationEvent.skillResult(active.getParentIteration(),
+                            active.getOuterToolCall().getName(), active.getOuterToolCall().getArguments(), observation));
+                }
+            } catch (Exception e) {
+                observation = "Skill execution failed after MCP elicitation: " + e.getMessage();
+                state.setFailureCount(state.getFailureCount() + 1);
+                replaceToolResult(messages, active.getOuterToolCall(), observation);
+                toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                        "skill:" + skillState.getSkillName(), active.getOuterToolCall().getName(),
+                        active.getOuterToolCall().getArguments(), observation, active.getParentIteration()));
+            }
+        } else {
+            replaceToolResult(messages, active.getOuterToolCall(), observation);
+            AgentResponse.ToolCallRecord record = new AgentResponse.ToolCallRecord(
+                    request.getServerName(), request.getToolName(), request.getToolArguments(),
+                    observation, active.getParentIteration());
+            if (result != null && result.hasUiResource()) {
+                record.setUiResourceUri(result.getUiResourceUri());
+                record.setUiHtml(result.getUiHtml());
+            }
+            toolCallRecords.add(record);
+            saveFullToolOutput(store, conversationId, active.getOuterToolCall(), observation);
+            if (callback != null) {
+                callback.onEvent(AgentIterationEvent.toolResult(active.getParentIteration(),
+                        request.getToolName(), request.getToolArguments(), observation, request.getServerName()));
+            }
+        }
+
+        state.getQueue().remove(0);
+        state.setToolCallRecords(snapshotToolCallRecords());
+        saveHistory(store, conversationId, messages);
+        if (!state.getQueue().isEmpty()) {
+            savePendingElicitation(store, conversationId, state);
+            return ResumeResult.waiting(buildElicitationResponse(state, conversationId, null));
+        }
+        removePendingElicitation(store, conversationId);
+        return ResumeResult.completed(messages);
+    }
+
+    private List<AgentResponse.ToolCallRecord> snapshotToolCallRecords() {
+        synchronized (toolCallRecords) {
+            return new ArrayList<>(toolCallRecords);
+        }
+    }
+
+    private McpServerConfig findMcpServer(McpToolResult.ElicitationRequest request,
+                                          List<McpServerConfig> servers) {
+        return servers.stream()
+                .filter(s -> request.getServerUrl().equals(s.getServerUrl()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "Configured MCP server is no longer available: " + request.getServerName()));
+    }
+
+    private ToolCall lastToolCall(List<LlmMessage> messages) {
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            List<ToolCall> calls = messages.get(i).getToolCalls();
+            if (calls != null && !calls.isEmpty()) return calls.get(calls.size() - 1);
+        }
+        return null;
+    }
+
+    private void replaceToolResult(List<LlmMessage> messages, ToolCall call, String observation) {
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            LlmMessage message = messages.get(i);
+            if ("tool_result".equals(message.getRole())
+                    && call.getId() != null && call.getId().equals(message.getToolCallId())) {
+                message.setContent(compactToolObservation(call.getName(), observation));
+                return;
+            }
+        }
+        messages.add(new LlmMessage("tool_result", compactToolObservation(call.getName(), observation),
+                call.getId(), call.getName()));
+    }
+
+    private SkillResumeResult continueSkill(PendingElicitationState.SkillState state,
+                                             List<ToolDefinition> allMcpTools,
+                                             List<McpServerConfig> mcpServers,
+                                             AgentComposerConfiguration config,
+                                             int parentIteration,
+                                             IterationCallback callback) throws Exception {
+        AgentSkillConfig skill = findSkillByName(state.getSkillName(), config.getSkills());
+        if (skill == null) throw new IllegalStateException("Configured skill is no longer available: " + state.getSkillName());
+        List<ToolDefinition> skillTools = config.isIncludeMcpToolsAsSkills()
+                ? allMcpTools : Collections.emptyList();
+        LlmClient llm = LlmClientFactory.create(config);
+        List<LlmMessage> skillMessages = state.getMessages();
+        int consecutiveText = state.getConsecutiveTextResponses();
+        int tokenCount = state.getTokensSinceCompression();
+        final int maxTextReprompts = 3;
+
+        for (int i = state.getNextStep(); i < state.getMaxSteps(); i++) {
+            LlmResponse response = llm.chat(skill.getInstructions(), skillMessages, skillTools);
+            tokenCount += getTotalTokens(response);
+            if (response.hasFinalAnswer()) {
+                if (!skillTools.isEmpty() && consecutiveText < maxTextReprompts) {
+                    consecutiveText++;
+                    skillMessages.add(new LlmMessage("assistant",
+                            response.getContent() != null ? response.getContent() : "Understood."));
+                    skillMessages.add(new LlmMessage("user",
+                            "You MUST now execute the next required step by calling the appropriate tool directly. "
+                                    + "Do not produce more text — invoke the tool now."));
+                    continue;
+                }
+                SkillResumeResult done = new SkillResumeResult();
+                done.answer = response.getContent();
+                return done;
+            }
+
+            consecutiveText = 0;
+            ToolCall call = response.getToolCall();
+            skillMessages.add(new LlmMessage("assistant", response.getContent(), Collections.singletonList(call)));
+            if (callback != null) {
+                callback.onEvent(AgentIterationEvent.toolCall(parentIteration, call.getName(),
+                        call.getArguments(), "skill:" + skill.getName()));
+            }
+            try {
+                McpToolResult.CallOutcome toolOutcome = executeTool(call, skillTools, mcpServers);
+                if (toolOutcome.isElicitationRequired()) {
+                    state.setMessages(skillMessages);
+                    state.setNextStep(i + 1);
+                    state.setConsecutiveTextResponses(consecutiveText);
+                    state.setTokensSinceCompression(tokenCount);
+                    SkillResumeResult paused = new SkillResumeResult();
+                    paused.elicitation = toolOutcome.getElicitation();
+                    paused.state = state;
+                    return paused;
+                }
+                McpToolResult toolResult = toolOutcome.getResult();
+                String observation = toolResult.getTextContent();
+                AgentResponse.ToolCallRecord record = new AgentResponse.ToolCallRecord(
+                        skill.getName(), call.getName(), call.getArguments(), observation, parentIteration);
+                if (toolResult.hasUiResource()) {
+                    record.setUiResourceUri(toolResult.getUiResourceUri());
+                    record.setUiHtml(toolResult.getUiHtml());
+                }
+                toolCallRecords.add(record);
+                skillMessages.add(new LlmMessage("tool_result", compactToolObservation(call.getName(), observation),
+                        call.getId(), call.getName()));
+                if (callback != null) {
+                    callback.onEvent(AgentIterationEvent.toolResult(parentIteration, call.getName(),
+                            call.getArguments(), observation, "skill:" + skill.getName()));
+                }
+            } catch (Exception e) {
+                String observation = "Tool execution failed: " + e.getMessage();
+                toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                        skill.getName(), call.getName(), call.getArguments(), observation, parentIteration));
+                skillMessages.add(new LlmMessage("tool_result", observation, call.getId(), call.getName()));
+            }
+
+            if (tokenCount >= COMPRESSION_TOKEN_THRESHOLD) {
+                skillMessages = compressHistory(llm, skillMessages);
+                tokenCount = 0;
+            }
+        }
+
+        SkillResumeResult exhausted = new SkillResumeResult();
+        exhausted.answer = "Skill '" + skill.getName() + "' did not return a final answer within "
+                + state.getMaxSteps() + " iterations.";
+        return exhausted;
+    }
+
+    private ParsedElicitationAnswer parseElicitationAnswer(Map<String, Object> schema, String rawInput) {
+        ParsedElicitationAnswer answer = new ParsedElicitationAnswer();
+        answer.action = "accept";
+        String raw = rawInput != null ? rawInput.trim() : "";
+        try {
+            com.google.gson.JsonElement parsed = com.google.gson.JsonParser.parseString(raw);
+            if (parsed.isJsonObject()) {
+                Map<String, Object> object = GSON.fromJson(parsed, new TypeToken<Map<String, Object>>() {}.getType());
+                Object actionValue = object.get("action");
+                if (actionValue instanceof String
+                        && Arrays.asList("accept", "decline", "cancel").contains(actionValue)) {
+                    answer.action = (String) actionValue;
+                    if ("accept".equals(answer.action)) {
+                        Object content = object.get("content");
+                        if (!(content instanceof Map)) {
+                            answer.error = "An accept response must include an object-valued 'content' field.";
+                            return answer;
+                        }
+                        answer.content = (Map<String, Object>) content;
+                    } else {
+                        answer.content = Collections.emptyMap();
+                        return answer;
+                    }
+                } else {
+                    answer.content = object;
+                }
+            } else if (parsed.isJsonPrimitive()) {
+                String scalar = parsed.getAsJsonPrimitive().isString()
+                        ? parsed.getAsString() : raw;
+                answer.content = parseSingleFieldText(schema, scalar, answer);
+            } else {
+                answer.error = "The elicitation response must be a JSON object.";
+                return answer;
+            }
+        } catch (Exception ignored) {
+            answer.content = parseSingleFieldText(schema, raw, answer);
+        }
+        if (answer.error == null && "accept".equals(answer.action)) {
+            answer.error = validateElicitationContent(schema, answer.content);
+        }
+        return answer;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parseSingleFieldText(Map<String, Object> schema, String raw,
+                                                     ParsedElicitationAnswer answer) {
+        Object propsValue = schema != null ? schema.get("properties") : null;
+        if (!(propsValue instanceof Map) || ((Map<?, ?>) propsValue).size() != 1) {
+            answer.error = "Provide a JSON object matching the requested schema.";
+            return null;
+        }
+        Map.Entry<String, Object> entry = ((Map<String, Object>) propsValue).entrySet().iterator().next();
+        Map<String, Object> property = entry.getValue() instanceof Map
+                ? (Map<String, Object>) entry.getValue() : Collections.emptyMap();
+        String type = String.valueOf(property.getOrDefault("type", "string"));
+        Object value;
+        try {
+            switch (type) {
+                case "integer": value = Long.parseLong(raw); break;
+                case "number": value = Double.parseDouble(raw); break;
+                case "boolean":
+                    if (!"true".equalsIgnoreCase(raw) && !"false".equalsIgnoreCase(raw)) {
+                        throw new IllegalArgumentException();
+                    }
+                    value = Boolean.parseBoolean(raw); break;
+                case "string": value = raw; break;
+                default:
+                    answer.error = "Plain text fallback is available only for one scalar field.";
+                    return null;
+            }
+        } catch (Exception e) {
+            answer.error = "Could not convert the response to the requested '" + type + "' value.";
+            return null;
+        }
+        Map<String, Object> content = new LinkedHashMap<>();
+        content.put(entry.getKey(), value);
+        return content;
+    }
+
+    @SuppressWarnings("unchecked")
+    private String validateElicitationContent(Map<String, Object> schema, Map<String, Object> content) {
+        if (content == null) return "The elicitation response content is required.";
+        Map<String, Object> properties = schema != null && schema.get("properties") instanceof Map
+                ? (Map<String, Object>) schema.get("properties") : Collections.emptyMap();
+        Object requiredValue = schema != null ? schema.get("required") : null;
+        if (requiredValue instanceof List) {
+            for (Object name : (List<?>) requiredValue) {
+                if (!content.containsKey(String.valueOf(name)) || content.get(String.valueOf(name)) == null) {
+                    return "Missing required field '" + name + "'.";
+                }
+            }
+        }
+        for (Map.Entry<String, Object> entry : content.entrySet()) {
+            if (!(properties.get(entry.getKey()) instanceof Map)) continue;
+            Map<String, Object> definition = (Map<String, Object>) properties.get(entry.getKey());
+            Object value = entry.getValue();
+            String type = String.valueOf(definition.getOrDefault("type", "string"));
+            if (!matchesType(type, value)) return "Field '" + entry.getKey() + "' must be of type " + type + ".";
+            String constraintError = validateConstraints(entry.getKey(), value, definition);
+            if (constraintError != null) return constraintError;
+        }
+        return null;
+    }
+
+    private boolean matchesType(String type, Object value) {
+        if (value == null) return true;
+        switch (type) {
+            case "string": return value instanceof String;
+            case "boolean": return value instanceof Boolean;
+            case "number": return value instanceof Number;
+            case "integer": return value instanceof Number && Math.floor(((Number) value).doubleValue()) == ((Number) value).doubleValue();
+            case "array": return value instanceof List;
+            default: return false;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private String validateConstraints(String field, Object value, Map<String, Object> definition) {
+        if (value instanceof String) {
+            String text = (String) value;
+            if (definition.get("minLength") instanceof Number && text.length() < ((Number) definition.get("minLength")).intValue())
+                return "Field '" + field + "' is shorter than minLength.";
+            if (definition.get("maxLength") instanceof Number && text.length() > ((Number) definition.get("maxLength")).intValue())
+                return "Field '" + field + "' is longer than maxLength.";
+            if (definition.get("pattern") instanceof String && !Pattern.compile((String) definition.get("pattern")).matcher(text).find())
+                return "Field '" + field + "' does not match the required pattern.";
+            String format = definition.get("format") instanceof String ? (String) definition.get("format") : null;
+            try {
+                if ("email".equals(format) && !text.matches("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$")) throw new IllegalArgumentException();
+                if ("uri".equals(format)) URI.create(text);
+                if ("date".equals(format)) LocalDate.parse(text);
+                if ("date-time".equals(format)) OffsetDateTime.parse(text);
+            } catch (Exception e) {
+                return "Field '" + field + "' is not a valid " + format + ".";
+            }
+        }
+        if (value instanceof Number) {
+            double number = ((Number) value).doubleValue();
+            if (definition.get("minimum") instanceof Number && number < ((Number) definition.get("minimum")).doubleValue())
+                return "Field '" + field + "' is below the minimum.";
+            if (definition.get("maximum") instanceof Number && number > ((Number) definition.get("maximum")).doubleValue())
+                return "Field '" + field + "' is above the maximum.";
+        }
+        if (definition.get("enum") instanceof List && !((List<?>) definition.get("enum")).contains(value))
+            return "Field '" + field + "' is not one of the allowed values.";
+        List<?> variants = definition.get("oneOf") instanceof List ? (List<?>) definition.get("oneOf")
+                : definition.get("anyOf") instanceof List ? (List<?>) definition.get("anyOf") : null;
+        if (variants != null) {
+            boolean matched = variants.stream().anyMatch(v -> v instanceof Map && value.equals(((Map<?, ?>) v).get("const")));
+            if (!matched) return "Field '" + field + "' is not one of the allowed values.";
+        }
+        if (value instanceof List && definition.get("items") instanceof Map) {
+            int size = ((List<?>) value).size();
+            if (definition.get("minItems") instanceof Number && size < ((Number) definition.get("minItems")).intValue())
+                return "Field '" + field + "' has fewer items than minItems.";
+            if (definition.get("maxItems") instanceof Number && size > ((Number) definition.get("maxItems")).intValue())
+                return "Field '" + field + "' has more items than maxItems.";
+            Map<String, Object> items = (Map<String, Object>) definition.get("items");
+            for (Object item : (List<?>) value) {
+                String error = validateConstraints(field, item, items);
+                if (error != null) return error;
+            }
+        }
+        return null;
+    }
+
+    private AgentResponse buildElicitationResponse(PendingElicitationState state,
+                                                    String conversationId,
+                                                    String validationError) {
+        PendingElicitationState.Continuation active = state.getQueue().get(0);
+        McpToolResult.ElicitationRequest request = active.getRequest();
+        String prompt = request.getMessage();
+        if (validationError != null) prompt = validationError + " " + prompt;
+        AgentResponse response = new AgentResponse(state.getRootUserTask(), prompt,
+                state.getMaxIterations(), state.getActualIterations(), false, conversationId);
+        response.setRequiresInput(true);
+        response.setInputKind("elicitation");
+        response.setInputRequest(prompt);
+        response.setElicitationSchema(request.getRequestedSchema());
+        response.setElicitationServerName(request.getServerName());
+        response.setElicitationToolName(request.getToolName());
+        response.setResumedSession(state.isResumedSession());
+        response.setFailureCount(state.getFailureCount());
+        response.setReturnReason("input required");
+        response.setToolCalls(snapshotToolCallRecords());
+        return response;
+    }
+
+    private void savePendingElicitation(ObjectStore<Serializable> store, String conversationId,
+                                        PendingElicitationState state) {
+        String key = ELICITATION_STORE_PREFIX + conversationId;
+        try {
+            if (store.contains(key)) store.remove(key);
+            store.store(key, GSON.toJson(state));
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not persist MCP elicitation state for '" + conversationId + "'", e);
+        }
+    }
+
+    private PendingElicitationState loadPendingElicitation(ObjectStore<Serializable> store,
+                                                           String conversationId) {
+        String key = ELICITATION_STORE_PREFIX + conversationId;
+        try {
+            if (!store.contains(key)) return null;
+            return GSON.fromJson((String) store.retrieve(key), PendingElicitationState.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not load MCP elicitation state for '" + conversationId + "'", e);
+        }
+    }
+
+    private void removePendingElicitation(ObjectStore<Serializable> store, String conversationId) {
+        String key = ELICITATION_STORE_PREFIX + conversationId;
+        try {
+            if (store.contains(key)) store.remove(key);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not remove MCP elicitation state for '" + conversationId + "'", e);
         }
     }
 
@@ -1228,6 +1860,21 @@ public class ReactEngine {
         result.put("conversationHistory", history);
         result.put("conversationTurns", history.size());
 
+        PendingElicitationState pending = loadPendingElicitation(store, sessionId);
+        if (pending != null && pending.getQueue() != null && !pending.getQueue().isEmpty()) {
+            McpToolResult.ElicitationRequest request = pending.getQueue().get(0).getRequest();
+            java.util.Map<String, Object> pendingSummary = new java.util.LinkedHashMap<>();
+            pendingSummary.put("inputKind", "elicitation");
+            pendingSummary.put("inputRequest", request.getMessage());
+            pendingSummary.put("elicitationSchema", request.getRequestedSchema());
+            pendingSummary.put("serverName", request.getServerName());
+            pendingSummary.put("toolName", request.getToolName());
+            pendingSummary.put("queuedRequests", pending.getQueue().size());
+            result.put("pendingElicitation", pendingSummary);
+        } else {
+            result.put("pendingElicitation", null);
+        }
+
         // Solved / cached responses scoped to this session
         List<java.util.Map<String, Object>> solvedEntries = new ArrayList<>();
         try {
@@ -1254,7 +1901,7 @@ public class ReactEngine {
         }
 
         result.put("solvedResponses", solvedEntries);
-        result.put("found", !history.isEmpty() || !solvedEntries.isEmpty());
+        result.put("found", !history.isEmpty() || !solvedEntries.isEmpty() || pending != null);
         return result;
     }
 
@@ -1274,6 +1921,11 @@ public class ReactEngine {
             if (store.contains(sessionId)) {
                 store.remove(sessionId);
                 removed.add(sessionId);
+            }
+            String pendingKey = ELICITATION_STORE_PREFIX + sessionId;
+            if (store.contains(pendingKey)) {
+                store.remove(pendingKey);
+                removed.add(pendingKey);
             }
             String scopedPrefix = "resolved::" + sessionId + "::";
             for (String key : allKeys) {

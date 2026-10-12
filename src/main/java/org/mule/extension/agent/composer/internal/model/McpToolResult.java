@@ -83,10 +83,21 @@ public class McpToolResult {
         private final String toolName;
         private final Map<String, Object> toolArguments;
         private final String defUiResourceUri;
+        private final String sessionId;
+        private final String protocolVersion;
 
         public ElicitationRequest(String requestId, long originalRequestId, String message,
                                    Map<String, Object> requestedSchema, String serverName, String serverUrl,
-                                   String toolName, Map<String, Object> toolArguments, String defUiResourceUri) {
+                                   String toolName, Map<String, Object> toolArguments, String defUiResourceUri,
+                                   String sessionId) {
+            this(requestId, originalRequestId, message, requestedSchema, serverName, serverUrl,
+                    toolName, toolArguments, defUiResourceUri, sessionId, null);
+        }
+
+        public ElicitationRequest(String requestId, long originalRequestId, String message,
+                                   Map<String, Object> requestedSchema, String serverName, String serverUrl,
+                                   String toolName, Map<String, Object> toolArguments, String defUiResourceUri,
+                                   String sessionId, String protocolVersion) {
             this.requestId = requestId;
             this.originalRequestId = originalRequestId;
             this.message = message;
@@ -96,6 +107,8 @@ public class McpToolResult {
             this.toolName = toolName;
             this.toolArguments = toolArguments;
             this.defUiResourceUri = defUiResourceUri;
+            this.sessionId = sessionId;
+            this.protocolVersion = protocolVersion;
         }
 
         public String getRequestId() { return requestId; }
@@ -107,6 +120,8 @@ public class McpToolResult {
         public String getToolName() { return toolName; }
         public Map<String, Object> getToolArguments() { return toolArguments; }
         public String getDefUiResourceUri() { return defUiResourceUri; }
+        public String getSessionId() { return sessionId; }
+        public String getProtocolVersion() { return protocolVersion; }
     }
 
     /**

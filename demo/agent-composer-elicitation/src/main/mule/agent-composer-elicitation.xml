@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+	xmlns:agent-composer="http://www.mulesoft.org/schema/mule/agent-composer" xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/agent-composer http://www.mulesoft.org/schema/mule/agent-composer/current/mule-agent-composer.xsd
+http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
+	
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="6638bf3c-78ad-49ca-b815-fee28adedcc9" >
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+	<agent-composer:config name="TixAgent" doc:name="Agent Composer Config" doc:id="ef2070f8-244c-4216-b237-a9988091cd9d" apiKey="${OPENAI_API_KEY}" agentName="Tix Agent" agentDescription="Ticketing Agent" modelName="gpt-5.6-luna" temperature="1.0">
+		<agent-composer:instructions ><![CDATA[${file::instructions/tix.md}]]></agent-composer:instructions>
+		<agent-composer:mcp-servers >
+			<agent-composer:mcp-server-config name="Approval MCP" serverUrl="http://localhost:8081/mcp" />
+		</agent-composer:mcp-servers>
+	</agent-composer:config>
+	<mcp:server-config name="Service_Ticket_MCP_Server" doc:name="MCP Server" doc:id="c079ef00-7b0e-41d8-bc64-bd484c8d88f1" serverName="service-ticket-mcp" serverVersion="1.0.0" >
+		<mcp:streamable-http-server-connection listenerConfig="HTTP_Listener_config">
+			<mcp:session-handling sessionIdleTimeout="10" sessionIdleTimeoutUnit="MINUTES" />
+		</mcp:streamable-http-server-connection>
+	</mcp:server-config>
+	<configuration-properties doc:name="Configuration properties" doc:id="eb8d5904-493e-452f-8380-9737b48e968f" file="config/common.yaml" />
+	<flow name="service-ticket-mcpFlow" doc:id="7eee6a15-b573-42b3-9584-2b2bb8234cd4" >
+		<agent-composer:agent-listener doc:name="Agent Listener" doc:id="826e439e-62d4-49b9-bd79-9a43eaf7e544" config-ref="TixAgent" maxIterations="20"/>
+		<agent-composer:execute-agent doc:name="Execute agent" doc:id="a6d30725-1bd2-40fe-8689-152c1cdf4629" config-ref="TixAgent" maxIterations="20"/>
+	</flow>
+	
+	<flow name="service-ticket-mcpFlow2" doc:id="706c427d-5d4e-455a-9a77-48469fb6b297" >
+		<mcp:tool-listener doc:name="approval-request" doc:id="96687225-b7b5-4904-807a-704110999e3b" config-ref="Service_Ticket_MCP_Server" name="approval-request">
+			<mcp:description ><![CDATA[Based on triggered request, an approval request will be sent for confirming the ticket.]]></mcp:description>
+			<mcp:parameters-schema ><![CDATA[{
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "description": "Unique workflow request ID."
+    },
+    "approverSlackId": {
+      "type": "string",
+      "description": "Slack user ID of the approver."
+    },
+    "requestedBySlackId": {
+      "type": "string",
+      "description": "Slack user ID of the original requester."
+    },
+    "title": {
+      "type": "string",
+      "description": "Short approval request title."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Summary of the request and its business justification."
+    },
+    "ticketIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "description": "Linear ticket identifiers requiring approval."
+    },
+    "ticketUrls": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uri"
+      },
+      "description": "Links to the generated Linear tickets."
+    },
+    "canvasUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "Slack Canvas link containing request details."
+    },
+    "channelId": {
+      "type": "string",
+      "description": "Slack channel associated with the workflow."
+    },
+    "threadTs": {
+      "type": "string",
+      "description": "Original Slack thread timestamp."
+    },
+    "expiresInMinutes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 60,
+      "description": "Approval deadline in minutes."
+    }
+  },
+  "required": [
+    "requestId",
+    "approverSlackId",
+    "requestedBySlackId",
+    "title",
+    "summary",
+    "ticketIds"
+  ],
+  "additionalProperties": false
+}]]></mcp:parameters-schema>
+			<mcp:responses >
+				<mcp:text-tool-response-content text="#[write(payload, 'application/json')]" />
+			</mcp:responses>
+		</mcp:tool-listener>
+		<set-variable value="#[payload]" doc:name="originalPayload" doc:id="4d20acdd-a2ff-4876-bbb1-52e6d039af9b" variableName="originalPayload"/>
+		<mcp:create-elicitation doc:name="MCP Server - Create Elicitation" doc:id="e21dec19-704c-4508-a49a-ffbc7603bd39" config-ref="Service_Ticket_MCP_Server" sessionId="#[attributes.sessionId]" message="#[payload.summary]">
+			<mcp:schema-properties >
+				<mcp:enum-schema-property name="approve-request" description="Is the created tickets good to send this for Manager Approval?" required="true" >
+					<mcp:enum-entries >
+						<mcp:enum-entry key="APPROVE" value="Approve" />
+						<mcp:enum-entry key="REJECT" value="Reject" />
+						<mcp:enum-entry key="CANCEL" value="Cancel" />
+					</mcp:enum-entries>
+				</mcp:enum-schema-property>
+			</mcp:schema-properties>
+		</mcp:create-elicitation>
+		<logger level="INFO" doc:name="Log RESPONSE" doc:id="27ca8aa2-9d65-4c48-b64a-19f7cda8aedc" message="#[payload]"/>
+		<ee:transform doc:name="Manager Approval" doc:id="0ffc20ec-6461-4a2a-a4ef-80bb8540881c">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var isApproved = (payload.content["approve-request"] ~= "Approve")
+---
+{
+	sendRequestToManager: isApproved,
+	approvalRequested: isApproved,
+	approvalAction: payload.action,
+	status: if(isApproved) "PENDING_MANAGER_APPROVAL" else payload.action,
+	message: if(isApproved)
+		"Sending Request to Manager Approval"
+	else if(payload.action == "decline")
+		"Approval was declined; no manager approval request was sent"
+	else
+		"Approval was canceled; no manager approval request was sent",
+	managerSlackId: "",
+	ticketIds: vars.originalPayload.ticketIds,
+	ticketUrls: vars.originalPayload.ticketUrls,
+	canvasUrl: vars.originalPayload.canvasUrl,
+	requestedBySlackId: vars.originalPayload.requestedBySlackId
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+	</flow>
+	
+	
+</mule>

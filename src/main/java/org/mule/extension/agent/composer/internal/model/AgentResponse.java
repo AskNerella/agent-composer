@@ -31,6 +31,10 @@ public class AgentResponse {
     private String inputKind;
     /** JSON Schema describing the structured answer expected, populated only for {@code inputKind == "elicitation"}. */
     private Map<String, Object> elicitationSchema;
+    /** MCP server that requested the current elicitation. */
+    private String elicitationServerName;
+    /** MCP tool whose execution is paused. */
+    private String elicitationToolName;
 
     public AgentResponse() {}
 
@@ -61,6 +65,8 @@ public class AgentResponse {
     public String getInputRequest() { return inputRequest; }
     public String getInputKind() { return inputKind; }
     public Map<String, Object> getElicitationSchema() { return elicitationSchema; }
+    public String getElicitationServerName() { return elicitationServerName; }
+    public String getElicitationToolName() { return elicitationToolName; }
 
     // Setters
     public void setUserTask(String userTask) { this.userTask = userTask; }
@@ -79,6 +85,8 @@ public class AgentResponse {
     public void setInputRequest(String inputRequest) { this.inputRequest = inputRequest; }
     public void setInputKind(String inputKind) { this.inputKind = inputKind; }
     public void setElicitationSchema(Map<String, Object> elicitationSchema) { this.elicitationSchema = elicitationSchema; }
+    public void setElicitationServerName(String elicitationServerName) { this.elicitationServerName = elicitationServerName; }
+    public void setElicitationToolName(String elicitationToolName) { this.elicitationToolName = elicitationToolName; }
 
     public void addToolCall(ToolCallRecord record) {
         this.toolCalls.add(record);
