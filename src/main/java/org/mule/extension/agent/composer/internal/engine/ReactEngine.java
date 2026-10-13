@@ -40,6 +40,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 import java.net.URI;
@@ -80,6 +81,8 @@ public class ReactEngine {
      * never starve common-pool work elsewhere in the Mule runtime. Daemon threads avoid blocking JVM shutdown.
      */
     private static final ExecutorService MCP_IO_EXECUTOR = Executors.newCachedThreadPool(daemonThreadFactory("agent-composer-mcp-io"));
+    /** Tool schemas are stable for the lifetime of a deployed Mule application. */
+    private static final Map<String, List<ToolDefinition>> MCP_TOOL_CACHE = new ConcurrentHashMap<>();
 
     /** Verbs that indicate a create/update/delete intent — responses to these are not cached. */
     private static final List<String> MUTATION_VERBS = Arrays.asList(
@@ -124,7 +127,7 @@ public class ReactEngine {
     private final ObjectStoreManager objectStoreManager;
     private final McpClient mcpClient;
     private final List<AgentResponse.ToolCallRecord> toolCallRecords = Collections.synchronizedList(new ArrayList<>());
-    private ExecutionTraceContext traceContext;
+    private final ThreadLocal<ExecutionTraceContext> traceContext = new ThreadLocal<>();
 
     public ReactEngine(ObjectStoreManager objectStoreManager) {
         this(objectStoreManager, new McpClient());
@@ -173,7 +176,8 @@ public class ReactEngine {
 
         ExecutionTraceContext invocationTrace = ExecutionTraceContext.start(
                 objectStoreManager, config, userMessage, conversationId, maxIterations);
-        this.traceContext = invocationTrace;
+        ExecutionTraceContext previousTrace = traceContext.get();
+        traceContext.set(invocationTrace);
         try {
             AgentResponse response = runInternal(config, userMessage, conversationId, maxIterations, callback);
             response.setExecutionId(invocationTrace.getExecutionId());
@@ -190,7 +194,8 @@ public class ReactEngine {
             invocationTrace.fail(e);
             throw e;
         } finally {
-            this.traceContext = null;
+            if (previousTrace != null) traceContext.set(previousTrace);
+            else traceContext.remove();
         }
     }
 
@@ -206,17 +211,23 @@ public class ReactEngine {
 
         LlmClient llmClient = LlmClientFactory.create(config);
 
-        SpanScope discoverySpan = startTraceSpan("MCP_DISCOVERY", "Discover MCP tools", null,
-                null, mcpServers != null ? mcpServers.stream().map(McpServerConfig::getName).collect(Collectors.toList())
-                        : Collections.emptyList());
-        List<ToolDefinition> mcpTools;
-        try {
-            mcpTools = discoverMcpTools(mcpServers);
-            traceSuccess(discoverySpan, mcpTools.stream().map(ToolDefinition::getName).collect(Collectors.toList()));
-        } catch (Exception e) {
-            traceError(discoverySpan, e);
-            throw e;
+        List<ToolDefinition> discoveredMcpTools = Collections.emptyList();
+        if (mcpServers != null && !mcpServers.isEmpty()) {
+            boolean requiresDiscovery = mcpServers.stream()
+                    .anyMatch(server -> !MCP_TOOL_CACHE.containsKey(mcpToolCacheKey(server)));
+            SpanScope discoverySpan = requiresDiscovery
+                    ? startTraceSpan("MCP_HEALTH", "MCP health", null, null,
+                            mcpServers.stream().map(McpServerConfig::getName).collect(Collectors.toList()))
+                    : null;
+            try {
+                discoveredMcpTools = discoverMcpTools(mcpServers);
+                traceSuccess(discoverySpan, discoveredMcpTools.stream().map(ToolDefinition::getName).collect(Collectors.toList()));
+            } catch (Exception e) {
+                traceError(discoverySpan, e);
+                throw e;
+            }
         }
+        final List<ToolDefinition> mcpTools = discoveredMcpTools;
         List<AgentSkillConfig> skills = config.getSkills() != null ? config.getSkills() : Collections.emptyList();
         List<ToolDefinition> skillTools = buildSkillTools(skills);
         boolean includeMcpToolsAsSkills = config.isIncludeMcpToolsAsSkills();
@@ -246,6 +257,10 @@ public class ReactEngine {
         ObjectStore<Serializable> store = objectStoreManager.getObjectStore(objectStoreName);
         toolCallRecords.clear();
 
+        Map<String, Object> conversationLookup = new LinkedHashMap<>();
+        conversationLookup.put("conversationId", conversationId);
+        SpanScope conversationSpan = startTraceSpan("OBJECT_STORE", "Load conversation",
+                null, null, conversationLookup);
         boolean resumedSession = hasConversationHistory(store, conversationId);
         PendingElicitationState pendingState = loadPendingElicitation(store, conversationId);
         List<LlmMessage> messages;
@@ -253,6 +268,13 @@ public class ReactEngine {
         int toolFailureCount = 0;
 
         if (pendingState != null) {
+            Map<String, Object> pendingOutput = new LinkedHashMap<>();
+            pendingOutput.put("source", "pending-elicitation");
+            pendingOutput.put("found", true);
+            pendingOutput.put("queuedElicitations",
+                    pendingState.getQueue() != null ? pendingState.getQueue().size() : 0);
+            pendingOutput.put("state", pendingState);
+            traceSuccess(conversationSpan, pendingOutput);
             String elicitationAnswer = userMessage;
             resumedSession = true;
             pendingState.setResumedSession(true);
@@ -293,7 +315,11 @@ public class ReactEngine {
             String globalCache = buildSolvedCacheKey(null, requestSignatureForCache);
             if (!resumedSession) {
                 AgentResponse cached = loadSolvedResponse(store, scopedCache);
-                if (cached == null) cached = loadSolvedResponse(store, globalCache);
+                String cacheSource = "conversation-cache";
+                if (cached == null) {
+                    cached = loadSolvedResponse(store, globalCache);
+                    cacheSource = "global-cache";
+                }
                 if (cached != null) {
                     cached.setCacheHit(true);
                     cached.setResumedSession(false);
@@ -303,10 +329,21 @@ public class ReactEngine {
                     if (cached.getReturnReason() == null || cached.getReturnReason().trim().isEmpty()) {
                         cached.setReturnReason(cached.isComplete() ? "completed successfully" : "incomplete cached response");
                     }
+                    Map<String, Object> cacheOutput = new LinkedHashMap<>();
+                    cacheOutput.put("source", cacheSource);
+                    cacheOutput.put("found", true);
+                    cacheOutput.put("response", cached);
+                    traceSuccess(conversationSpan, cacheOutput);
                     return cached;
                 }
             }
             messages = loadHistory(store, conversationId);
+            Map<String, Object> historyOutput = new LinkedHashMap<>();
+            historyOutput.put("source", "conversation-history");
+            historyOutput.put("found", !messages.isEmpty());
+            historyOutput.put("messageCount", messages.size());
+            historyOutput.put("messages", messages);
+            traceSuccess(conversationSpan, historyOutput);
             messages.add(new LlmMessage("user", userMessage));
         }
 
@@ -322,7 +359,7 @@ public class ReactEngine {
 
         for (int iteration = startIteration; iteration < maxIterations; iteration++) {
             actualIterations = iteration + 1;
-            SpanScope iterationSpan = startTraceSpan("ITERATION", "ReAct iteration " + (iteration + 1),
+            SpanScope iterationSpan = startTraceSpan("ITERATION", "Iteration " + (iteration + 1),
                     null, iteration + 1, Collections.singletonMap("currentThought", currentThought));
             LOGGER.info("--- ReAct Iteration {}/{} | conversationId='{}' ---", iteration + 1, maxIterations, conversationId);
             LOGGER.debug("[Iteration {}] What am I trying to do? {}", iteration + 1, currentThought);
@@ -421,10 +458,10 @@ public class ReactEngine {
                 final int remainingIter = maxIterations - iteration;
                 // Pass null callback: the skill sub-loop must not emit concurrently from multiple threads.
                 List<CompletableFuture<ExecutionOutcome>> futures = toolCalls.stream()
-                        .map(tc -> CompletableFuture.supplyAsync(
+                        .map(tc -> CompletableFuture.supplyAsync(withTraceContext(
                                 () -> executeToolOrSkill(tc, mcpTools, mcpServers, config, skills,
                                         capturedThought, iterNum, remainingIter, null, spanId(iterationSpan)),
-                                MCP_IO_EXECUTOR))
+                                traceContext.get()), MCP_IO_EXECUTOR))
                         .collect(Collectors.toList());
 
                 CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
@@ -599,9 +636,24 @@ public class ReactEngine {
 
     private SpanScope startTraceSpan(String type, String name, String parentSpanId,
                                      Integer iteration, Object input) {
-        return traceContext != null
-                ? traceContext.startSpan(type, name, parentSpanId, iteration, input)
+        ExecutionTraceContext context = traceContext.get();
+        return context != null
+                ? context.startSpan(type, name, parentSpanId, iteration, input)
                 : null;
+    }
+
+    private <T> java.util.function.Supplier<T> withTraceContext(
+            java.util.function.Supplier<T> delegate, ExecutionTraceContext captured) {
+        return () -> {
+            ExecutionTraceContext previous = traceContext.get();
+            if (captured != null) traceContext.set(captured);
+            try {
+                return delegate.get();
+            } finally {
+                if (previous != null) traceContext.set(previous);
+                else traceContext.remove();
+            }
+        };
     }
 
     private static String spanId(SpanScope scope) {
@@ -627,7 +679,13 @@ public class ReactEngine {
 
         // Independent per-server discovery calls — fan out instead of querying servers one at a time.
         List<CompletableFuture<List<ToolDefinition>>> futures = mcpServers.stream()
-                .map(server -> CompletableFuture.supplyAsync(() -> {
+                .map(server -> CompletableFuture.supplyAsync(withTraceContext(() -> {
+                    String cacheKey = mcpToolCacheKey(server);
+                    List<ToolDefinition> cached = MCP_TOOL_CACHE.get(cacheKey);
+                    if (cached != null) {
+                        LOGGER.debug("Using cached MCP tools for client '{}'", server.getName());
+                        return cached;
+                    }
                     LOGGER.debug("Fetching MCP tools for client '{}' from {}", server.getName(), server.getServerUrl());
                     List<ToolDefinition> serverTools = mcpClient.listTools(server);
                     List<String> filter = server.getToolFilterList();
@@ -638,8 +696,10 @@ public class ReactEngine {
                     }
                     LOGGER.debug("Fetched {} tool(s) for client '{}': {}", serverTools.size(), server.getName(),
                             serverTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
-                    return serverTools;
-                }, MCP_IO_EXECUTOR))
+                    List<ToolDefinition> immutableTools = Collections.unmodifiableList(new ArrayList<>(serverTools));
+                    MCP_TOOL_CACHE.put(cacheKey, immutableTools);
+                    return immutableTools;
+                }, traceContext.get()), MCP_IO_EXECUTOR))
                 .collect(Collectors.toList());
 
         List<ToolDefinition> all = new ArrayList<>();
@@ -647,6 +707,12 @@ public class ReactEngine {
             all.addAll(future.join());
         }
         return all;
+    }
+
+    private static String mcpToolCacheKey(McpServerConfig server) {
+        String token = server.getAuthToken() == null ? "" : sha256(server.getAuthToken());
+        return String.valueOf(server.getName()) + "|" + String.valueOf(server.getServerUrl()) + "|"
+                + String.join(",", server.getToolFilterList()) + "|" + token;
     }
 
     // ── tool execution ────────────────────────────────────────────────────────

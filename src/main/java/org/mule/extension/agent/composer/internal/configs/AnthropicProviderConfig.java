@@ -22,7 +22,6 @@ public class AnthropicProviderConfig implements LlmProviderConfig {
     @Password
     @Expression(ExpressionSupport.SUPPORTED)
     @Summary("Anthropic API key.")
-    @Optional
     @Placement(order = 1)
     private String apiKey;
 

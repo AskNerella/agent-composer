@@ -73,6 +73,10 @@ public class ExecutionTracingTest {
         ExecutionTraceContext.SpanScope span = context.startSpan(
                 "LLM", "Unsafe <name>", null, 1,
                 Collections.singletonMap("password", "never-render-me"));
+        ExecutionTraceContext.SpanScope objectStore = context.startSpan(
+                "OBJECT_STORE", "Load conversation", null, null,
+                Collections.singletonMap("conversationId", "conversation-html"));
+        objectStore.success(Collections.singletonMap("source", "conversation-cache"));
 
         String runningHtml = TraceHtmlRenderer.render(context.getTrace(), "/agent/traces");
         assertTrue(runningHtml.contains("\\u003cscript"));
@@ -89,6 +93,12 @@ public class ExecutionTracingTest {
         assertTrue(runningHtml.contains("Agent Composer"));
         assertTrue(runningHtml.contains("/agent/assets/agent-composer.svg"));
         assertTrue(runningHtml.contains("Correlation ID &middot; conversation-html"));
+        assertTrue(runningHtml.contains("id=\"loopDiagram\""));
+        assertTrue(runningHtml.contains("mermaid@11"));
+        assertTrue(runningHtml.contains("buildLoopDiagram"));
+        assertTrue(runningHtml.contains("Load conversation"));
+        assertTrue(runningHtml.contains("OBJECT_STORE"));
+        assertTrue(runningHtml.contains("lucide-database"));
         assertTrue(runningHtml.contains("Trace Timeline"));
         assertTrue(runningHtml.contains("class=\"track\""));
         assertTrue(runningHtml.contains("selectSpan("));
@@ -101,10 +111,27 @@ public class ExecutionTracingTest {
         assertTrue(runningHtml.contains("lucide-moon"));
         assertTrue(runningHtml.contains("--primary:#ff385c"));
 
+        String indexHtml = TraceHtmlRenderer.renderIndex(
+                Collections.singletonList(context.getTrace()), "/agent/traces");
+        assertFalse(indexHtml.contains("<span>Trace</span>"));
+        assertTrue(indexHtml.contains("<span>Correlation / Trace ID</span>"));
+        assertFalse(indexHtml.contains("<code>" + context.getExecutionId().substring(0, 8)));
+
         span.success("safe");
         context.finish(ExecutionTraceContext.STATUS_COMPLETED, "done");
         String completedHtml = TraceHtmlRenderer.render(context.getTrace(), "/agent/traces");
         assertFalse(completedHtml.contains("setTimeout(()=>location.reload(),2000)"));
+    }
+
+    @Test
+    public void usesTraceIdWhenCorrelationIdIsMissingWithoutDuplicatingIt() throws Exception {
+        AgentComposerConfiguration config = config("tenant-trace-id");
+        ExecutionTraceContext context = ExecutionTraceContext.start(null, config, "task", null, 5);
+        String html = TraceHtmlRenderer.render(context.getTrace(), "/agent/traces");
+
+        assertTrue(html.contains("Trace ID &middot; " + context.getExecutionId()));
+        assertFalse(html.contains("Correlation ID &middot; null"));
+        assertFalse(html.contains("<span>Trace ID</span><strong>" + context.getExecutionId()));
     }
 
     @Test

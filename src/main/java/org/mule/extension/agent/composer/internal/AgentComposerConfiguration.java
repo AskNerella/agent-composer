@@ -32,7 +32,6 @@ public class AgentComposerConfiguration {
   @Parameter
   @DisplayName("LLM Provider")
   @Summary("Select OpenAI, Anthropic, or a custom OpenAI Responses-compatible endpoint. Only relevant fields are displayed.")
-  @Optional
   @Placement(order = 1)
   private LlmProviderConfig llmProvider;
 
@@ -146,7 +145,7 @@ public class AgentComposerConfiguration {
 
   // ── Getters ───────────────────────────────────────────────────────────────
 
-  public LlmProvider getProvider()            { return llmProvider != null ? llmProvider.getProvider() : provider != null ? provider : LlmProvider.OPENAI; }
+  public LlmProvider getProvider()            { return llmProvider != null ? llmProvider.getProvider() : provider; }
   public String getModelName()                { return llmProvider != null ? llmProvider.getModelName() : modelName != null ? modelName : "gpt-4o"; }
   public String getApiKey()                   { return llmProvider != null ? llmProvider.getApiKey() : apiKey; }
   public String getCustomLlmEndpointUrl()     { return llmProvider != null ? llmProvider.getCustomLlmEndpointUrl() : customLlmEndpointUrl; }
@@ -165,4 +164,5 @@ public class AgentComposerConfiguration {
   public String getAgentVersion()             { return agentVersion; }
   public List<AgentSkillConfig> getSkills()   { return skills; }
   public boolean isIncludeMcpToolsAsSkills()  { return includeMcpToolsAsSkills; }
+  public LlmProviderConfig getLlmProvider()   { return llmProvider; }
 }

@@ -1,6 +1,5 @@
 package org.mule.extension.agent.composer.internal.values;
 
-import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 import org.mule.runtime.extension.api.values.ValueBuilder;
 import org.mule.runtime.extension.api.values.ValueProvider;
 import org.mule.runtime.extension.api.values.ValueResolvingException;
@@ -29,31 +28,24 @@ public class ModelNameValueProvider implements ValueProvider {
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
     @Parameter
-    private LlmProvider provider;
-
-    @Parameter
     private String apiKey;
-
-    @Parameter
-    private String anthropicVersion;
 
     @Override
     public Set<Value> resolve() throws ValueResolvingException {
         Set<Value> values = new LinkedHashSet<>();
-        if (provider == LlmProvider.CUSTOM) {
-            // Custom gateways do not necessarily expose a models endpoint. Keep the
-            // field editable and let the application supply its gateway model ID.
+        // Property placeholders and expressions remain valid model values. Studio may
+        // ask for suggestions before it can resolve the API key, in which case the
+        // editable field is left alone instead of issuing an invalid request.
+        if (apiKey == null || apiKey.isBlank() || apiKey.contains("${") || apiKey.startsWith("#[")) {
             return values;
         }
         try {
-            List<String> models = (provider == LlmProvider.ANTHROPIC)
-                    ? fetchAnthropicModels()
-                    : fetchOpenAiModels();
+            List<String> models = fetchOpenAiModels();
             for (String model : models) {
                 values.add(ValueBuilder.newValue(model).build());
             }
         } catch (Exception e) {
-            LOGGER.warn("Could not fetch models from provider {}: {}", provider, e.getMessage());
+            LOGGER.warn("Could not fetch OpenAI models: {}", e.getMessage());
         }
         return values;
     }
@@ -77,24 +69,4 @@ public class ModelNameValueProvider implements ValueProvider {
         return models;
     }
 
-    private List<String> fetchAnthropicModels() throws Exception {
-        String version = (anthropicVersion != null && !anthropicVersion.isEmpty())
-                ? anthropicVersion : "2023-06-01";
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("https://api.anthropic.com/v1/models"))
-                .header("x-api-key", apiKey)
-                .header("anthropic-version", version)
-                .GET()
-                .build();
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
-        JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
-        JsonArray data = root.getAsJsonArray("data");
-        List<String> models = new ArrayList<>();
-        if (data != null) {
-            for (JsonElement el : data) {
-                models.add(el.getAsJsonObject().get("id").getAsString());
-            }
-        }
-        return models;
-    }
 }

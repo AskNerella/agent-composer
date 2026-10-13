@@ -10,6 +10,8 @@ import org.mule.runtime.extension.api.annotation.param.display.Placement;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
 import org.mule.sdk.api.annotation.Alias;
 import org.mule.sdk.api.annotation.param.Parameter;
+import org.mule.runtime.extension.api.annotation.values.OfValues;
+import org.mule.extension.agent.composer.internal.values.ModelNameValueProvider;
 
 /** OpenAI provider settings. */
 @Alias("open-ai")
@@ -19,6 +21,7 @@ public class OpenAiProviderConfig implements LlmProviderConfig {
     @Parameter
     @DisplayName("Model Name")
     @Expression(ExpressionSupport.SUPPORTED)
+    @OfValues(value = ModelNameValueProvider.class, open = true)
     @Summary("OpenAI model identifier, for example gpt-4o.")
     @Optional(defaultValue = "gpt-4o")
     @Placement(order = 1)
@@ -29,7 +32,6 @@ public class OpenAiProviderConfig implements LlmProviderConfig {
     @Password
     @Expression(ExpressionSupport.SUPPORTED)
     @Summary("OpenAI API key.")
-    @Optional
     @Placement(order = 2)
     private String apiKey;
 

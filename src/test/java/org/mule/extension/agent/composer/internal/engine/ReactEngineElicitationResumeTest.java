@@ -168,6 +168,7 @@ public class ReactEngineElicitationResumeTest {
         AgentComposerConfiguration config = new AgentComposerConfiguration();
         setField(config, "provider", LlmProvider.OPENAI);
         setField(config, "modelName", "test-model");
+        setField(config, "apiKey", "test-api-key");
         setField(config, "skills", skills);
         setField(config, "includeMcpToolsAsSkills", true);
         return config;
