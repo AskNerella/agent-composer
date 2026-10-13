@@ -35,6 +35,10 @@ public class AgentResponse {
     private String elicitationServerName;
     /** MCP tool whose execution is paused. */
     private String elicitationToolName;
+    /** Unique identifier for the execution trace produced by this invocation. */
+    private String executionId;
+    /** Relative HTTP path for the live HTML execution report. */
+    private String traceReportPath;
 
     public AgentResponse() {}
 
@@ -67,6 +71,8 @@ public class AgentResponse {
     public Map<String, Object> getElicitationSchema() { return elicitationSchema; }
     public String getElicitationServerName() { return elicitationServerName; }
     public String getElicitationToolName() { return elicitationToolName; }
+    public String getExecutionId() { return executionId; }
+    public String getTraceReportPath() { return traceReportPath; }
 
     // Setters
     public void setUserTask(String userTask) { this.userTask = userTask; }
@@ -87,6 +93,8 @@ public class AgentResponse {
     public void setElicitationSchema(Map<String, Object> elicitationSchema) { this.elicitationSchema = elicitationSchema; }
     public void setElicitationServerName(String elicitationServerName) { this.elicitationServerName = elicitationServerName; }
     public void setElicitationToolName(String elicitationToolName) { this.elicitationToolName = elicitationToolName; }
+    public void setExecutionId(String executionId) { this.executionId = executionId; }
+    public void setTraceReportPath(String traceReportPath) { this.traceReportPath = traceReportPath; }
 
     public void addToolCall(ToolCallRecord record) {
         this.toolCalls.add(record);

@@ -3,3 +3,5 @@ target
 changes-1.md
 .DS_Store
 common.yaml
+.playwright-cli
+output

@@ -16,6 +16,8 @@ import org.mule.extension.agent.composer.internal.model.McpToolResult;
 import org.mule.extension.agent.composer.internal.model.PendingElicitationState;
 import org.mule.extension.agent.composer.internal.model.ToolCall;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionTraceContext;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionTraceContext.SpanScope;
 import org.mule.runtime.api.store.ObjectStore;
 import org.mule.runtime.api.store.ObjectStoreManager;
 import org.slf4j.Logger;
@@ -23,6 +25,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -119,6 +124,7 @@ public class ReactEngine {
     private final ObjectStoreManager objectStoreManager;
     private final McpClient mcpClient;
     private final List<AgentResponse.ToolCallRecord> toolCallRecords = Collections.synchronizedList(new ArrayList<>());
+    private ExecutionTraceContext traceContext;
 
     public ReactEngine(ObjectStoreManager objectStoreManager) {
         this(objectStoreManager, new McpClient());
@@ -165,13 +171,52 @@ public class ReactEngine {
                              int maxIterations,
                              IterationCallback callback) throws Exception {
 
+        ExecutionTraceContext invocationTrace = ExecutionTraceContext.start(
+                objectStoreManager, config, userMessage, conversationId, maxIterations);
+        this.traceContext = invocationTrace;
+        try {
+            AgentResponse response = runInternal(config, userMessage, conversationId, maxIterations, callback);
+            response.setExecutionId(invocationTrace.getExecutionId());
+            response.setTraceReportPath(traceReportPath(config, invocationTrace.getExecutionId()));
+            if (response.isRequiresInput()) {
+                invocationTrace.finish(ExecutionTraceContext.STATUS_INPUT_REQUIRED, response);
+            } else if (response.isComplete()) {
+                invocationTrace.finish(ExecutionTraceContext.STATUS_COMPLETED, response);
+            } else {
+                invocationTrace.finish(ExecutionTraceContext.STATUS_FAILED, response);
+            }
+            return response;
+        } catch (Exception | Error e) {
+            invocationTrace.fail(e);
+            throw e;
+        } finally {
+            this.traceContext = null;
+        }
+    }
+
+    private AgentResponse runInternal(AgentComposerConfiguration config,
+                                      String userMessage,
+                                      String conversationId,
+                                      int maxIterations,
+                                      IterationCallback callback) throws Exception {
+
         String instructions = config.getInstructions();
         List<McpServerConfig> mcpServers = config.getMcpServers();
         String objectStoreName = config.getObjectStore();
 
         LlmClient llmClient = LlmClientFactory.create(config);
 
-        List<ToolDefinition> mcpTools = discoverMcpTools(mcpServers);
+        SpanScope discoverySpan = startTraceSpan("MCP_DISCOVERY", "Discover MCP tools", null,
+                null, mcpServers != null ? mcpServers.stream().map(McpServerConfig::getName).collect(Collectors.toList())
+                        : Collections.emptyList());
+        List<ToolDefinition> mcpTools;
+        try {
+            mcpTools = discoverMcpTools(mcpServers);
+            traceSuccess(discoverySpan, mcpTools.stream().map(ToolDefinition::getName).collect(Collectors.toList()));
+        } catch (Exception e) {
+            traceError(discoverySpan, e);
+            throw e;
+        }
         List<AgentSkillConfig> skills = config.getSkills() != null ? config.getSkills() : Collections.emptyList();
         List<ToolDefinition> skillTools = buildSkillTools(skills);
         boolean includeMcpToolsAsSkills = config.isIncludeMcpToolsAsSkills();
@@ -221,11 +266,25 @@ public class ReactEngine {
             startIteration = pendingState.getActualIterations();
             toolFailureCount = pendingState.getFailureCount();
             toolCallRecords.addAll(pendingState.getToolCallRecords());
-            ResumeResult resume = resumePendingElicitation(store, conversationId, pendingState,
-                    elicitationAnswer, config, skills, mcpTools, mcpServers, callback);
+            Map<String, Object> resumeInput = new LinkedHashMap<>();
+            resumeInput.put("queuedElicitations", pendingState.getQueue() != null ? pendingState.getQueue().size() : 0);
+            resumeInput.put("persistedIteration", pendingState.getActualIterations());
+            SpanScope resumeSpan = startTraceSpan("ELICITATION_RESUME", "Resume MCP elicitation",
+                    null, startIteration, resumeInput);
+            ResumeResult resume;
+            try {
+                resume = resumePendingElicitation(store, conversationId, pendingState,
+                        elicitationAnswer, config, skills, mcpTools, mcpServers, callback,
+                        spanId(resumeSpan));
+            } catch (RuntimeException e) {
+                traceError(resumeSpan, e);
+                throw e;
+            }
             if (resume.response != null) {
+                traceInputRequired(resumeSpan, resume.response);
                 return resume.response;
             }
+            traceSuccess(resumeSpan, Collections.singletonMap("status", "resumed"));
             messages = resume.messages;
             toolFailureCount = pendingState.getFailureCount();
         } else {
@@ -263,6 +322,8 @@ public class ReactEngine {
 
         for (int iteration = startIteration; iteration < maxIterations; iteration++) {
             actualIterations = iteration + 1;
+            SpanScope iterationSpan = startTraceSpan("ITERATION", "ReAct iteration " + (iteration + 1),
+                    null, iteration + 1, Collections.singletonMap("currentThought", currentThought));
             LOGGER.info("--- ReAct Iteration {}/{} | conversationId='{}' ---", iteration + 1, maxIterations, conversationId);
             LOGGER.debug("[Iteration {}] What am I trying to do? {}", iteration + 1, currentThought);
 
@@ -273,7 +334,8 @@ public class ReactEngine {
                     allTools.stream().map(ToolDefinition::getName).collect(Collectors.joining(", ")));
             LOGGER.info("[Iteration {}] Sending {} message(s) to LLM", iteration + 1, messages.size());
 
-            LlmResponse response = callLlmWithSingleRetry(llmClient, instructions, messages, allTools, iteration + 1);
+            LlmResponse response = callLlmWithSingleRetry(llmClient, instructions, messages, allTools,
+                    iteration + 1, spanId(iterationSpan), "Agent reasoning");
             currentThought = response.getContent() != null ? response.getContent() : "";
             tokensSinceCompression += getTotalTokens(response);
 
@@ -296,6 +358,7 @@ public class ReactEngine {
                     saveHistory(store, conversationId, messages);
 
                     LOGGER.info("[Iteration {}] Stopping early: grounded final answer is available.", iteration + 1);
+                    traceSuccess(iterationSpan, Collections.singletonMap("finalAnswer", currentThought));
                     break;
                 }
 
@@ -304,6 +367,7 @@ public class ReactEngine {
                         "Provide the final answer to the user in text using the available tool results. "
                                 + "Do not call additional tools unless more information is truly required."));
                 saveHistory(store, conversationId, messages);
+                traceSuccess(iterationSpan, Collections.singletonMap("action", "request_text_answer"));
                 continue;
             }
 
@@ -333,6 +397,7 @@ public class ReactEngine {
                 inputRequired.setResumedSession(resumedSession);
                 inputRequired.setReturnReason("input required");
                 inputRequired.setToolCalls(toolCallRecords);
+                traceInputRequired(iterationSpan, Collections.singletonMap("question", question));
                 return inputRequired;
             }
 
@@ -358,7 +423,7 @@ public class ReactEngine {
                 List<CompletableFuture<ExecutionOutcome>> futures = toolCalls.stream()
                         .map(tc -> CompletableFuture.supplyAsync(
                                 () -> executeToolOrSkill(tc, mcpTools, mcpServers, config, skills,
-                                        capturedThought, iterNum, remainingIter, null),
+                                        capturedThought, iterNum, remainingIter, null, spanId(iterationSpan)),
                                 MCP_IO_EXECUTOR))
                         .collect(Collectors.toList());
 
@@ -408,6 +473,7 @@ public class ReactEngine {
                     PendingElicitationState state = buildPendingState(userMessage, maxIterations,
                             actualIterations, toolFailureCount, resumedSession, pausedContinuations);
                     savePendingElicitation(store, conversationId, state);
+                    traceInputRequired(iterationSpan, Collections.singletonMap("elicitationCount", pausedContinuations.size()));
                     return buildElicitationResponse(state, conversationId, null);
                 }
 
@@ -424,7 +490,7 @@ public class ReactEngine {
                 }
 
                 ExecutionOutcome outcome = executeToolOrSkill(toolCall, mcpTools, mcpServers, config, skills,
-                        currentThought, iteration + 1, maxIterations - iteration, callback);
+                        currentThought, iteration + 1, maxIterations - iteration, callback, spanId(iterationSpan));
                 toolCallRecords.addAll(outcome.nestedRecords);
 
                 if (outcome.elicitation != null) {
@@ -436,6 +502,7 @@ public class ReactEngine {
                             actualIterations, toolFailureCount, resumedSession,
                             Collections.singletonList(continuation));
                     savePendingElicitation(store, conversationId, state);
+                    traceInputRequired(iterationSpan, Collections.singletonMap("tool", toolCall.getName()));
                     return buildElicitationResponse(state, conversationId, null);
                 }
 
@@ -468,11 +535,12 @@ public class ReactEngine {
                 if (callback != null) {
                     callback.onEvent(AgentIterationEvent.compression(iteration + 1));
                 }
-                messages = compressHistory(llmClient, messages);
+                messages = compressHistory(llmClient, messages, spanId(iterationSpan));
                 tokensSinceCompression = 0;
             }
 
             saveHistory(store, conversationId, messages);
+            traceSuccess(iterationSpan, Collections.singletonMap("toolCalls", toolCalls.size()));
         }
 
         if (finalAnswer == null) {
@@ -520,6 +588,36 @@ public class ReactEngine {
         }
 
         return result;
+    }
+
+    private String traceReportPath(AgentComposerConfiguration config, String executionId) {
+        String agentPath = config.getAgentPath();
+        if (agentPath == null || agentPath.trim().isEmpty()) agentPath = "/agent";
+        if (!agentPath.startsWith("/")) agentPath = "/" + agentPath;
+        return agentPath + "/traces?executionId=" + executionId;
+    }
+
+    private SpanScope startTraceSpan(String type, String name, String parentSpanId,
+                                     Integer iteration, Object input) {
+        return traceContext != null
+                ? traceContext.startSpan(type, name, parentSpanId, iteration, input)
+                : null;
+    }
+
+    private static String spanId(SpanScope scope) {
+        return scope != null ? scope.getSpanId() : null;
+    }
+
+    private static void traceSuccess(SpanScope scope, Object output) {
+        if (scope != null) scope.success(output);
+    }
+
+    private static void traceInputRequired(SpanScope scope, Object output) {
+        if (scope != null) scope.inputRequired(output);
+    }
+
+    private static void traceError(SpanScope scope, Throwable error) {
+        if (scope != null) scope.error(error);
     }
 
     // ── tool discovery ────────────────────────────────────────────────────────
@@ -636,8 +734,11 @@ public class ReactEngine {
                                                 String currentThought,
                                                 int iteration,
                                                 int remainingIterations,
-                                                IterationCallback subLoopCallback) {
+                                                IterationCallback subLoopCallback,
+                                                String parentSpanId) {
         AgentSkillConfig matchedSkill = findSkillByName(toolCall.getName(), skills);
+        SpanScope toolSpan = startTraceSpan(matchedSkill != null ? "SKILL" : "MCP_TOOL",
+                toolCall.getName(), parentSpanId, iteration, toolCall.getArguments());
         if (matchedSkill != null) {
             List<AgentResponse.ToolCallRecord> nestedRecords = new ArrayList<>();
             String taskArg = toolCall.getArguments() != null
@@ -647,15 +748,18 @@ public class ReactEngine {
             LOGGER.info("[Iteration {}] >>> Using skill '{}' | task: {}", iteration, matchedSkill.getName(), taskArg);
             try {
                 String obs = executeSkill(matchedSkill, mcpTools, mcpServers, config, taskArg,
-                        iteration, remainingIterations, subLoopCallback, nestedRecords);
+                        iteration, remainingIterations, subLoopCallback, nestedRecords, spanId(toolSpan));
                 LOGGER.info("[Iteration {}] Skill response | name='{}' result={}", iteration, matchedSkill.getName(), obs);
+                traceSuccess(toolSpan, obs);
                 return new ExecutionOutcome(obs, serverName, false, null, null, nestedRecords);
             } catch (ElicitationPauseSignal pause) {
                 LOGGER.info("[Iteration {}] Skill '{}' paused for user input (MCP elicitation) | requestId={}",
                         iteration, matchedSkill.getName(), pause.request.getRequestId());
+                traceInputRequired(toolSpan, pause.request);
                 return ExecutionOutcome.paused(pause.request, pause.skillState, nestedRecords);
             } catch (Exception e) {
                 LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration, matchedSkill.getName(), e.getMessage(), e);
+                traceError(toolSpan, e);
                 return new ExecutionOutcome("Skill execution failed: " + e.getMessage(), serverName, true, null, null, nestedRecords);
             }
         }
@@ -668,14 +772,17 @@ public class ReactEngine {
             if (outcome.isElicitationRequired()) {
                 LOGGER.info("[Iteration {}] Tool '{}' paused for user input (MCP elicitation) | requestId={}",
                         iteration, toolCall.getName(), outcome.getElicitation().getRequestId());
+                traceInputRequired(toolSpan, outcome.getElicitation());
                 return ExecutionOutcome.paused(outcome.getElicitation(), null, Collections.emptyList());
             }
             McpToolResult result = outcome.getResult();
             LOGGER.info("[Iteration {}] Tool response | name='{}' result={}", iteration, toolCall.getName(), result.getTextContent());
+            traceSuccess(toolSpan, result);
             return new ExecutionOutcome(result.getTextContent(), serverName, false,
                     result.getUiResourceUri(), result.getUiHtml());
         } catch (Exception e) {
             LOGGER.warn("[Iteration {}] Tool '{}' failed: {}", iteration, toolCall.getName(), e.getMessage(), e);
+            traceError(toolSpan, e);
             return new ExecutionOutcome("Tool execution failed: " + e.getMessage(), serverName, true, null, null);
         }
     }
@@ -700,17 +807,31 @@ public class ReactEngine {
                                                String instructions,
                                                List<LlmMessage> messages,
                                                List<ToolDefinition> tools,
-                                               int iterationNumber) throws Exception {
+                                               int iterationNumber,
+                                               String parentSpanId,
+                                               String spanName) throws Exception {
+        SpanScope llmSpan = startTraceSpan("LLM", spanName, parentSpanId, iterationNumber,
+                ExecutionTraceContext.llmInput(instructions, messages, tools));
         try {
-            return llmClient.chat(instructions, messages, tools);
+            LlmResponse response = llmClient.chat(instructions, messages, tools);
+            if (llmSpan != null) llmSpan.tokens(response);
+            traceSuccess(llmSpan, response);
+            return response;
         } catch (Exception firstError) {
             LOGGER.warn("[Iteration {}] LLM call failed on first attempt, retrying once: {}",
                     iterationNumber, firstError.getMessage());
+            if (llmSpan != null) {
+                llmSpan.incrementRetry("First LLM attempt failed: " + firstError.getMessage());
+            }
             try {
-                return llmClient.chat(instructions, messages, tools);
+                LlmResponse response = llmClient.chat(instructions, messages, tools);
+                if (llmSpan != null) llmSpan.tokens(response);
+                traceSuccess(llmSpan, response);
+                return response;
             } catch (Exception secondError) {
                 LOGGER.error("[Iteration {}] LLM call failed after one retry: {}",
                         iterationNumber, secondError.getMessage(), secondError);
+                traceError(llmSpan, secondError);
                 throw secondError;
             }
         }
@@ -786,7 +907,8 @@ public class ReactEngine {
                                 int parentIteration,
                                 int remainingIterations,
                                 IterationCallback callback,
-                                List<AgentResponse.ToolCallRecord> recordSink) throws Exception {
+                                List<AgentResponse.ToolCallRecord> recordSink,
+                                String parentSpanId) throws Exception {
         // Skill gets MCP tools only when the config flag says so.
         List<ToolDefinition> skillMcpTools = config.isIncludeMcpToolsAsSkills() ? allMcpTools : Collections.emptyList();
 
@@ -816,7 +938,9 @@ public class ReactEngine {
         for (int i = 0; i < maxSkillIterations; i++) {
             LOGGER.info("[Skill '{}' | Step {}/{}] Sending {} message(s) to LLM",
                     skill.getName(), i + 1, maxSkillIterations, skillMessages.size());
-            LlmResponse response = llmClient.chat(skillInstructions, skillMessages, skillMcpTools);
+            LlmResponse response = callLlmOnceTraced(llmClient, skillInstructions, skillMessages,
+                    skillMcpTools, parentIteration, parentSpanId,
+                    "Skill " + skill.getName() + " step " + (i + 1));
                 skillTokensSinceCompression += getTotalTokens(response);
 
             LOGGER.debug("[Skill '{}' | Step {}/{}] Tokens used | input={} output={} total={}",
@@ -866,6 +990,8 @@ public class ReactEngine {
             }
 
             String obs;
+            SpanScope nestedToolSpan = startTraceSpan("MCP_TOOL", toolCall.getName(), parentSpanId,
+                    parentIteration, toolCall.getArguments());
             try {
                 McpToolResult.CallOutcome toolOutcome = executeTool(toolCall, skillMcpTools, mcpServers);
                 if (toolOutcome.isElicitationRequired()) {
@@ -877,10 +1003,12 @@ public class ReactEngine {
                     state.setMaxSteps(maxSkillIterations);
                     state.setConsecutiveTextResponses(consecutiveTextResponses);
                     state.setTokensSinceCompression(skillTokensSinceCompression);
+                    traceInputRequired(nestedToolSpan, toolOutcome.getElicitation());
                     throw new ElicitationPauseSignal(toolOutcome.getElicitation(), state);
                 }
                 McpToolResult skillToolResult = toolOutcome.getResult();
                 obs = skillToolResult.getTextContent();
+                traceSuccess(nestedToolSpan, skillToolResult);
                 AgentResponse.ToolCallRecord skillRecord = new AgentResponse.ToolCallRecord(
                         skill.getName(), toolCall.getName(), toolCall.getArguments(), obs, parentIteration);
                 if (skillToolResult.hasUiResource()) {
@@ -892,6 +1020,7 @@ public class ReactEngine {
                 throw pause;
             } catch (Exception e) {
                 obs = "Tool execution failed: " + e.getMessage();
+                traceError(nestedToolSpan, e);
                 LOGGER.warn("[Skill '{}'] Tool '{}' failed: {}", skill.getName(), toolCall.getName(), e.getMessage());
                 recordSink.add(new AgentResponse.ToolCallRecord(
                         skill.getName(), toolCall.getName(), toolCall.getArguments(), obs, parentIteration));
@@ -910,7 +1039,7 @@ public class ReactEngine {
                 if (callback != null) {
                     callback.onEvent(AgentIterationEvent.compression(parentIteration));
                 }
-                skillMessages = compressHistory(llmClient, skillMessages);
+                skillMessages = compressHistory(llmClient, skillMessages, parentSpanId);
                 skillTokensSinceCompression = 0;
             }
         }
@@ -922,6 +1051,26 @@ public class ReactEngine {
         return skillAnswer;
     }
 
+    private LlmResponse callLlmOnceTraced(LlmClient llmClient,
+                                          String instructions,
+                                          List<LlmMessage> messages,
+                                          List<ToolDefinition> tools,
+                                          int iterationNumber,
+                                          String parentSpanId,
+                                          String spanName) throws Exception {
+        SpanScope llmSpan = startTraceSpan("LLM", spanName, parentSpanId, iterationNumber,
+                ExecutionTraceContext.llmInput(instructions, messages, tools));
+        try {
+            LlmResponse response = llmClient.chat(instructions, messages, tools);
+            if (llmSpan != null) llmSpan.tokens(response);
+            traceSuccess(llmSpan, response);
+            return response;
+        } catch (Exception e) {
+            traceError(llmSpan, e);
+            throw e;
+        }
+    }
+
     /**
      * Compresses the message history by summarising all but the two most recent messages.
      * Keeps the original user request plus a generated summary as context, then appends
@@ -931,7 +1080,8 @@ public class ReactEngine {
      * @param messages  current message list (modified in-place is NOT safe; returns new list)
      * @return a new, shorter message list
      */
-    private List<LlmMessage> compressHistory(LlmClient llmClient, List<LlmMessage> messages) {
+    private List<LlmMessage> compressHistory(LlmClient llmClient, List<LlmMessage> messages,
+                                             String parentSpanId) {
         // Nothing to compress if the list is tiny.
         if (messages.size() <= 4) return messages;
 
@@ -944,6 +1094,8 @@ public class ReactEngine {
         // If we couldn't find a safe cut point, leave the history untouched.
         if (compressUpTo <= 1) return messages;
 
+        SpanScope compressionSpan = startTraceSpan("COMPACTION", "Compress conversation history",
+                parentSpanId, null, Collections.singletonMap("messagesBefore", messages.size()));
         try {
             StringBuilder sb = new StringBuilder();
             sb.append("Summarise the following conversation history in a few sentences. "
@@ -955,10 +1107,10 @@ public class ReactEngine {
                 sb.append("[").append(m.getRole()).append("] ").append(content).append("\n");
             }
 
-            LlmResponse summary = llmClient.chat(
+            LlmResponse summary = callLlmOnceTraced(llmClient,
                     "You are a concise summariser.",
                     Collections.singletonList(new LlmMessage("user", sb.toString())),
-                    Collections.emptyList());
+                    Collections.emptyList(), 0, spanId(compressionSpan), "Conversation summary");
 
             String summaryText = summary.getContent() != null ? summary.getContent() : "(summary unavailable)";
             LOGGER.info("[Context compression] Compressed {} messages → summary ({} chars)",
@@ -972,9 +1124,11 @@ public class ReactEngine {
             compressed.add(new LlmMessage("assistant", "Understood. Continuing from that point."));
             // Re-attach the recent tail.
             compressed.addAll(messages.subList(compressUpTo, messages.size()));
+            traceSuccess(compressionSpan, Collections.singletonMap("messagesAfter", compressed.size()));
             return compressed;
         } catch (Exception e) {
             LOGGER.warn("[Context compression] Failed to compress history, keeping full history: {}", e.getMessage());
+            traceError(compressionSpan, e);
             return messages;
         }
     }
@@ -996,7 +1150,7 @@ public class ReactEngine {
 
     private String buildSolvedCacheKey(String conversationId, String requestSignature) {
         String conv = conversationId == null ? "no-conversation" : conversationId;
-        return "resolved::" + conv + "::" + Integer.toHexString(requestSignature.hashCode());
+        return "resolved::" + conv + "::" + sha256(requestSignature);
     }
 
     private String buildRequestSignature(AgentComposerConfiguration config,
@@ -1007,6 +1161,16 @@ public class ReactEngine {
         sb.append(config.getProvider() == null ? "" : config.getProvider().name()).append("|")
           .append(config.getModelName() == null ? "" : config.getModelName().trim().toLowerCase()).append("|")
           .append(userMessage == null ? "" : userMessage.trim().toLowerCase()).append("|")
+          .append(config.getInstructions() == null ? "" : config.getInstructions()).append("|")
+          .append("customEndpoint=").append(config.getCustomLlmEndpointUrl() == null
+                  ? "" : config.getCustomLlmEndpointUrl().trim()).append("|")
+          .append("customHeaders=").append(config.getCustomLlmHeaders() == null ? "" :
+                  config.getCustomLlmHeaders().stream()
+                          .map(h -> String.valueOf(h.getName()) + "=" + String.valueOf(h.getValue()))
+                          .collect(Collectors.joining(","))).append("|")
+          .append("maxTokens=").append(config.getMaxTokens()).append("|")
+          .append("temperature=").append(config.getTemperature()).append("|")
+          .append("includeMcpToolsAsSkills=").append(config.isIncludeMcpToolsAsSkills()).append("|")
           // The iteration budget changes execution semantics and is reported in AgentResponse.
           // Including it prevents a response produced with the default budget (for example 5)
           // from being returned after the application is reconfigured with a larger budget.
@@ -1018,12 +1182,30 @@ public class ReactEngine {
                     .map(s -> {
                         String name = s.getName() == null ? "" : s.getName();
                         String url = s.getServerUrl() == null ? "" : s.getServerUrl();
-                        return name + "@" + url;
+                        return name + "@" + url + "#" + String.join(",", s.getToolFilterList())
+                                + "#retries=" + s.getRetryCount();
                     })
                     .collect(Collectors.joining(","));
             sb.append(servers);
         }
+        if (config.getSkills() != null && !config.getSkills().isEmpty()) {
+            sb.append("|skills=").append(config.getSkills().stream()
+                    .map(s -> String.valueOf(s.getName()) + "@" + String.valueOf(s.getInstructions()))
+                    .collect(Collectors.joining(",")));
+        }
         return sb.toString();
+    }
+
+    private static String sha256(String value) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(digest.length * 2);
+            for (byte b : digest) hex.append(String.format("%02x", b & 0xff));
+            return hex.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available", e);
+        }
     }
 
     private AgentResponse loadSolvedResponse(ObjectStore<Serializable> store, String cacheKey) {
@@ -1238,7 +1420,8 @@ public class ReactEngine {
             List<AgentSkillConfig> skills,
             List<ToolDefinition> mcpTools,
             List<McpServerConfig> mcpServers,
-            IterationCallback callback) {
+            IterationCallback callback,
+            String parentSpanId) {
         List<LlmMessage> messages = loadHistory(store, conversationId);
         if (state.getVersion() != PendingElicitationState.CURRENT_VERSION
                 || state.getQueue() == null || state.getQueue().isEmpty()) {
@@ -1254,6 +1437,14 @@ public class ReactEngine {
             return ResumeResult.waiting(buildElicitationResponse(state, conversationId, parsed.error));
         }
 
+        Map<String, Object> resolveInput = new LinkedHashMap<>();
+        resolveInput.put("server", active.getRequest().getServerName());
+        resolveInput.put("tool", active.getRequest().getToolName());
+        resolveInput.put("action", parsed.action);
+        resolveInput.put("content", parsed.content);
+        SpanScope resolveSpan = startTraceSpan("MCP_TOOL",
+                "Resume " + active.getRequest().getToolName(), parentSpanId,
+                active.getParentIteration(), resolveInput);
         McpToolResult result = null;
         String failure = null;
         try {
@@ -1263,10 +1454,13 @@ public class ReactEngine {
             if (outcome.isElicitationRequired()) {
                 active.setRequest(outcome.getElicitation());
                 savePendingElicitation(store, conversationId, state);
+                traceInputRequired(resolveSpan, outcome.getElicitation());
                 return ResumeResult.waiting(buildElicitationResponse(state, conversationId, null));
             }
             result = outcome.getResult();
+            traceSuccess(resolveSpan, result);
         } catch (Exception e) {
+            traceError(resolveSpan, e);
             failure = "Tool execution failed while resuming MCP elicitation: " + e.getMessage();
             state.setFailureCount(state.getFailureCount() + 1);
             LOGGER.warn("Could not resume MCP elicitation for conversation '{}': {}",
@@ -1278,6 +1472,9 @@ public class ReactEngine {
 
         if (active.isSkill()) {
             PendingElicitationState.SkillState skillState = active.getSkillState();
+            SpanScope skillSpan = startTraceSpan("SKILL", "Resume skill " + skillState.getSkillName(),
+                    parentSpanId, active.getParentIteration(),
+                    Collections.singletonMap("nextStep", skillState.getNextStep()));
             ToolCall nestedCall = lastToolCall(skillState.getMessages());
             if (nestedCall == null) {
                 nestedCall = new ToolCall(null, request.getToolName(), request.getToolArguments());
@@ -1301,12 +1498,13 @@ public class ReactEngine {
 
             try {
                 SkillResumeResult skillResult = continueSkill(skillState, mcpTools, mcpServers,
-                        config, active.getParentIteration(), callback);
+                        config, active.getParentIteration(), callback, spanId(skillSpan));
                 if (skillResult.elicitation != null) {
                     active.setRequest(skillResult.elicitation);
                     active.setSkillState(skillResult.state);
                     state.setToolCallRecords(snapshotToolCallRecords());
                     savePendingElicitation(store, conversationId, state);
+                    traceInputRequired(skillSpan, skillResult.elicitation);
                     return ResumeResult.waiting(buildElicitationResponse(state, conversationId, null));
                 }
                 observation = skillResult.answer;
@@ -1318,7 +1516,9 @@ public class ReactEngine {
                     callback.onEvent(AgentIterationEvent.skillResult(active.getParentIteration(),
                             active.getOuterToolCall().getName(), active.getOuterToolCall().getArguments(), observation));
                 }
+                traceSuccess(skillSpan, observation);
             } catch (Exception e) {
+                traceError(skillSpan, e);
                 observation = "Skill execution failed after MCP elicitation: " + e.getMessage();
                 state.setFailureCount(state.getFailureCount() + 1);
                 replaceToolResult(messages, active.getOuterToolCall(), observation);
@@ -1395,7 +1595,8 @@ public class ReactEngine {
                                              List<McpServerConfig> mcpServers,
                                              AgentComposerConfiguration config,
                                              int parentIteration,
-                                             IterationCallback callback) throws Exception {
+                                             IterationCallback callback,
+                                             String parentSpanId) throws Exception {
         AgentSkillConfig skill = findSkillByName(state.getSkillName(), config.getSkills());
         if (skill == null) throw new IllegalStateException("Configured skill is no longer available: " + state.getSkillName());
         List<ToolDefinition> skillTools = config.isIncludeMcpToolsAsSkills()
@@ -1407,7 +1608,9 @@ public class ReactEngine {
         final int maxTextReprompts = 3;
 
         for (int i = state.getNextStep(); i < state.getMaxSteps(); i++) {
-            LlmResponse response = llm.chat(skill.getInstructions(), skillMessages, skillTools);
+            LlmResponse response = callLlmOnceTraced(llm, skill.getInstructions(), skillMessages,
+                    skillTools, parentIteration, parentSpanId,
+                    "Skill " + skill.getName() + " resumed step " + (i + 1));
             tokenCount += getTotalTokens(response);
             if (response.hasFinalAnswer()) {
                 if (!skillTools.isEmpty() && consecutiveText < maxTextReprompts) {
@@ -1431,6 +1634,8 @@ public class ReactEngine {
                 callback.onEvent(AgentIterationEvent.toolCall(parentIteration, call.getName(),
                         call.getArguments(), "skill:" + skill.getName()));
             }
+            SpanScope toolSpan = startTraceSpan("MCP_TOOL", call.getName(), parentSpanId,
+                    parentIteration, call.getArguments());
             try {
                 McpToolResult.CallOutcome toolOutcome = executeTool(call, skillTools, mcpServers);
                 if (toolOutcome.isElicitationRequired()) {
@@ -1441,10 +1646,12 @@ public class ReactEngine {
                     SkillResumeResult paused = new SkillResumeResult();
                     paused.elicitation = toolOutcome.getElicitation();
                     paused.state = state;
+                    traceInputRequired(toolSpan, toolOutcome.getElicitation());
                     return paused;
                 }
                 McpToolResult toolResult = toolOutcome.getResult();
                 String observation = toolResult.getTextContent();
+                traceSuccess(toolSpan, toolResult);
                 AgentResponse.ToolCallRecord record = new AgentResponse.ToolCallRecord(
                         skill.getName(), call.getName(), call.getArguments(), observation, parentIteration);
                 if (toolResult.hasUiResource()) {
@@ -1459,6 +1666,7 @@ public class ReactEngine {
                             call.getArguments(), observation, "skill:" + skill.getName()));
                 }
             } catch (Exception e) {
+                traceError(toolSpan, e);
                 String observation = "Tool execution failed: " + e.getMessage();
                 toolCallRecords.add(new AgentResponse.ToolCallRecord(
                         skill.getName(), call.getName(), call.getArguments(), observation, parentIteration));
@@ -1466,7 +1674,7 @@ public class ReactEngine {
             }
 
             if (tokenCount >= COMPRESSION_TOKEN_THRESHOLD) {
-                skillMessages = compressHistory(llm, skillMessages);
+                skillMessages = compressHistory(llm, skillMessages, parentSpanId);
                 tokenCount = 0;
             }
         }

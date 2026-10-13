@@ -104,10 +104,10 @@ public class ReactEngineElicitationResumeTest {
         Method method = ReactEngine.class.getDeclaredMethod("resumePendingElicitation",
                 ObjectStore.class, String.class, PendingElicitationState.class, String.class,
                 AgentComposerConfiguration.class, List.class, List.class, List.class,
-                ReactEngine.IterationCallback.class);
+                ReactEngine.IterationCallback.class, String.class);
         method.setAccessible(true);
         return method.invoke(engine, store, "conversation-1", state, answer,
-                config, skills, Collections.emptyList(), servers, null);
+                config, skills, Collections.emptyList(), servers, null, null);
     }
 
     @SuppressWarnings("unchecked")

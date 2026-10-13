@@ -40,6 +40,11 @@ public class ModelNameValueProvider implements ValueProvider {
     @Override
     public Set<Value> resolve() throws ValueResolvingException {
         Set<Value> values = new LinkedHashSet<>();
+        if (provider == LlmProvider.CUSTOM) {
+            // Custom gateways do not necessarily expose a models endpoint. Keep the
+            // field editable and let the application supply its gateway model ID.
+            return values;
+        }
         try {
             List<String> models = (provider == LlmProvider.ANTHROPIC)
                     ? fetchAnthropicModels()

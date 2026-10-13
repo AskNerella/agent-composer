@@ -504,6 +504,10 @@ public class McpClient {
     }
 
     private String sendRpc(McpServerConfig server, String method, JsonObject params) throws Exception {
+        return withRetries(server, method, () -> sendRpcOnce(server, method, params));
+    }
+
+    private String sendRpcOnce(McpServerConfig server, String method, JsonObject params) throws Exception {
         String sessionId = getOrInitSession(server);
 
         JsonObject payload = new JsonObject();
@@ -608,6 +612,12 @@ public class McpClient {
      * Retries once with a fresh session on a session-expiry (400) response, mirroring {@link #sendRpc}.
      */
     private JsonObject postStreamingAndAwait(McpServerConfig server, JsonObject payload, long awaitRequestId) throws Exception {
+        return withRetries(server, payload.has("method") ? payload.get("method").getAsString() : "streaming request",
+                () -> postStreamingAndAwaitOnce(server, payload, awaitRequestId));
+    }
+
+    private JsonObject postStreamingAndAwaitOnce(McpServerConfig server, JsonObject payload,
+                                                 long awaitRequestId) throws Exception {
         String sessionId = getOrInitSession(server);
         HttpResponse<Stream<String>> response = postForLines(server, payload, sessionId);
 
@@ -739,6 +749,32 @@ public class McpClient {
             builder.header("Authorization", "Bearer " + server.getAuthToken());
         }
         return builder;
+    }
+
+    private <T> T withRetries(McpServerConfig server, String operation,
+                              CheckedSupplier<T> supplier) throws Exception {
+        int retries = server != null ? server.getRetryCount() : 0;
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return supplier.get();
+            } catch (Exception e) {
+                if (attempt >= retries) throw e;
+                int nextAttempt = attempt + 2;
+                LOGGER.warn("MCP {} failed for '{}' (attempt {}/{}): {}. Retrying...",
+                        operation, server.getName(), attempt + 1, retries + 1, e.getMessage());
+                try {
+                    Thread.sleep(Math.min(1000L, 100L * nextAttempt));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw interrupted;
+                }
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface CheckedSupplier<T> {
+        T get() throws Exception;
     }
 
     /**

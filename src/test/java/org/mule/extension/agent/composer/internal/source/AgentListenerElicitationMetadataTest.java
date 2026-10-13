@@ -22,6 +22,8 @@ public class AgentListenerElicitationMetadataTest {
         response.addProperty("inputKind", "elicitation");
         response.addProperty("elicitationServerName", "travel");
         response.addProperty("elicitationToolName", "book_trip");
+        response.addProperty("executionId", "execution-1");
+        response.addProperty("traceReportPath", "/agent/traces?executionId=execution-1");
         JsonObject schema = new JsonObject();
         schema.addProperty("type", "object");
         response.add("elicitationSchema", schema);
@@ -37,5 +39,7 @@ public class AgentListenerElicitationMetadataTest {
         assertEquals("data", parts.get(1).getAsJsonObject().get("kind").getAsString());
         assertEquals("travel", parts.get(1).getAsJsonObject().getAsJsonObject("data")
                 .get("elicitationServerName").getAsString());
+        assertEquals("execution-1", parts.get(1).getAsJsonObject().getAsJsonObject("data")
+                .get("executionId").getAsString());
     }
 }

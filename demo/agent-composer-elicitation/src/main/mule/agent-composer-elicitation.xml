@@ -13,10 +13,13 @@ http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/
 	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="6638bf3c-78ad-49ca-b815-fee28adedcc9" >
 		<http:listener-connection host="0.0.0.0" port="8081" />
 	</http:listener-config>
-	<agent-composer:config name="TixAgent" doc:name="Agent Composer Config" doc:id="ef2070f8-244c-4216-b237-a9988091cd9d" apiKey="${OPENAI_API_KEY}" agentName="Tix Agent" agentDescription="Ticketing Agent" modelName="gpt-5.6-luna" temperature="1.0">
+	<agent-composer:config name="TixAgent" doc:name="Agent Composer Config" doc:id="ef2070f8-244c-4216-b237-a9988091cd9d" agentName="Tix Agent" agentDescription="Ticketing Agent" temperature="1.0" httpListenerConfig="HTTP_Listener_config" includeMcpToolsAsSkills="true">
+		<agent-composer:llm-provider>
+			<agent-composer:open-ai modelName="gpt-5.6-luna" apiKey="${OPENAI_API_KEY}" />
+		</agent-composer:llm-provider>
 		<agent-composer:instructions ><![CDATA[${file::instructions/tix.md}]]></agent-composer:instructions>
 		<agent-composer:mcp-servers >
-			<agent-composer:mcp-server-config name="Approval MCP" serverUrl="http://localhost:8081/mcp" />
+			<agent-composer:mcp-server-config name="Approval MCP" serverUrl="http://localhost:8081/mcp" retryCount="0" />
 		</agent-composer:mcp-servers>
 	</agent-composer:config>
 	<mcp:server-config name="Service_Ticket_MCP_Server" doc:name="MCP Server" doc:id="c079ef00-7b0e-41d8-bc64-bd484c8d88f1" serverName="service-ticket-mcp" serverVersion="1.0.0" >
@@ -26,7 +29,7 @@ http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/
 	</mcp:server-config>
 	<configuration-properties doc:name="Configuration properties" doc:id="eb8d5904-493e-452f-8380-9737b48e968f" file="config/common.yaml" />
 	<flow name="service-ticket-mcpFlow" doc:id="7eee6a15-b573-42b3-9584-2b2bb8234cd4" >
-		<agent-composer:agent-listener doc:name="Agent Listener" doc:id="826e439e-62d4-49b9-bd79-9a43eaf7e544" config-ref="TixAgent" maxIterations="20"/>
+		<agent-composer:agent-listener doc:name="Agent Listener" doc:id="826e439e-62d4-49b9-bd79-9a43eaf7e544" config-ref="TixAgent"/>
 		<agent-composer:execute-agent doc:name="Execute agent" doc:id="a6d30725-1bd2-40fe-8689-152c1cdf4629" config-ref="TixAgent" maxIterations="20"/>
 	</flow>
 	

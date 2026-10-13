@@ -19,6 +19,8 @@
     "elicitationSchema": { "type": ["object", "null"], "description": "MCP form schema expected for an elicitation response." },
     "elicitationServerName": { "type": ["string", "null"], "description": "MCP server requesting the input." },
     "elicitationToolName": { "type": ["string", "null"], "description": "Paused MCP tool requesting the input." },
+    "executionId": { "type": ["string", "null"], "description": "Unique execution trace identifier." },
+    "traceReportPath": { "type": ["string", "null"], "description": "Relative path to the live HTML trace report." },
     "toolCalls": {
       "type": "array",
       "description": "Ordered list of tool calls made during execution.",

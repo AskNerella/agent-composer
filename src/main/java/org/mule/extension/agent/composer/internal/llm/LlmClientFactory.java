@@ -14,6 +14,8 @@ public final class LlmClientFactory {
         switch (config.getProvider()) {
             case ANTHROPIC:
                 return new AnthropicLlmClient(config);
+            case CUSTOM:
+                return new OpenAiLlmClient(config);
             case OPENAI:
             default:
                 return new OpenAiLlmClient(config);
