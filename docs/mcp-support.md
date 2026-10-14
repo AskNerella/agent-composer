@@ -6,16 +6,6 @@ The connector requests MCP `2025-11-25`. If `initialize` negotiates another vers
 
 Stateful and stateless Streamable HTTP servers are supported for tool discovery and execution. When a server returns an MCP session ID, the connector sends it on subsequent requests in that session.
 
-## MCP Apps / MCP UI
-
-Supported patterns:
-
-- Tool-definition `_meta.ui.resourceUri` followed by `resources/read`.
-- Result-level `_meta.ui.resourceUri` fallback.
-- Legacy embedded HTML resource content.
-
-UI URI, HTML, and MIME type are included in tool records and applicable A2A artifacts.
-
 ## Discovery and retries
 
 Successful non-empty tool discovery is cached for the deployed application and reused by agent-card generation and agent execution. This avoids a health or discovery request for every agent call. Failed and empty discovery results are not cached, allowing a server to recover on a later request.
