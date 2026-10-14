@@ -7,6 +7,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
+import org.mule.extension.agent.composer.internal.configs.CustomHttpHeader;
+import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 import org.mule.extension.agent.composer.internal.model.ToolCall;
@@ -124,7 +126,7 @@ public class OpenAiLlmClient implements LlmClient {
             body.add("tools", toolsArr);
         }
 
-        String responseBody = post(RESPONSES_URL, GSON.toJson(body));
+        String responseBody = post(resolveResponsesUrl(), GSON.toJson(body));
         JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
 
         String stopReason = root.has("stop_reason") ? root.get("stop_reason").getAsString() : "end_turn";
@@ -259,17 +261,48 @@ public class OpenAiLlmClient implements LlmClient {
     }
 
     private String post(String url, String body) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + config.getApiKey())
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build();
+                .POST(HttpRequest.BodyPublishers.ofString(body));
+        applyAuthenticationAndCustomHeaders(builder);
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new RuntimeException("OpenAI API error " + response.statusCode() + ": " + response.body());
         }
         return response.body();
+    }
+
+    private String resolveResponsesUrl() {
+        if (config.getProvider() != LlmProvider.CUSTOM) return RESPONSES_URL;
+        String endpoint = config.getCustomLlmEndpointUrl();
+        if (endpoint == null || endpoint.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Custom LLM Endpoint URL is required when LLM Provider is CUSTOM");
+        }
+        URI uri = URI.create(endpoint.trim());
+        String scheme = uri.getScheme();
+        if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
+            throw new IllegalArgumentException("Custom LLM Endpoint URL must use http or https");
+        }
+        return uri.toString();
+    }
+
+    private void applyAuthenticationAndCustomHeaders(HttpRequest.Builder builder) {
+        if (config.getApiKey() != null && !config.getApiKey().trim().isEmpty()) {
+            builder.setHeader("Authorization", "Bearer " + config.getApiKey().trim());
+        }
+        if (config.getProvider() != LlmProvider.CUSTOM || config.getCustomLlmHeaders() == null) return;
+        for (CustomHttpHeader header : config.getCustomLlmHeaders()) {
+            if (header == null || header.getName() == null || header.getName().trim().isEmpty()) continue;
+            String name = header.getName().trim();
+            String value = header.getValue() != null ? header.getValue() : "";
+            if (name.indexOf('\r') >= 0 || name.indexOf('\n') >= 0
+                    || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
+                throw new IllegalArgumentException("Custom LLM headers cannot contain line breaks");
+            }
+            builder.setHeader(name, value);
+        }
     }
 }

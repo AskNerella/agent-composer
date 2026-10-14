@@ -16,6 +16,10 @@
         }
       }
     },
+    "pendingElicitation": {
+      "type": ["object", "null"],
+      "description": "Summary of a durable MCP elicitation currently waiting for input."
+    },
     "solvedResponses": {
       "type": "array",
       "description": "Solved/cached agent responses scoped to this session.",

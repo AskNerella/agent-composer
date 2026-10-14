@@ -16,6 +16,8 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 /**
  * Builds an A2A-compliant agent card JSON from the connector configuration
@@ -71,6 +73,8 @@ public class AgentCardBuilder {
                 : scheme + "://" + host + ":" + port + normalizedPath;
 
         Map<String, Object> card = new LinkedHashMap<>();
+        // Top-level protocolVersion/additionalInterfaces are the 0.3.x fields; supportedInterfaces
+        // (1.0) declares the same endpoint negotiates both versions via the A2A-Version header.
         card.put("protocolVersion", "0.3.0");
         card.put("name", nonEmpty(config.getAgentName(), "Agent Composer"));
         card.put("description", nonEmpty(config.getAgentDescription(), "A ReAct agent powered by Agent Composer."));
@@ -79,6 +83,9 @@ public class AgentCardBuilder {
         card.put("securitySchemes", Collections.emptyMap());
         card.put("preferredTransport", "JSONRPC");
         card.put("additionalInterfaces", Collections.singletonList(interfaceEntry(agentUrl, "JSONRPC")));
+        card.put("supportedInterfaces", List.of(
+                supportedInterfaceEntry(agentUrl, "JSONRPC", "1.0"),
+                supportedInterfaceEntry(agentUrl, "JSONRPC", "0.3")));
 
         Map<String, Object> capabilities = new LinkedHashMap<>();
         capabilities.put("streaming", true);
@@ -123,29 +130,41 @@ public class AgentCardBuilder {
         // MCP tool skills (auto-discovered) — controlled by the includeMcpToolsAsSkills flag.
         if (includeMcpToolsAsSkills && mcpServers != null && !mcpServers.isEmpty()) {
             McpClient mcpClient = new McpClient();
-            for (McpServerConfig server : mcpServers) {
-                try {
-                    List<ToolDefinition> tools = mcpClient.listTools(server);
-                    List<String> whitelist = server.getToolFilterList();
-                    for (ToolDefinition tool : tools) {
-                        if (!whitelist.isEmpty() && !whitelist.contains(tool.getName())) {
-                            continue; // skip non-whitelisted tools
+            // Independent per-server discovery calls — fan out instead of querying servers one at a time.
+            List<CompletableFuture<List<ToolDefinition>>> futures = mcpServers.stream()
+                    .map(server -> CompletableFuture.supplyAsync(() -> {
+                        try {
+                            List<ToolDefinition> tools = mcpClient.listTools(server);
+                            List<String> whitelist = server.getToolFilterList();
+                            List<ToolDefinition> filtered = new ArrayList<>();
+                            for (ToolDefinition tool : tools) {
+                                if (whitelist.isEmpty() || whitelist.contains(tool.getName())) {
+                                    filtered.add(tool);
+                                }
+                            }
+                            return filtered;
+                        } catch (Exception e) {
+                            LOGGER.warn("Could not fetch tools from MCP server '{}' for agent card: {}",
+                                    server.getName(), e.getMessage());
+                            return Collections.<ToolDefinition>emptyList();
                         }
-                        Map<String, Object> skill = new LinkedHashMap<>();
-                        List<String> tags = new ArrayList<>();
-                        tags.add(nonEmpty(server.getName(), "unknown-mcp-server"));
-                        tags.add(tool.getName());
-                        skill.put("id", tool.getName());
-                        skill.put("name", tool.getName());
-                        skill.put("description", nonEmpty(tool.getDescription(), ""));
-                        skill.put("tags", tags);
-                        skill.put("inputModes", Collections.singletonList("text/plain"));
-                        skill.put("outputModes", List.of("text/plain", "application/json"));
-                        skills.add(skill);
-                    }
-                } catch (Exception e) {
-                    LOGGER.warn("Could not fetch tools from MCP server '{}' for agent card: {}",
-                            server.getName(), e.getMessage());
+                    }))
+                    .collect(Collectors.toList());
+
+            for (int i = 0; i < mcpServers.size(); i++) {
+                McpServerConfig server = mcpServers.get(i);
+                for (ToolDefinition tool : futures.get(i).join()) {
+                    Map<String, Object> skill = new LinkedHashMap<>();
+                    List<String> tags = new ArrayList<>();
+                    tags.add(nonEmpty(server.getName(), "unknown-mcp-server"));
+                    tags.add(tool.getName());
+                    skill.put("id", tool.getName());
+                    skill.put("name", tool.getName());
+                    skill.put("description", nonEmpty(tool.getDescription(), ""));
+                    skill.put("tags", tags);
+                    skill.put("inputModes", Collections.singletonList("text/plain"));
+                    skill.put("outputModes", List.of("text/plain", "application/json"));
+                    skills.add(skill);
                 }
             }
         }
@@ -168,6 +187,14 @@ public class AgentCardBuilder {
         Map<String, Object> entry = new LinkedHashMap<>();
         entry.put("url", url);
         entry.put("transport", transport);
+        return entry;
+    }
+
+    private static Map<String, Object> supportedInterfaceEntry(String url, String protocolBinding, String protocolVersion) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("url", url);
+        entry.put("protocolBinding", protocolBinding);
+        entry.put("protocolVersion", protocolVersion);
         return entry;
     }
 

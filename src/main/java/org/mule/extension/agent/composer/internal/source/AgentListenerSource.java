@@ -1,12 +1,12 @@
 package org.mule.extension.agent.composer.internal.source;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonParser;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
-import org.mule.extension.agent.composer.internal.engine.ReactEngine;
 import org.mule.runtime.api.exception.DefaultMuleException;
 import org.mule.runtime.api.exception.MuleException;
 import org.mule.runtime.api.metadata.TypedValue;
@@ -19,6 +19,11 @@ import org.mule.runtime.http.api.domain.message.response.HttpResponse;
 import org.mule.runtime.http.api.server.HttpServer;
 import org.mule.runtime.http.api.server.RequestHandlerManager;
 import org.mule.runtime.http.api.server.async.HttpResponseReadyCallback;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionTrace;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionTraceStore;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionCancellationRegistry;
+import org.mule.extension.agent.composer.internal.tracing.TraceHtmlRenderer;
+import org.mule.extension.agent.composer.internal.tracing.TraceRedactor;
 import org.mule.runtime.api.message.Error;
 import org.mule.runtime.extension.api.annotation.param.Content;
 import org.mule.sdk.api.annotation.Alias;
@@ -48,6 +53,7 @@ import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Message source that attaches to an existing {@code <http:listener-config\>\} global element
@@ -73,6 +79,7 @@ import java.util.UUID;
 public class AgentListenerSource extends Source<String, AgentListenerAttributes> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(AgentListenerSource.class);
+    private static final Gson GSON = new Gson();
     private static final String RESPONSE_CALLBACK_VAR = "responseCallback";
     private static final String REQUEST_VAR = "requestId";
     private static final String TASK_ID_VAR = "taskId";
@@ -80,6 +87,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static final String RPC_ID_VAR = "rpcId";
     private static final String IS_JSONRPC_VAR = "isJsonRpc";
     private static final String IS_STREAMING_VAR = "isStreaming";
+    private static final String SSE_OUTPUT_VAR = "sseOutput";
+    private static final String SSE_TERMINAL_SENT_VAR = "sseTerminalSent";
     private static final String TASK_STORE_PREFIX = "a2a:task:";
     private static final String CARD_SUFFIX = "/.well-known/agent-card.json";
     private static final String LEGACY_CARD_SUFFIX = "/.well-known/agent.json";
@@ -98,6 +107,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private RequestHandlerManager cardHandlerManager;
     private RequestHandlerManager scopedCardHandlerManager;
     private RequestHandlerManager legacyCardHandlerManager;
+    private RequestHandlerManager traceReportHandlerManager;
+    private RequestHandlerManager brandAssetHandlerManager;
 
     @Override
     public void onStart(SourceCallback<String, AgentListenerAttributes> sourceCallback) throws MuleException {
@@ -116,30 +127,35 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
+        String normalizedTracePath = config.getTracesPath().startsWith("/")
+                ? config.getTracesPath() : "/" + config.getTracesPath();
 
         // ── GET {agentPath}/.well-known/agent-card.json  +  {agentPath}/.well-known/agent.json ──
         String scopedCardPath = normalizedPath + CARD_SUFFIX;
         String legacyCardPath = normalizedPath + LEGACY_CARD_SUFFIX;
         cardHandlerManager = addCardHandler(scopedCardPath, cardBytes);
         scopedCardHandlerManager = addCardHandler(legacyCardPath, cardBytes);
+        traceReportHandlerManager = addTraceReportHandler(normalizedTracePath);
+        int traceSlash = normalizedTracePath.lastIndexOf('/');
+        String traceBasePath = traceSlash > 0 ? normalizedTracePath.substring(0, traceSlash) : "";
+        brandAssetHandlerManager = addStaticAssetHandler(
+                traceBasePath + "/assets/agent-composer.svg", loadBrandLogo(), "image/svg+xml; charset=UTF-8");
 
         // ── POST {agentPath} ─────────────────────────────────────────────────
         agentHandlerManager = httpServer.addRequestHandler(normalizedPath, (requestCtx, responseCallback) -> {
             String method = requestCtx.getRequest().getMethod();
-            if (!requestCtx.getRequest().getPath().equals(normalizedPath)) {
-                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
-                return;
-            }
             if (!"POST".equalsIgnoreCase(method)) {
-                sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
+                sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
                 return;
             }
 
             String requestId = UUID.randomUUID().toString();
+            String body = "";
+            String rpcIdJson = null;
+            boolean isJsonRpc = false;
 
             try {
                 // Read request body
-                String body = "";
                 try (InputStream is = requestCtx.getRequest().getEntity().getContent()) {
                     body = new String(is.readAllBytes(), StandardCharsets.UTF_8);
                 } catch (IOException e) {
@@ -154,9 +170,26 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 String remoteAddr = requestCtx.getClientConnection() != null
                         ? requestCtx.getClientConnection().getRemoteHostAddress().toString() : "unknown";
 
-                String rpcIdJson = extractRpcIdJson(body);
-                boolean isJsonRpc = rpcIdJson != null;
+                rpcIdJson = extractRpcIdJson(body);
+                isJsonRpc = rpcIdJson != null;
+
+                // A2A-Version negotiation (Section 3.6): empty/absent means 0.3; only 0.3 and 1.0 are understood.
+                // The wire payload shape (status/artifact event objects) is unchanged across both versions.
+                String a2aVersion = resolveA2aVersion(requestCtx.getRequest());
+                if (!isSupportedA2aVersion(a2aVersion)) {
+                    sendProtocolError(responseCallback, 400, -32009,
+                            "A2A protocol version '" + a2aVersion + "' is not supported by this agent.", isJsonRpc, rpcIdJson);
+                    return;
+                }
+
                 String methodName = extractMethodName(body);
+                JsonObject requestRoot = parseJsonObject(body);
+                if (requestRoot != null && requestRoot.has("jsonrpc")
+                    && (methodName == null || methodName.trim().isEmpty())) {
+                    sendProtocolError(responseCallback, 400, -32600,
+                        "Invalid Request: missing required method.", true, rpcIdJson);
+                    return;
+                }
 
                 if (isTaskGetRequest(methodName)) {
                     handleTaskGetRequest(responseCallback, body, isJsonRpc, rpcIdJson);
@@ -186,12 +219,14 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         requestId);
 
                 // Store HTTP callback in context so @OnSuccess / @OnError can send the response
-                persistTask(buildTask(taskId, contextId, "submitted", null, null));
+                persistTask(buildTask(taskId, contextId, "submitted", null, null, null));
 
                 // ── Streaming: message/stream or tasks/sendSubscribe ─────────
-                // These bypass the Mule flow so we can push SSE events per iteration.
+                // The Mule flow remains authoritative so Execute Agent's maxIterations
+                // and all other operation parameters apply identically to both transports.
                 if (isStreamingRequest(methodName)) {
-                    handleStreamingRequest(responseCallback, body, taskId, contextId, rpcIdJson, isJsonRpc);
+                    handleStreamingRequest(sourceCallback, responseCallback, body, attributes,
+                            requestId, taskId, contextId, rpcIdJson, isJsonRpc);
                     return;
                 }
 
@@ -216,12 +251,13 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
             } catch (Exception e) {
                 LOGGER.error("Error handling agent task {}: {}", requestId, e.getMessage(), e);
-                sendResponse(responseCallback, 500, "{\"error\":\"Internal server error\"}");
+                sendProtocolError(responseCallback, 500, -32000,
+                        "Internal server error", isJsonRpc, rpcIdJson);
             }
         });
 
-        LOGGER.info("Agent Listener attached to HTTP Listener Config '{}' | path={} card={}",
-                configName, normalizedPath, scopedCardPath);
+        LOGGER.info("Agent Listener attached to HTTP Listener Config '{}' | path={} card={} traces={}",
+                configName, normalizedPath, scopedCardPath, normalizedTracePath);
     }
 
     @Override
@@ -238,6 +274,12 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         if (legacyCardHandlerManager != null) {
             legacyCardHandlerManager.stop();
         }
+        if (traceReportHandlerManager != null) {
+            traceReportHandlerManager.stop();
+        }
+        if (brandAssetHandlerManager != null) {
+            brandAssetHandlerManager.stop();
+        }
         LOGGER.info("Agent Listener detached from HTTP Listener Config '{}'.", config.getHttpListenerConfig());
     }
 
@@ -251,6 +293,16 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String contextId = callbackContext.<String>getVariable(CONTEXT_ID_VAR).orElse(taskId);
         String rpcIdJson = callbackContext.<String>getVariable(RPC_ID_VAR).orElse("null");
         boolean isJsonRpc = callbackContext.<Boolean>getVariable(IS_JSONRPC_VAR).orElse(false);
+        boolean isStreaming = callbackContext.<Boolean>getVariable(IS_STREAMING_VAR).orElse(false);
+        if (isStreaming) {
+            AtomicBoolean terminalSent = callbackContext.<AtomicBoolean>getVariable(SSE_TERMINAL_SENT_VAR)
+                    .orElseGet(AtomicBoolean::new);
+            if (terminalSent.compareAndSet(false, true)) {
+                callbackContext.<PipedOutputStream>getVariable(SSE_OUTPUT_VAR).ifPresent(out ->
+                        completeStreamingSuccess(out, payload, taskId, contextId, rpcIdJson, isJsonRpc));
+            }
+            return;
+        }
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
             JsonObject canceledTask = getCanceledTask(taskId);
             if (canceledTask != null) {
@@ -262,13 +314,18 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             JsonObject agentResponse = parseJsonObject(rawPayload);
             if (isInputRequired(agentResponse)) {
                 String question = extractInputRequest(agentResponse, rawPayload);
-                JsonObject task = buildTask(taskId, contextId, "input-required", question, null);
+                JsonObject task = buildTask(taskId, contextId, "input-required", question, null, null);
+                addInputRequiredMetadata(task, agentResponse);
+                addTraceMetadata(task, agentResponse);
                 persistTask(task);
                 sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
                 return;
             }
 
-            JsonObject task = buildTask(taskId, contextId, "completed", null, extractAgentOutput(rawPayload, agentResponse));
+            String agentOutput = extractAgentOutput(rawPayload, agentResponse);
+            String uiHtml = extractFirstUiHtml(agentResponse);
+            JsonObject task = buildTask(taskId, contextId, "completed", null, agentOutput, uiHtml);
+            addTraceMetadata(task, agentResponse);
             persistTask(task);
             sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
         });
@@ -284,10 +341,26 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         String contextId = callbackContext.<String>getVariable(CONTEXT_ID_VAR).orElse(taskId);
         String rpcIdJson = callbackContext.<String>getVariable(RPC_ID_VAR).orElse("null");
         boolean isJsonRpc = callbackContext.<Boolean>getVariable(IS_JSONRPC_VAR).orElse(false);
+        boolean isStreaming = callbackContext.<Boolean>getVariable(IS_STREAMING_VAR).orElse(false);
+        if (isStreaming) {
+            AtomicBoolean terminalSent = callbackContext.<AtomicBoolean>getVariable(SSE_TERMINAL_SENT_VAR)
+                    .orElseGet(AtomicBoolean::new);
+            if (!terminalSent.compareAndSet(false, true)) return;
+            callbackContext.<PipedOutputStream>getVariable(SSE_OUTPUT_VAR).ifPresent(out -> {
+                JsonObject task = getCanceledTask(taskId);
+                if (task == null) {
+                    task = buildTask(taskId, contextId, "canceled", "Flow terminated before response was sent", null, null);
+                    persistTask(task);
+                }
+                writeAndCloseSse(out, buildStatusUpdateSseEvent(taskId, contextId, "canceled",
+                        extractStatusMessage(task), true, isJsonRpc, rpcIdJson), taskId);
+            });
+            return;
+        }
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
             JsonObject task = getCanceledTask(taskId);
             if (task == null) {
-                task = buildTask(taskId, contextId, "canceled", "Flow terminated before response was sent", null);
+                task = buildTask(taskId, contextId, "canceled", "Flow terminated before response was sent", null, null);
                 persistTask(task);
             }
             sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
@@ -303,10 +376,27 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         boolean isJsonRpc = callbackContext.<Boolean>getVariable(IS_JSONRPC_VAR).orElse(false);
         String msg = error != null ? error.getDescription() : "unknown";
         LOGGER.error("Flow error for agent request {}: {}", requestId, msg);
+        boolean isStreaming = callbackContext.<Boolean>getVariable(IS_STREAMING_VAR).orElse(false);
+        if (isStreaming) {
+            AtomicBoolean terminalSent = callbackContext.<AtomicBoolean>getVariable(SSE_TERMINAL_SENT_VAR)
+                    .orElseGet(AtomicBoolean::new);
+            if (!terminalSent.compareAndSet(false, true)) return;
+            callbackContext.<PipedOutputStream>getVariable(SSE_OUTPUT_VAR).ifPresent(out -> {
+                JsonObject task = getCanceledTask(taskId);
+                if (task == null) {
+                    task = buildTask(taskId, contextId, "failed", msg, null, null);
+                    persistTask(task);
+                }
+                writeAndCloseSse(out, buildStatusUpdateSseEvent(taskId, contextId,
+                        extractTaskState(task), extractStatusMessage(task), true,
+                        isJsonRpc, rpcIdJson), taskId);
+            });
+            return;
+        }
         callbackContext.<HttpResponseReadyCallback>getVariable(RESPONSE_CALLBACK_VAR).ifPresent(cb -> {
             JsonObject task = getCanceledTask(taskId);
             if (task == null) {
-                task = buildTask(taskId, contextId, "failed", msg, null);
+                task = buildTask(taskId, contextId, "failed", msg, null, null);
                 persistTask(task);
             }
             sendResponse(cb, 200, wrapTaskResponse(task, isJsonRpc, rpcIdJson));
@@ -317,15 +407,84 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
     private RequestHandlerManager addCardHandler(String path, byte[] cardBytes) {
         return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
-            if (!requestCtx.getRequest().getPath().equals(path)) {
-                sendResponse(responseCallback, 404, "{\"error\":\"Not Found\"}");
-                return;
-            }
             if (!"GET".equalsIgnoreCase(requestCtx.getRequest().getMethod())) {
-                sendResponse(responseCallback, 405, "{\"error\":\"Method Not Allowed\"}");
+                sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
                 return;
             }
             sendResponseBytes(responseCallback, 200, cardBytes);
+        });
+    }
+
+    private RequestHandlerManager addStaticAssetHandler(String path, byte[] bytes, String contentType) {
+        return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
+            if (!"GET".equalsIgnoreCase(requestCtx.getRequest().getMethod())) {
+                sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
+                return;
+            }
+            sendResponseBytes(responseCallback, 200, bytes, contentType);
+        });
+    }
+
+    private static byte[] loadBrandLogo() throws MuleException {
+        try (InputStream stream = AgentListenerSource.class.getResourceAsStream("/icon/icon.svg")) {
+            if (stream == null) {
+                throw new IOException("Packaged Agent Composer logo was not found at /icon/icon.svg");
+            }
+            return stream.readAllBytes();
+        } catch (IOException e) {
+            throw new DefaultMuleException(new RuntimeException("Could not load the Agent Composer logo", e));
+        }
+    }
+
+    private RequestHandlerManager addTraceReportHandler(String path) {
+        return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
+            String method = requestCtx.getRequest().getMethod();
+            String executionId = requestCtx.getRequest().getQueryParams().get("executionId");
+            if ("POST".equalsIgnoreCase(method)
+                    && "cancel".equalsIgnoreCase(requestCtx.getRequest().getQueryParams().get("action"))) {
+                boolean stopped = ExecutionCancellationRegistry.cancel(executionId);
+                sendResponseWithContentType(responseCallback, stopped ? 202 : 409,
+                        "{\"stopped\":" + stopped + ",\"executionId\":" + GSON.toJson(executionId) + "}",
+                        "application/json; charset=UTF-8");
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(method)) {
+                sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
+                return;
+            }
+            String format = requestCtx.getRequest().getQueryParams().get("format");
+            boolean json = "json".equalsIgnoreCase(format);
+            if (executionId == null || executionId.trim().isEmpty()) {
+                java.util.List<ExecutionTrace> traces = ExecutionTraceStore.list(
+                        objectStoreManager, config.getObjectStore(), 50);
+                if (json) {
+                    sendResponseWithContentType(responseCallback, 200,
+                            TraceRedactor.toRedactedJson(traces), "application/json; charset=UTF-8");
+                } else {
+                    sendResponseWithContentType(responseCallback, 200,
+                            TraceHtmlRenderer.renderIndex(traces, path), "text/html; charset=UTF-8");
+                }
+                return;
+            }
+            ExecutionTrace trace = ExecutionTraceStore.get(executionId,
+                    objectStoreManager, config.getObjectStore());
+            if (trace == null) {
+                if (json) {
+                    sendResponseWithContentType(responseCallback, 404,
+                            "{\"error\":\"Execution trace not found\"}", "application/json; charset=UTF-8");
+                } else {
+                    sendResponseWithContentType(responseCallback, 404,
+                            TraceHtmlRenderer.render(null, path), "text/html; charset=UTF-8");
+                }
+                return;
+            }
+            if (json) {
+                sendResponseWithContentType(responseCallback, 200,
+                        ExecutionTraceStore.toJson(trace), "application/json; charset=UTF-8");
+            } else {
+                sendResponseWithContentType(responseCallback, 200,
+                        TraceHtmlRenderer.render(trace, path), "text/html; charset=UTF-8");
+            }
         });
     }
 
@@ -377,7 +536,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         }
 
         JsonObject canceledTask = buildTask(taskId, extractTaskContextId(existingTask, taskId),
-                "canceled", "Task canceled by client request.", null);
+                "canceled", "Task canceled by client request.", null, null);
         if (existingTask.has("history")) {
             canceledTask.add("history", existingTask.get("history").deepCopy());
         }
@@ -387,17 +546,19 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
     /**
      * Handles a streaming A2A request ({@code message/stream} or legacy {@code tasks/sendSubscribe})
-     * by running the ReAct engine directly in a background thread and emitting A2A 0.3.0
-     * status-update / artifact-update events.
+     * through the configured Mule flow. This keeps Execute Agent as the only owner of
+     * the ReAct iteration limit while still returning an SSE transport response.
      */
-    private void handleStreamingRequest(HttpResponseReadyCallback responseCallback, String body, String taskId, String contextId,
-                                        String rpcIdJson, boolean isJsonRpc) {
-        String userMessage = extractUserMessage(body);
+    private void handleStreamingRequest(SourceCallback<String, AgentListenerAttributes> sourceCallback,
+                                        HttpResponseReadyCallback responseCallback,
+                                        String body, AgentListenerAttributes attributes, String requestId,
+                                        String taskId, String contextId, String rpcIdJson,
+                                        boolean isJsonRpc) {
         try {
             PipedOutputStream pipedOut = new PipedOutputStream();
             PipedInputStream pipedIn = new PipedInputStream(pipedOut, 131072);
 
-            JsonObject submittedTask = buildTask(taskId, contextId, "submitted", null, null);
+            JsonObject submittedTask = buildTask(taskId, contextId, "submitted", null, null, null);
             persistTask(submittedTask);
 
             try {
@@ -405,80 +566,6 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 pipedOut.write(buildTaskSseEvent(submittedTask, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
                 pipedOut.flush();
             } catch (Exception ignored) {}
-
-            Thread thread = new Thread(() -> {
-                try {
-                    ReactEngine engine = new ReactEngine(objectStoreManager);
-                    ReactEngine.IterationCallback callback = (iteration, actionName, observation) -> {
-                        if (isTaskCanceled(taskId)) {
-                            return;
-                        }
-                        String summary = observation != null && !observation.trim().isEmpty()
-                                ? observation
-                                : actionName;
-                        if (summary == null || summary.trim().isEmpty()) {
-                            return;
-                        }
-                        try {
-                            JsonObject workingTask = buildTask(taskId, contextId, "working", summary, null);
-                            persistTask(workingTask);
-                            pipedOut.write(buildWorkingSseEvent(taskId, contextId, summary, isJsonRpc, rpcIdJson)
-                                    .getBytes(StandardCharsets.UTF_8));
-                            pipedOut.flush();
-                        } catch (Exception e) {
-                            LOGGER.warn("Could not write SSE event for task {}: {}", taskId, e.getMessage());
-                        }
-                    };
-
-                    org.mule.extension.agent.composer.internal.model.AgentResponse result =
-                            engine.run(config, userMessage, contextId, 5, callback);
-
-                    if (isTaskCanceled(taskId)) {
-                        JsonObject canceledTask = getCanceledTask(taskId);
-                        if (canceledTask == null) {
-                            canceledTask = buildTask(taskId, contextId, "canceled", "Task canceled by client request.", null);
-                            persistTask(canceledTask);
-                        }
-                        pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "canceled",
-                                extractStatusMessage(canceledTask), true, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
-                        pipedOut.flush();
-                        return;
-                    }
-
-                    if (result.isRequiresInput()) {
-                        LOGGER.info("[SSE task {}] Agent requires input: {}", taskId, result.getInputRequest());
-                        JsonObject inputRequiredTask = buildTask(taskId, contextId, "input-required", result.getInputRequest(), null);
-                        persistTask(inputRequiredTask);
-                        pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "input-required",
-                                result.getInputRequest(), true, isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
-                        pipedOut.flush();
-                        return;
-                    }
-
-                    JsonObject completedTask = buildTask(taskId, contextId, "completed", null, result.getResponse());
-                    persistTask(completedTask);
-                    pipedOut.write(buildArtifactUpdateSseEvent(taskId, contextId, result.getResponse(), isJsonRpc, rpcIdJson)
-                            .getBytes(StandardCharsets.UTF_8));
-                    pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "completed", null, true, isJsonRpc, rpcIdJson)
-                            .getBytes(StandardCharsets.UTF_8));
-                    pipedOut.flush();
-                } catch (Exception e) {
-                    LOGGER.error("Streaming agent error for task {}: {}", taskId, e.getMessage(), e);
-                    try {
-                        JsonObject failedTask = buildTask(taskId, contextId, "failed",
-                                "Agent execution failed: " + e.getMessage(), null);
-                        persistTask(failedTask);
-                        pipedOut.write(buildStatusUpdateSseEvent(taskId, contextId, "failed",
-                                "Agent execution failed: " + e.getMessage(), true, isJsonRpc, rpcIdJson)
-                                .getBytes(StandardCharsets.UTF_8));
-                        pipedOut.flush();
-                    } catch (Exception ignored) {}
-                } finally {
-                    try { pipedOut.close(); } catch (Exception ignored) {}
-                }
-            }, "agent-sse-" + taskId);
-            thread.setDaemon(true);
-            thread.start();
 
             HttpResponse sseResponse = HttpResponse.builder()
                     .statusCode(200)
@@ -497,11 +584,77 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 @Override public void responseSendSuccessfully() { }
             });
 
+            SourceCallbackContext ctx = sourceCallback.createContext();
+            ctx.addVariable(SSE_OUTPUT_VAR, pipedOut);
+            ctx.addVariable(SSE_TERMINAL_SENT_VAR, new AtomicBoolean(false));
+            ctx.addVariable(REQUEST_VAR, requestId);
+            ctx.addVariable(TASK_ID_VAR, taskId);
+            ctx.addVariable(CONTEXT_ID_VAR, contextId);
+            ctx.addVariable(RPC_ID_VAR, rpcIdJson != null ? rpcIdJson : "null");
+            ctx.addVariable(IS_JSONRPC_VAR, isJsonRpc);
+            ctx.addVariable(IS_STREAMING_VAR, true);
+            sourceCallback.handle(
+                    Result.<String, AgentListenerAttributes>builder()
+                            .output(body)
+                            .attributes(attributes)
+                            .build(),
+                    ctx);
+
         } catch (Exception e) {
             LOGGER.error("Failed to set up SSE stream for task {}: {}", taskId, e.getMessage(), e);
-            JsonObject failedTask = buildTask(taskId, contextId, "failed", "Streaming setup failed: " + e.getMessage(), null);
+            JsonObject failedTask = buildTask(taskId, contextId, "failed", "Streaming setup failed: " + e.getMessage(), null, null);
             persistTask(failedTask);
             sendResponse(responseCallback, 200, wrapTaskResponse(failedTask, isJsonRpc, rpcIdJson));
+        }
+    }
+
+    private void completeStreamingSuccess(PipedOutputStream out, TypedValue<Object> payload,
+                                          String taskId, String contextId, String rpcIdJson,
+                                          boolean isJsonRpc) {
+        try {
+            JsonObject canceledTask = getCanceledTask(taskId);
+            if (canceledTask != null) {
+                writeAndCloseSse(out, buildStatusUpdateSseEvent(taskId, contextId, "canceled",
+                        extractStatusMessage(canceledTask), true, isJsonRpc, rpcIdJson), taskId);
+                return;
+            }
+
+            String rawPayload = stringifyPayload(payload);
+            JsonObject agentResponse = parseJsonObject(rawPayload);
+            if (isInputRequired(agentResponse)) {
+                String question = extractInputRequest(agentResponse, rawPayload);
+                JsonObject task = buildTask(taskId, contextId, "input-required", question, null, null);
+                addInputRequiredMetadata(task, agentResponse);
+                addTraceMetadata(task, agentResponse);
+                persistTask(task);
+                writeAndCloseSse(out, buildInputRequiredStatusUpdateSseEvent(taskId, contextId,
+                        question, agentResponse, isJsonRpc, rpcIdJson), taskId);
+                return;
+            }
+
+            String agentOutput = extractAgentOutput(rawPayload, agentResponse);
+            String uiHtml = extractFirstUiHtml(agentResponse);
+            JsonObject task = buildTask(taskId, contextId, "completed", null, agentOutput, uiHtml);
+            addTraceMetadata(task, agentResponse);
+            persistTask(task);
+            out.write(buildArtifactUpdateSseEvent(taskId, contextId, agentOutput, uiHtml,
+                    isJsonRpc, rpcIdJson).getBytes(StandardCharsets.UTF_8));
+            writeAndCloseSse(out, buildStatusUpdateSseEvent(taskId, contextId, "completed",
+                    null, true, isJsonRpc, rpcIdJson), taskId);
+        } catch (Exception e) {
+            LOGGER.warn("Could not complete SSE response for task {}: {}", taskId, e.getMessage(), e);
+            try { out.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private static void writeAndCloseSse(PipedOutputStream out, String event, String taskId) {
+        try {
+            out.write(event.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+        } catch (Exception e) {
+            LOGGER.warn("Could not write final SSE event for task {}: {}", taskId, e.getMessage());
+        } finally {
+            try { out.close(); } catch (Exception ignored) {}
         }
     }
 
@@ -600,30 +753,22 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     }
 
     /**
-     * Extracts the user message text from a JSON-RPC 2.0 or flat A2A request body.
-     * Checks {@code params.message.parts[0].text} first, then {@code message.parts[0].text},
-     * and falls back to the raw body string.
+     * Scans {@code agentResponse.toolCalls} for the first non-empty {@code uiHtml} value.
+     * Returns {@code null} when no tool in this response produced an MCP-UI HTML widget.
      */
-    private static String extractUserMessage(String body) {
-        try {
-            JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-            if (root.has("params") && root.get("params").isJsonObject()) {
-                JsonObject params = root.getAsJsonObject("params");
-                if (params.has("message") && params.get("message").isJsonObject()) {
-                    String text = firstTextPart(params.getAsJsonObject("message"));
-                    if (text != null) {
-                        return text;
-                    }
-                }
+    private static String extractFirstUiHtml(JsonObject agentResponse) {
+        if (agentResponse == null || !agentResponse.has("toolCalls")) return null;
+        JsonElement toolCallsEl = agentResponse.get("toolCalls");
+        if (!toolCallsEl.isJsonArray()) return null;
+        for (JsonElement el : toolCallsEl.getAsJsonArray()) {
+            if (!el.isJsonObject()) continue;
+            JsonObject record = el.getAsJsonObject();
+            if (record.has("uiHtml") && !record.get("uiHtml").isJsonNull()) {
+                String html = record.get("uiHtml").getAsString();
+                if (html != null && !html.isEmpty()) return html;
             }
-            if (root.has("message") && root.get("message").isJsonObject()) {
-                String text = firstTextPart(root.getAsJsonObject("message"));
-                if (text != null) {
-                    return text;
-                }
-            }
-        } catch (Exception ignored) {}
-        return body;
+        }
+        return null;
     }
 
     private static String firstTextPart(JsonObject message) {
@@ -654,20 +799,24 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return null;
     }
 
+    // Method names accept both the legacy 0.3.x slash-style ('message/stream') and the
+    // A2A 1.0 PascalCase style ('SendStreamingMessage') for the same operation.
     private static boolean isStreamingRequest(String methodName) {
-        return "message/stream".equals(methodName) || "tasks/sendSubscribe".equals(methodName);
+        return "message/stream".equals(methodName) || "tasks/sendSubscribe".equals(methodName)
+                || "SendStreamingMessage".equals(methodName) || "SubscribeToTask".equals(methodName);
     }
 
     private static boolean isTaskGetRequest(String methodName) {
-        return "tasks/get".equals(methodName);
+        return "tasks/get".equals(methodName) || "GetTask".equals(methodName);
     }
 
     private static boolean isTaskCancelRequest(String methodName) {
-        return "tasks/cancel".equals(methodName);
+        return "tasks/cancel".equals(methodName) || "CancelTask".equals(methodName);
     }
 
     private static boolean isMessageSendRequest(String methodName) {
-        return methodName == null || "message/send".equals(methodName) || "tasks/send".equals(methodName);
+        return methodName == null || "message/send".equals(methodName) || "tasks/send".equals(methodName)
+                || "SendMessage".equals(methodName);
     }
 
     private static String extractMessageTaskId(String body) {
@@ -770,19 +919,57 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return null;
     }
 
-    private static JsonObject buildTask(String taskId, String contextId, String state, String statusText, String artifactText) {
+    private static JsonObject buildTask(String taskId, String contextId, String state, String statusText, String artifactText, String artifactHtml) {
         String safeContextId = (contextId == null || contextId.trim().isEmpty()) ? taskId : contextId;
         JsonObject task = new JsonObject();
         task.addProperty("id", taskId);
         task.addProperty("contextId", safeContextId);
         task.add("status", buildStatus(state, statusText, taskId, safeContextId));
-        if (artifactText != null) {
+        if (artifactText != null || artifactHtml != null) {
             JsonArray artifacts = new JsonArray();
-            artifacts.add(buildArtifact(taskId, artifactText));
+            artifacts.add(buildArtifact(taskId, artifactText, artifactHtml));
             task.add("artifacts", artifacts);
         }
         task.addProperty("kind", "task");
         return task;
+    }
+
+    private static void addInputRequiredMetadata(JsonObject task, JsonObject agentResponse) {
+        if (task == null || agentResponse == null || !task.has("status")) return;
+        JsonObject status = task.getAsJsonObject("status");
+        if (!status.has("message")) return;
+        JsonObject message = status.getAsJsonObject("message");
+        JsonArray parts = message.getAsJsonArray("parts");
+        if (parts == null) {
+            parts = new JsonArray();
+            message.add("parts", parts);
+        }
+        JsonObject data = new JsonObject();
+        copyIfPresent(agentResponse, data, "inputKind");
+        copyIfPresent(agentResponse, data, "elicitationServerName");
+        copyIfPresent(agentResponse, data, "elicitationToolName");
+        copyIfPresent(agentResponse, data, "elicitationSchema");
+        copyIfPresent(agentResponse, data, "executionId");
+        copyIfPresent(agentResponse, data, "traceReportPath");
+        JsonObject part = new JsonObject();
+        part.addProperty("kind", "data");
+        part.add("data", data);
+        parts.add(part);
+    }
+
+    private static void addTraceMetadata(JsonObject task, JsonObject agentResponse) {
+        if (task == null || agentResponse == null) return;
+        JsonObject metadata = task.has("metadata") && task.get("metadata").isJsonObject()
+                ? task.getAsJsonObject("metadata") : new JsonObject();
+        copyIfPresent(agentResponse, metadata, "executionId");
+        copyIfPresent(agentResponse, metadata, "traceReportPath");
+        if (metadata.size() > 0) task.add("metadata", metadata);
+    }
+
+    private static void copyIfPresent(JsonObject source, JsonObject target, String field) {
+        if (source.has(field) && !source.get(field).isJsonNull()) {
+            target.add(field, source.get(field).deepCopy());
+        }
     }
 
     private static JsonObject buildStatus(String state, String text, String taskId, String contextId) {
@@ -808,12 +995,19 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return message;
     }
 
-    private static JsonObject buildArtifact(String taskId, String payload) {
+    private static JsonObject buildArtifact(String taskId, String payload, String uiHtml) {
         JsonObject artifact = new JsonObject();
         artifact.addProperty("artifactId", taskId + "-response");
         artifact.addProperty("name", "response");
         JsonArray parts = new JsonArray();
-        parts.add(buildPayloadPart(payload));
+        if (payload != null) {
+            parts.add(buildPayloadPart(payload));
+        }
+        if (uiHtml != null && !uiHtml.isEmpty()) {
+            // MCP Apps HTML widget — clients that understand text/html;profile=mcp-app
+            // should render this in a sandboxed iframe instead of displaying as text.
+            parts.add(buildTextPart(uiHtml, "text/html;profile=mcp-app"));
+        }
         artifact.add("parts", parts);
         return artifact;
     }
@@ -864,41 +1058,29 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return wrapSseData(update, isJsonRpc, rpcIdJson);
     }
 
+    private static String buildInputRequiredStatusUpdateSseEvent(
+            String taskId, String contextId, String text, JsonObject agentResponse,
+            boolean isJsonRpc, String rpcIdJson) {
+        JsonObject task = buildTask(taskId, contextId, "input-required", text, null, null);
+        addInputRequiredMetadata(task, agentResponse);
+        JsonObject update = new JsonObject();
+        update.addProperty("taskId", taskId);
+        update.addProperty("contextId", contextId);
+        update.addProperty("kind", "status-update");
+        update.add("status", task.getAsJsonObject("status"));
+        update.addProperty("final", true);
+        return wrapSseData(update, isJsonRpc, rpcIdJson);
+    }
+
     private static String buildArtifactUpdateSseEvent(String taskId, String contextId, String payload,
+                                                      String uiHtml,
                                                       boolean isJsonRpc, String rpcIdJson) {
         JsonObject update = new JsonObject();
         update.addProperty("taskId", taskId);
         update.addProperty("contextId", contextId);
         update.addProperty("kind", "artifact-update");
-        update.add("artifact", buildArtifact(taskId, payload));
+        update.add("artifact", buildArtifact(taskId, payload, uiHtml));
         update.addProperty("lastChunk", true);
-        return wrapSseData(update, isJsonRpc, rpcIdJson);
-    }
-
-    private static String buildWorkingSseEvent(String taskId, String contextId, String summary,
-                                               boolean isJsonRpc, String rpcIdJson) {
-        JsonObject update = new JsonObject();
-        update.addProperty("taskId", taskId);
-        update.addProperty("contextId", contextId);
-        update.addProperty("kind", "status-update");
-        update.addProperty("final", false);
-        JsonObject status = new JsonObject();
-        status.addProperty("state", "working");
-        status.addProperty("timestamp", nowUtc());
-        JsonObject message = new JsonObject();
-        message.addProperty("role", "agent");
-        message.addProperty("messageId", UUID.randomUUID().toString());
-        message.addProperty("taskId", taskId);
-        message.addProperty("contextId", contextId);
-        message.addProperty("kind", "message");
-        JsonArray parts = new JsonArray();
-        JsonObject part = new JsonObject();
-        part.addProperty("kind", "text");
-        part.addProperty("text", summary);
-        parts.add(part);
-        message.add("parts", parts);
-        status.add("message", message);
-        update.add("status", status);
         return wrapSseData(update, isJsonRpc, rpcIdJson);
     }
 
@@ -935,8 +1117,10 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             return;
         }
 
-        errorBody.addProperty("code", code);
-        errorBody.addProperty("error", message);
+        JsonObject error = new JsonObject();
+        error.addProperty("code", code);
+        error.addProperty("message", message);
+        errorBody.add("error", error);
         sendResponse(responseCallback, httpStatus, errorBody.toString());
     }
 
@@ -983,6 +1167,22 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 || "rejected".equals(state);
     }
 
+    /** Reads the {@code A2A-Version} header, falling back to the query parameter; empty/absent means 0.3. */
+    private static String resolveA2aVersion(org.mule.runtime.http.api.domain.message.request.HttpRequest request) {
+        String header = request.getHeaderValue("A2A-Version");
+        if (header != null && !header.trim().isEmpty()) {
+            return header.trim();
+        }
+        String queryParam = request.getQueryParams().get("A2A-Version");
+        return (queryParam != null && !queryParam.trim().isEmpty()) ? queryParam.trim() : "0.3";
+    }
+
+    /** Only Major.Minor is compared per spec \u00a73.6; patch versions (e.g. "1.0.0") are ignored. */
+    private static boolean isSupportedA2aVersion(String version) {
+        String majorMinor = version.length() > 3 ? version.substring(0, 3) : version;
+        return "0.3".equals(majorMinor) || "1.0".equals(majorMinor);
+    }
+
     private static String nowUtc() {
         return OffsetDateTime.now(ZoneOffset.UTC).toString();
     }
@@ -993,12 +1193,34 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         sendResponseBytes(responseCallback, statusCode, body.getBytes(StandardCharsets.UTF_8));
     }
 
+    private static void sendResponseWithContentType(
+            org.mule.runtime.http.api.server.async.HttpResponseReadyCallback responseCallback,
+            int statusCode, String body, String contentType) {
+        HttpResponse response = HttpResponse.builder()
+                .statusCode(statusCode)
+                .addHeader("Content-Type", contentType)
+                .entity(new ByteArrayHttpEntity(body.getBytes(StandardCharsets.UTF_8)))
+                .build();
+        responseCallback.responseReady(response, new org.mule.runtime.http.api.server.async.ResponseStatusCallback() {
+            @Override public void responseSendSuccessfully() {}
+            @Override public void responseSendFailure(Throwable throwable) {
+                LOGGER.warn("Could not send HTTP response: {}", throwable.getMessage());
+            }
+        });
+    }
+
     private static void sendResponseBytes(
             org.mule.runtime.http.api.server.async.HttpResponseReadyCallback responseCallback,
             int statusCode, byte[] bytes) {
+        sendResponseBytes(responseCallback, statusCode, bytes, "application/json");
+    }
+
+    private static void sendResponseBytes(
+            org.mule.runtime.http.api.server.async.HttpResponseReadyCallback responseCallback,
+            int statusCode, byte[] bytes, String contentType) {
         HttpResponse response = HttpResponse.builder()
                 .statusCode(statusCode)
-                .addHeader("Content-Type", "application/json")
+                .addHeader("Content-Type", contentType)
                 .entity(new ByteArrayHttpEntity(bytes))
                 .build();
         responseCallback.responseReady(response, new org.mule.runtime.http.api.server.async.ResponseStatusCallback() {

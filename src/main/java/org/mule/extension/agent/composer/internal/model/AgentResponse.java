@@ -27,6 +27,18 @@ public class AgentResponse {
     private boolean requiresInput;
     /** The clarifying question the agent wants answered before it can continue. */
     private String inputRequest;
+    /** Distinguishes why input is required: {@code "clarification"} (LLM-initiated) or {@code "elicitation"} (MCP server-initiated, mid-tool-call). */
+    private String inputKind;
+    /** JSON Schema describing the structured answer expected, populated only for {@code inputKind == "elicitation"}. */
+    private Map<String, Object> elicitationSchema;
+    /** MCP server that requested the current elicitation. */
+    private String elicitationServerName;
+    /** MCP tool whose execution is paused. */
+    private String elicitationToolName;
+    /** Unique identifier for the execution trace produced by this invocation. */
+    private String executionId;
+    /** Relative HTTP path for the live HTML execution report. */
+    private String traceReportPath;
 
     public AgentResponse() {}
 
@@ -55,6 +67,12 @@ public class AgentResponse {
     public List<ToolCallRecord> getToolCalls() { return toolCalls; }
     public boolean isRequiresInput() { return requiresInput; }
     public String getInputRequest() { return inputRequest; }
+    public String getInputKind() { return inputKind; }
+    public Map<String, Object> getElicitationSchema() { return elicitationSchema; }
+    public String getElicitationServerName() { return elicitationServerName; }
+    public String getElicitationToolName() { return elicitationToolName; }
+    public String getExecutionId() { return executionId; }
+    public String getTraceReportPath() { return traceReportPath; }
 
     // Setters
     public void setUserTask(String userTask) { this.userTask = userTask; }
@@ -71,9 +89,23 @@ public class AgentResponse {
     public void setToolCalls(List<ToolCallRecord> toolCalls) { this.toolCalls = toolCalls; }
     public void setRequiresInput(boolean requiresInput) { this.requiresInput = requiresInput; }
     public void setInputRequest(String inputRequest) { this.inputRequest = inputRequest; }
+    public void setInputKind(String inputKind) { this.inputKind = inputKind; }
+    public void setElicitationSchema(Map<String, Object> elicitationSchema) { this.elicitationSchema = elicitationSchema; }
+    public void setElicitationServerName(String elicitationServerName) { this.elicitationServerName = elicitationServerName; }
+    public void setElicitationToolName(String elicitationToolName) { this.elicitationToolName = elicitationToolName; }
+    public void setExecutionId(String executionId) { this.executionId = executionId; }
+    public void setTraceReportPath(String traceReportPath) { this.traceReportPath = traceReportPath; }
 
     public void addToolCall(ToolCallRecord record) {
         this.toolCalls.add(record);
+    }
+
+    /** Returns the HTML of the first tool call that produced an MCP-UI widget, or {@code null}. */
+    public String getFirstUiHtml() {
+        for (ToolCallRecord r : toolCalls) {
+            if (r.getUiHtml() != null && !r.getUiHtml().isEmpty()) return r.getUiHtml();
+        }
+        return null;
     }
 
     public String toJson() {
@@ -89,6 +121,10 @@ public class AgentResponse {
         private Map<String, Object> toolRequest;
         private String toolResponse;
         private int iterationNumber;
+        /** URI of the MCP-UI resource returned by this tool call, if any (e.g. {@code ui://...}). */
+        private String uiResourceUri;
+        /** Rendered HTML of the MCP-UI resource associated with this tool call, if any. */
+        private String uiHtml;
 
         public ToolCallRecord(String mcpClientName, String toolName, 
                             Map<String, Object> toolRequest, String toolResponse,
@@ -106,5 +142,11 @@ public class AgentResponse {
         public Map<String, Object> getToolRequest() { return toolRequest; }
         public String getToolResponse() { return toolResponse; }
         public int getIterationNumber() { return iterationNumber; }
+        public String getUiResourceUri() { return uiResourceUri; }
+        public String getUiHtml() { return uiHtml; }
+
+        // Setters
+        public void setUiResourceUri(String uiResourceUri) { this.uiResourceUri = uiResourceUri; }
+        public void setUiHtml(String uiHtml) { this.uiHtml = uiHtml; }
     }
 }

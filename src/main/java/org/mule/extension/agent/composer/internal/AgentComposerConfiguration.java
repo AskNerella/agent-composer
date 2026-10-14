@@ -1,24 +1,23 @@
 package org.mule.extension.agent.composer.internal;
 
 import org.mule.extension.agent.composer.internal.configs.AgentSkillConfig;
+import org.mule.extension.agent.composer.internal.configs.CustomHttpHeader;
+import org.mule.extension.agent.composer.internal.configs.LlmProviderConfig;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 import org.mule.extension.agent.composer.internal.operations.AgentComposerOperations;
 import org.mule.extension.agent.composer.internal.source.AgentListenerSource;
-import org.mule.extension.agent.composer.internal.values.HttpListenerConfigValueProvider;
-import org.mule.extension.agent.composer.internal.values.ModelNameValueProvider;
 import org.mule.runtime.api.meta.ExpressionSupport;
 import org.mule.runtime.extension.api.annotation.Expression;
 import org.mule.runtime.extension.api.annotation.param.Optional;
 import org.mule.runtime.extension.api.annotation.param.display.DisplayName;
-import org.mule.runtime.extension.api.annotation.param.display.Password;
 import org.mule.runtime.extension.api.annotation.param.display.Placement;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
 import org.mule.runtime.extension.api.annotation.param.display.Text;
-import org.mule.runtime.extension.api.annotation.values.OfValues;
 import org.mule.sdk.api.annotation.Operations;
 import org.mule.sdk.api.annotation.connectivity.ConnectionProviders;
 import org.mule.sdk.api.annotation.param.Parameter;
+import org.mule.sdk.api.annotation.param.reference.ConfigReference;
 import org.mule.sdk.api.annotation.param.reference.ObjectStoreReference;
 
 import java.util.List;
@@ -32,72 +31,62 @@ public class AgentComposerConfiguration {
 
   @Parameter
   @DisplayName("LLM Provider")
-  @Expression(ExpressionSupport.SUPPORTED)
-  @Summary("Inference provider: OPENAI or ANTHROPIC.")
-  @Optional(defaultValue = "OPENAI")
+  @Summary("Select OpenAI, Anthropic, or a custom OpenAI Responses-compatible endpoint. Only relevant fields are displayed.")
   @Placement(order = 1)
+  private LlmProviderConfig llmProvider;
+
+  // Backward-compatible fallbacks for existing runtime tests and programmatic configuration.
+  // These fields are intentionally not SDK parameters; Studio renders only the selected subtype.
   private LlmProvider provider;
-
-  @Parameter
-  @DisplayName("Model Name")
-  @Expression(ExpressionSupport.SUPPORTED)
-  @Summary("Model identifier, e.g. gpt-4o, claude-3-5-sonnet-20241022.")
-  @OfValues(ModelNameValueProvider.class)
-  @Optional(defaultValue = "gpt-4o")
-  @Placement(order = 2)
   private String modelName;
-
-  @Parameter
-  @DisplayName("Anthropic API Version")
-  @Summary("Anthropic-Version header value (only used when provider is ANTHROPIC).")
-  @Optional(defaultValue = "2023-06-01")
-  @Placement(order = 3)
   private String anthropicVersion;
-
-  @Parameter
-  @DisplayName("API Key")
-  @Password
-  @Expression(ExpressionSupport.SUPPORTED)
-  @Summary("API key for the configured LLM provider.")
-  @Optional
-  @Placement(order = 4)
   private String apiKey;
+  private String customLlmEndpointUrl;
+  private List<CustomHttpHeader> customLlmHeaders;
 
   @Parameter
   @DisplayName("Max Output Tokens")
   @Expression(ExpressionSupport.SUPPORTED)
   @Optional(defaultValue = "1000")
-  @Placement(order = 5)
+  @Placement(order = 7)
   private int maxTokens;
 
   @Parameter
   @DisplayName("Temperature")
   @Summary("Sampling temperature (0–2). Higher values = more random outputs.")
-  @Optional(defaultValue = "0.7")
-  @Placement(order = 6)
+  @Optional(defaultValue = "1.0")
+  @Placement(order = 8)
   private double temperature;
 
   @Parameter
   @DisplayName("HTTP Listener Config")
+  @Expression(ExpressionSupport.NOT_SUPPORTED)
   @Summary("Select the <http:listener-config> global element this agent attaches to.")
-  @OfValues(HttpListenerConfigValueProvider.class)
+  @ConfigReference(namespace = "HTTP", name = "LISTENER_CONFIG")
   @Optional(defaultValue = "HTTP_Listener_config")
-  @Placement(order = 7)
+  @Placement(order = 9)
   private String httpListenerConfig;
 
   @Parameter
   @DisplayName("Agent Path")
   @Summary("HTTP path where A2A task POST requests arrive (e.g. /agent).")
   @Optional(defaultValue = "/agent")
-  @Placement(order = 8)
+  @Placement(order = 10)
   private String agentPath;
 
   @Parameter
   @DisplayName("Request Timeout (seconds)")
   @Summary("Seconds to wait for the Mule flow to produce a response before returning HTTP 504.")
   @Optional(defaultValue = "300")
-  @Placement(order = 9)
+  @Placement(order = 11)
   private int requestTimeoutSeconds;
+
+  @Parameter
+  @DisplayName("Traces Path")
+  @Summary("HTTP path for the execution trace console.")
+  @Optional(defaultValue = "/agent/traces")
+  @Placement(order = 12)
+  private String tracesPath;
   // ── Agent ─────────────────────────────────────────────────────────────────
 
   @Parameter
@@ -122,6 +111,13 @@ public class AgentComposerConfiguration {
   @Optional(defaultValue = "_defaultPersistentObjectStore")
   @Placement(tab = "Agent", order = 3)
   private String objectStore;
+
+  @Parameter
+  @DisplayName("Remember Conversation")
+  @Summary("Persist and reuse conversation history and solved responses. Disabled by default so each invocation starts fresh. MCP elicitation continuation state is still persisted while a call is paused.")
+  @Optional(defaultValue = "false")
+  @Placement(tab = "Agent", order = 4)
+  private boolean rememberConversation;
 
   // ── Agent Card ────────────────────────────────────────────────────────────
 
@@ -157,27 +153,32 @@ public class AgentComposerConfiguration {
   @DisplayName("Include MCP Tools as Skills")
   @Summary("When enabled, each MCP tool is advertised as an individual skill in the A2A agent card. "
           + "Disable to hide raw MCP tools from the card (e.g. when you have higher-level Skills configured).")
-  @Optional(defaultValue = "true")
+  @Optional(defaultValue = "false")
   @Placement(tab = "Agent Card", order = 5)
   private boolean includeMcpToolsAsSkills;
 
   // ── Getters ───────────────────────────────────────────────────────────────
 
-  public LlmProvider getProvider()            { return provider; }
-  public String getModelName()                { return modelName; }
-  public String getApiKey()                   { return apiKey; }
+  public LlmProvider getProvider()            { return llmProvider != null ? llmProvider.getProvider() : provider; }
+  public String getModelName()                { return llmProvider != null ? llmProvider.getModelName() : modelName != null ? modelName : "gpt-4o"; }
+  public String getApiKey()                   { return llmProvider != null ? llmProvider.getApiKey() : apiKey; }
+  public String getCustomLlmEndpointUrl()     { return llmProvider != null ? llmProvider.getCustomLlmEndpointUrl() : customLlmEndpointUrl; }
+  public List<CustomHttpHeader> getCustomLlmHeaders() { return llmProvider != null ? llmProvider.getCustomLlmHeaders() : customLlmHeaders; }
   public int getMaxTokens()                   { return maxTokens; }
   public double getTemperature()              { return temperature; }
-  public String getAnthropicVersion()         { return anthropicVersion; }
+  public String getAnthropicVersion()         { return llmProvider != null ? llmProvider.getAnthropicVersion() : anthropicVersion != null ? anthropicVersion : "2023-06-01"; }
   public String getInstructions()             { return instructions; }
   public List<McpServerConfig> getMcpServers(){ return mcpServers; }
   public String getObjectStore()              { return objectStore; }
   public String getHttpListenerConfig()       { return httpListenerConfig; }
   public String getAgentPath()                { return agentPath; }
   public int getRequestTimeoutSeconds()       { return requestTimeoutSeconds; }
+  public String getTracesPath()               { return tracesPath == null || tracesPath.isBlank() ? "/agent/traces" : tracesPath; }
   public String getAgentName()                { return agentName; }
   public String getAgentDescription()         { return agentDescription; }
   public String getAgentVersion()             { return agentVersion; }
   public List<AgentSkillConfig> getSkills()   { return skills; }
   public boolean isIncludeMcpToolsAsSkills()  { return includeMcpToolsAsSkills; }
+  public boolean isRememberConversation()     { return rememberConversation; }
+  public LlmProviderConfig getLlmProvider()   { return llmProvider; }
 }

@@ -9,6 +9,10 @@ import org.mule.extension.agent.composer.internal.llm.LlmClientFactory;
 import org.mule.extension.agent.composer.internal.model.AgentResponse;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionTrace;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionTraceStore;
+import org.mule.extension.agent.composer.internal.tracing.TraceHtmlRenderer;
+import org.mule.extension.agent.composer.internal.tracing.TraceRedactor;
 import org.mule.runtime.api.store.ObjectStoreManager;
 import org.mule.runtime.extension.api.annotation.metadata.fixed.OutputJsonType;
 import org.mule.runtime.extension.api.annotation.param.Optional;
@@ -24,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import javax.inject.Inject;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.mule.sdk.api.annotation.param.MediaType.APPLICATION_JSON;
@@ -64,9 +69,66 @@ public class AgentComposerOperations {
             @Optional(defaultValue = "5")
             Integer maxIterations) throws Exception {
 
+        int effectiveMaxIterations = maxIterations != null ? maxIterations : DEFAULT_MAX_ITERATIONS;
+        LOGGER.info("Execute Agent starting | conversationId='{}' maxIterations={}",
+                conversationId, effectiveMaxIterations);
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        AgentResponse response = engine.run(config, userMessage, conversationId, maxIterations);
+        AgentResponse response = engine.run(config, userMessage, conversationId, effectiveMaxIterations);
         return GSON.toJson(response);
+    }
+
+    // ── Execution Traces ─────────────────────────────────────────────────────
+
+    /** Returns the redacted structured trace for an execution. */
+    @DisplayName("Retrieve Execution Trace")
+    @MediaType(value = APPLICATION_JSON, strict = false)
+    @Throws(AgentComposerErrorTypeProvider.class)
+    public String retrieveExecutionTrace(
+            @Config AgentComposerConfiguration config,
+
+            @DisplayName("Execution ID")
+            @Summary("Execution identifier returned by Execute Agent or an A2A task.")
+            String executionId) {
+        ExecutionTrace trace = ExecutionTraceStore.get(executionId,
+                objectStoreManager, config.getObjectStore());
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("found", trace != null);
+        result.put("executionId", executionId);
+        result.put("trace", trace);
+        return TraceRedactor.toRedactedJson(result);
+    }
+
+    /** Lists recent live and persisted execution traces, newest first. */
+    @DisplayName("List Execution Traces")
+    @MediaType(value = APPLICATION_JSON, strict = false)
+    @Throws(AgentComposerErrorTypeProvider.class)
+    public String listExecutionTraces(
+            @Config AgentComposerConfiguration config,
+
+            @DisplayName("Max Results")
+            @Summary("Maximum number of recent traces to return (1-200).")
+            @Optional(defaultValue = "50")
+            Integer maxResults) {
+        List<ExecutionTrace> traces = ExecutionTraceStore.list(objectStoreManager,
+                config.getObjectStore(), maxResults != null ? maxResults : 50);
+        return TraceRedactor.toRedactedJson(traces);
+    }
+
+    /** Renders the interactive, auto-refreshing HTML timeline for an execution. */
+    @DisplayName("Render Execution Trace Report")
+    @MediaType(value = "text/html", strict = false)
+    @Throws(AgentComposerErrorTypeProvider.class)
+    public String renderExecutionTraceReport(
+            @Config AgentComposerConfiguration config,
+
+            @DisplayName("Execution ID")
+            @Summary("Execution identifier returned by Execute Agent or an A2A task.")
+            String executionId) {
+        ExecutionTrace trace = ExecutionTraceStore.get(executionId,
+                objectStoreManager, config.getObjectStore());
+        String tracesPath = config.getTracesPath();
+        if (!tracesPath.startsWith("/")) tracesPath = "/" + tracesPath;
+        return TraceHtmlRenderer.render(trace, tracesPath);
     }
 
     // ── Evaluate Agent ────────────────────────────────────────────────────────
