@@ -8,7 +8,7 @@ Agent Composer is a Mule SDK connector for building ReAct agents without custom 
 <dependency>
   <groupId>com.k2</groupId>
   <artifactId>agent-composer</artifactId>
-  <version>1.1.14-SNAPSHOT</version>
+  <version>1.1.0</version>
   <classifier>mule-plugin</classifier>
 </dependency>
 ```
@@ -70,7 +70,7 @@ The **Max Iterations** value on Execute Agent is the authoritative outer-loop li
 
 ## Trace Report
 
-Agent Composer records each agent run as a redacted execution trace. The report is available from the configured **Traces Path**, which defaults to:
+Agent Composer records each agent run as a execution trace. The report is available from the configured **Traces Path**, which defaults to:
 
 ```text
 http://<host>:<listener-port>/agent/traces
@@ -78,7 +78,11 @@ http://<host>:<listener-port>/agent/traces
 
 The trace index lists recent executions. Select an execution to inspect its ReAct flow, iteration and tool-call waterfall, span table, request and response data, errors, timing, token metrics, and connected MCP server/tool inventory. Selecting a span opens its details in the fixed right-hand drawer without changing the height of the timeline.
 
-The report supports light and dark themes and provides compact actions for refreshing and exporting redacted JSON. While an execution is running, **Stop Task** requests a best-effort in-process cancellation. Cancellation cannot reverse external tool side effects that have already completed.
+![Agent Composer configurable trace report](docs/agent-composer-trace-ui.png)
+
+The tracing UI is configurable through the Agent Composer global configuration. Set **Traces Path** to host it at the route appropriate for the application; the default is `/agent/traces`. Users can switch between light and dark themes from the report, and the selected appearance is retained in the browser. The UI also provides compact actions for refreshing and exporting redacted JSON.
+
+While an execution is running, **Stop Task** requests a best-effort in-process cancellation. Cancellation cannot reverse external tool side effects that have already completed.
 
 Trace HTTP endpoints:
 
