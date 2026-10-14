@@ -1,157 +1,112 @@
-# Agent Composer
+# Agent Composer for Mule 4
 
-A Mule 4 custom connector that bundles ReAct (Reason + Act) engine, OpenAI / Anthropic LLM support, MCP tool integration, and persistent conversation memory — all configurable from Anypoint Studio with no custom Java code required.
+Agent Composer is a Mule SDK connector for building ReAct agents without custom Java orchestration. It combines OpenAI, Anthropic, or a custom OpenAI Responses-compatible endpoint with MCP tools, skills, optional conversation memory, A2A HTTP endpoints, MCP Apps UI resources, and execution traces.
 
----
-
-## Installation
-
-Add this dependency to your application `pom.xml`:
+## Current version
 
 ```xml
 <dependency>
-    <groupId>com.k2</groupId>
-    <artifactId>agent-composer</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
-    <classifier>mule-plugin</classifier>
+  <groupId>com.k2</groupId>
+  <artifactId>agent-composer</artifactId>
+  <version>1.1.14-SNAPSHOT</version>
+  <classifier>mule-plugin</classifier>
 </dependency>
 ```
 
----
+Java 17 and Mule 4 are required.
 
-## What It Does
+## Quick start
 
-| Capability | Description |
-|---|---|
-| **ReAct Agent Loop** | Iterative Reason → Act → Observe cycle powered by any supported LLM |
-| **MCP Tool Integration** | Connects to one or more MCP servers; tools are automatically discovered and made available to the LLM |
-| **A2A Server** | Built-in HTTP listener exposes the agent as an A2A-compliant endpoint, serving an agent card and accepting task requests |
-| **Conversation Memory** | Persists turn-by-turn history in a Mule Object Store; supports multi-turn sessions via Conversation ID |
-| **MCP Form Elicitation** | Pauses direct tools or nested skills for schema-driven user input and durably resumes them with the same Conversation ID |
-| **Response Caching** | Identical requests reuse cached responses, avoiding redundant LLM calls |
-| **Agent Evaluation** | Built-in LLM-based evaluator scores agent responses (verdict, score, confidence, improvements) |
+```xml
+<agent-composer:config name="Agent_Composer">
+  <agent-composer:llm-provider>
+    <agent-composer:open-ai modelName="gpt-4o" apiKey="${OPENAI_API_KEY}" />
+  </agent-composer:llm-provider>
+</agent-composer:config>
 
----
-
-## Configuration
-
-All settings live on the global **Agent Composer Config** element in Anypoint Studio.
-
-### General Tab
-
-| Field | Default | Description |
-|---|---|---|
-| LLM Provider | `OPENAI` | Inference provider — `OPENAI` or `ANTHROPIC` |
-| Model Name | `gpt-4o` | Model identifier (dropdown populated from the selected provider) |
-| API Key | — | Provider API key (stored as a secure password field) |
-| Max Output Tokens | `1000` | Maximum tokens in each LLM response |
-| Temperature | `0.7` | Sampling temperature (0–2) |
-| HTTP Listener Config | `HTTP_Listener_config` | The `<http:listener-config>` this agent attaches to for A2A traffic |
-| Agent Path | `/agent` | HTTP path for A2A task `POST` requests |
-| Request Timeout (seconds) | `120` | How long to wait for a flow response before timing out |
-
-### Agent Tab
-
-| Field | Description |
-|---|---|
-| Instructions | System prompt / persona prepended to every LLM call |
-| MCP Servers | List of MCP server endpoints (name, URL, optional auth token, optional tool whitelist) |
-| Memory (Object Store) | Mule Object Store for conversation history and response cache |
-
-
-### Agent Card Tab
-
-| Field | Default | Description |
-|---|---|---|
-| Agent Name | `Agent Composer` | Display name advertised in the A2A agent card |
-| Agent Description | — | Short description in the A2A agent card |
-| Agent Version | `1.0.0` | Version string in the A2A agent card |
-
----
-
-## Operations
-
-### Execute Agent
-Runs the ReAct loop and returns a structured JSON response with the final answer and execution metrics.
-
-| Parameter | Default | Description |
-|---|---|---|
-| User Message | `#[payload]` | The user's input for this turn |
-| Conversation ID | `#[correlationId]` | Key scoping this conversation in the Object Store; A2A `message.contextId` is used automatically when present |
-| Max Iterations | `5` | Hard cap on Reason-Act cycles |
-
-**Typical flow:**
-
-![Agent Composer](docs/image.png)
-
----
-
-### Memory Operations
-
-| Operation | Description |
-|---|---|
-| **Reset Memory** | Clears all entries from the Object Store |
-| **Check Memory** | Searches past solved conversations for matches to a user task |
-| **Retrieve Conversation** | Returns full history and tool call records for a given Session ID |
-| **Delete Conversation** | Removes a conversation by Session ID, user task text, or both |
-
----
-
-## Agent Listener (Source / Trigger)
-
-The **Agent Listener** source appears in the Anypoint Studio palette under **Triggers**. It attaches to an existing `<http:listener-config>` and automatically registers two HTTP endpoints:
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/.well-known/agent-card.json` | `GET` | Serves the A2A 0.3.0 agent card |
-| `{agentPath}/.well-known/agent-card.json` | `GET` | Scoped alias for environments where the root well-known path is not exposed through the listener |
-| `{agentPath}/.well-known/agent.json` | `GET` | Legacy compatibility alias |
-| `{agentPath}` | `POST` | Receives A2A JSON-RPC calls such as `message/send`, `message/stream`, `tasks/get`, and `tasks/cancel` |
-
-Completed responses are returned in the **A2A 0.3.0 Task response structure**, with the agent payload in `artifacts` so A2A clients surface it under the response/output area instead of the general status area:
-
-```json
-{
-  "id": "<taskId>",
-  "contextId": "<contextId>",
-  "status": {
-    "state": "completed"
-  },
-  "artifacts": [
-    {
-      "artifactId": "<taskId>-response",
-      "parts": [{ "kind": "text", "text": "<agent output>" }]
-    }
-  ],
-  "kind": "task"
-}
+<flow name="agent-flow">
+  <agent-composer:agent-listener config-ref="Agent_Composer" />
+  <agent-composer:execute-agent config-ref="Agent_Composer" maxIterations="10" />
+</flow>
 ```
 
-`input-required`, `failed`, and `canceled` states still use `status.message` for the human-readable update.
+Conversation memory is disabled by default. Enable **Remember Conversation** when turns with the same conversation ID should share history and solved-response cache entries.
 
-When `Execute Agent` is invoked directly after `Agent Listener`, leave `User Message`, `Conversation ID`, and `Max Iterations` at their defaults unless you want to override them.
-The operation unwraps A2A request bodies automatically, using `message.parts[].text` as the user input, `message.contextId` as the conversation key, and the operation-level `Max Iterations` value for the React loop.
+## ReAct engine
 
----
+```mermaid
+flowchart LR
+    U[User message] --> M{Remember conversation?}
+    M -->|Yes| H[Load Object Store history]
+    M -->|No| D[Start fresh]
+    H --> L
+    D --> L[LLM plans]
+    L -->|Final answer| A[Return response]
+    L -->|Tool or skill call| T[Execute MCP tool or skill]
+    T -->|Result| O[Add observation]
+    O --> L
+```
 
-## MCP Server Configuration
+The **Max Iterations** value on Execute Agent is the authoritative outer-loop limit.
 
-Each MCP server entry supports:
+## Capabilities
 
-| Field | Description |
-|---|---|
-| Client Name | Logical name for this server (e.g. `weather-service`) |
-| Server URL | JSON-RPC 2.0 endpoint |
-| Auth Token | Optional Bearer token |
-| Tool Filter (Whitelist) | Comma-separated list of tool names to expose; leave empty to allow all |
+- Provider-specific OpenAI, Anthropic, and Custom LLM configuration.
+- Direct MCP tools and higher-level agent skills.
+- MCP Streamable HTTP tools and MCP Apps UI resources.
+- A2A 0.3 and 1.0 JSON-RPC endpoints, including streaming.
+- Opt-in Object Store conversation history and solved-response caching.
+- Redacted traces with Mermaid flow, waterfall, span table, MCP inventory, metrics, and a running-task stop control.
+- Configurable agent and trace paths.
 
----
+## Documentation
 
-## Error Types
+- [Global configuration and LLM providers](docs/configuration.md)
+- [Operations](docs/operation-reference/index.md)
+- [Agent Listener and trace console](docs/agent-listener.md)
+- [A2A support matrix](docs/a2a-support.md)
+- [MCP and MCP Apps](docs/mcp-support.md)
+- [ReAct runtime behavior](docs/react-engine.md)
 
-| Error | Description |
-|---|---|
-| `AGENT-COMPOSER:UNABLE_TO_FETCH_TOOLS` | Could not connect to or list tools from an MCP server |
-| `AGENT-COMPOSER:AGENT_LISTENER_ERROR` | Failure during Agent Listener startup or request handling |
+## Trace Report
 
-Both extend `MULE:CONNECTIVITY`.
+Agent Composer records each agent run as a redacted execution trace. The report is available from the configured **Traces Path**, which defaults to:
+
+```text
+http://<host>:<listener-port>/agent/traces
+```
+
+The trace index lists recent executions. Select an execution to inspect its ReAct flow, iteration and tool-call waterfall, span table, request and response data, errors, timing, token metrics, and connected MCP server/tool inventory. Selecting a span opens its details in the fixed right-hand drawer without changing the height of the timeline.
+
+The report supports light and dark themes and provides compact actions for refreshing and exporting redacted JSON. While an execution is running, **Stop Task** requests a best-effort in-process cancellation. Cancellation cannot reverse external tool side effects that have already completed.
+
+Trace HTTP endpoints:
+
+| Method | Endpoint | Result |
+|---|---|---|
+| `GET` | `{tracesPath}` | Recent trace index. |
+| `GET` | `{tracesPath}?executionId=<id>` | Interactive report for one execution. |
+| `GET` | `{tracesPath}?executionId=<id>&format=json` | Redacted trace JSON. |
+| `POST` | `{tracesPath}?executionId=<id>&action=cancel` | Requests cancellation of a running execution. |
+
+Execute Agent responses include `executionId` and `traceReportPath`, so applications can link directly to the relevant report. Configure a different route with **Traces Path** in the Agent Composer global configuration. See [Agent Listener and traces](docs/agent-listener.md) and [Trace operations](docs/operation-reference/traces.md) for the complete contract.
+
+## Defaults
+
+| Setting | Default |
+|---|---:|
+| Temperature | `1.0` |
+| Max output tokens | `1000` |
+| Execute Agent max iterations | `5` |
+| Remember conversation | `false` |
+| Include MCP tools as skills | `false` |
+| MCP retry count | `0` |
+| Agent path | `/agent` |
+| Traces path | `/agent/traces` |
+
+## Security
+
+- Use secure properties for API keys, bearer tokens, and custom headers.
+- Trace data is redacted for common credential fields and bearer tokens, but applications should still avoid putting secrets into prompts.
+- Stop Task interrupts work in the current Mule runtime; it cannot revoke side effects already committed by an external MCP tool.
+- Use HTTPS and authentication in front of Agent Listener and trace endpoints in deployed environments.

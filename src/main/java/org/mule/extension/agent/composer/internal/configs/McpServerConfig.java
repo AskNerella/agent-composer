@@ -14,7 +14,7 @@ import java.util.stream.Collectors;
 
 public class McpServerConfig {
     @Parameter
-    @DisplayName("Client Name")
+    @DisplayName("Name")
     @Summary("Logical name used to identify this MCP client (e.g. 'weather-service').")
     @Placement(order = 1)
     private String name;

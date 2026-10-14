@@ -19,6 +19,7 @@ public final class ExecutionTraceContext {
     public static final String STATUS_COMPLETED = "COMPLETED";
     public static final String STATUS_INPUT_REQUIRED = "INPUT_REQUIRED";
     public static final String STATUS_FAILED = "FAILED";
+    public static final String STATUS_CANCELED = "CANCELED";
 
     private final ExecutionTrace trace;
     private final ObjectStore<Serializable> store;

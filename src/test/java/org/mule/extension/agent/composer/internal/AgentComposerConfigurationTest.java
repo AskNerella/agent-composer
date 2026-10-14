@@ -29,6 +29,8 @@ public class AgentComposerConfigurationTest {
 
         assertEquals("1.0", optionalDefault("temperature"));
         assertEquals("false", optionalDefault("includeMcpToolsAsSkills"));
+        assertEquals("false", optionalDefault("rememberConversation"));
+        assertEquals("/agent/traces", optionalDefault("tracesPath"));
 
         assertNull(field("provider").getAnnotation(Parameter.class));
         assertNull(field("modelName").getAnnotation(Parameter.class));

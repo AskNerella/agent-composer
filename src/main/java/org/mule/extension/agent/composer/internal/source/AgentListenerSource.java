@@ -21,6 +21,7 @@ import org.mule.runtime.http.api.server.RequestHandlerManager;
 import org.mule.runtime.http.api.server.async.HttpResponseReadyCallback;
 import org.mule.extension.agent.composer.internal.tracing.ExecutionTrace;
 import org.mule.extension.agent.composer.internal.tracing.ExecutionTraceStore;
+import org.mule.extension.agent.composer.internal.tracing.ExecutionCancellationRegistry;
 import org.mule.extension.agent.composer.internal.tracing.TraceHtmlRenderer;
 import org.mule.extension.agent.composer.internal.tracing.TraceRedactor;
 import org.mule.runtime.api.message.Error;
@@ -126,15 +127,19 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
+        String normalizedTracePath = config.getTracesPath().startsWith("/")
+                ? config.getTracesPath() : "/" + config.getTracesPath();
 
         // ── GET {agentPath}/.well-known/agent-card.json  +  {agentPath}/.well-known/agent.json ──
         String scopedCardPath = normalizedPath + CARD_SUFFIX;
         String legacyCardPath = normalizedPath + LEGACY_CARD_SUFFIX;
         cardHandlerManager = addCardHandler(scopedCardPath, cardBytes);
         scopedCardHandlerManager = addCardHandler(legacyCardPath, cardBytes);
-        traceReportHandlerManager = addTraceReportHandler(normalizedPath + "/traces");
+        traceReportHandlerManager = addTraceReportHandler(normalizedTracePath);
+        int traceSlash = normalizedTracePath.lastIndexOf('/');
+        String traceBasePath = traceSlash > 0 ? normalizedTracePath.substring(0, traceSlash) : "";
         brandAssetHandlerManager = addStaticAssetHandler(
-                normalizedPath + "/assets/agent-composer.svg", loadBrandLogo(), "image/svg+xml; charset=UTF-8");
+                traceBasePath + "/assets/agent-composer.svg", loadBrandLogo(), "image/svg+xml; charset=UTF-8");
 
         // ── POST {agentPath} ─────────────────────────────────────────────────
         agentHandlerManager = httpServer.addRequestHandler(normalizedPath, (requestCtx, responseCallback) -> {
@@ -251,8 +256,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             }
         });
 
-        LOGGER.info("Agent Listener attached to HTTP Listener Config '{}' | path={} card={}",
-                configName, normalizedPath, scopedCardPath);
+        LOGGER.info("Agent Listener attached to HTTP Listener Config '{}' | path={} card={} traces={}",
+                configName, normalizedPath, scopedCardPath, normalizedTracePath);
     }
 
     @Override
@@ -433,11 +438,20 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
     private RequestHandlerManager addTraceReportHandler(String path) {
         return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
-            if (!"GET".equalsIgnoreCase(requestCtx.getRequest().getMethod())) {
+            String method = requestCtx.getRequest().getMethod();
+            String executionId = requestCtx.getRequest().getQueryParams().get("executionId");
+            if ("POST".equalsIgnoreCase(method)
+                    && "cancel".equalsIgnoreCase(requestCtx.getRequest().getQueryParams().get("action"))) {
+                boolean stopped = ExecutionCancellationRegistry.cancel(executionId);
+                sendResponseWithContentType(responseCallback, stopped ? 202 : 409,
+                        "{\"stopped\":" + stopped + ",\"executionId\":" + GSON.toJson(executionId) + "}",
+                        "application/json; charset=UTF-8");
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(method)) {
                 sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
                 return;
             }
-            String executionId = requestCtx.getRequest().getQueryParams().get("executionId");
             String format = requestCtx.getRequest().getQueryParams().get("format");
             boolean json = "json".equalsIgnoreCase(format);
             if (executionId == null || executionId.trim().isEmpty()) {

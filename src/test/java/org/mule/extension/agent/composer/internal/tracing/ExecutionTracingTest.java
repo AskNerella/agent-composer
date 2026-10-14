@@ -99,6 +99,8 @@ public class ExecutionTracingTest {
         assertTrue(runningHtml.contains("Load conversation"));
         assertTrue(runningHtml.contains("OBJECT_STORE"));
         assertTrue(runningHtml.contains("lucide-database"));
+        assertTrue(runningHtml.contains("Stop task"));
+        assertTrue(runningHtml.contains("action=cancel"));
         assertTrue(runningHtml.contains("Trace Timeline"));
         assertTrue(runningHtml.contains("class=\"track\""));
         assertTrue(runningHtml.contains("selectSpan("));

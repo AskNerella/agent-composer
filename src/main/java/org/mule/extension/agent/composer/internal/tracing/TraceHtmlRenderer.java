@@ -80,6 +80,7 @@ public final class TraceHtmlRenderer {
                 + icon("chevron-right") + "<a class=\"breadcrumb-link\" href=\"" + safePath + "\">Traces</a><i>/</i><code>"
                 + escape(identityValue) + "</code><div class=\"top-actions\">"
                 + "<button class=\"icon-button\" onclick=\"copyText(document.querySelector('.topbar code').textContent)\" title=\"Copy identifier\" aria-label=\"Copy identifier\">" + icon("copy") + "</button>"
+                + (running ? "<button class=\"icon-button danger\" onclick=\"stopExecution(this)\" title=\"Stop task\" aria-label=\"Stop task\">" + icon("square") + "</button>" : "")
                 + "<a class=\"icon-button\" href=\"" + safePath + "?executionId=" + escapeAttribute(trace.getExecutionId())
                 + "&amp;format=json\" title=\"Export JSON\" aria-label=\"Export JSON\">" + icon("download") + "</a><button class=\"icon-button\" onclick=\"location.reload()\" title=\"Refresh\" aria-label=\"Refresh\">" + icon("refresh-cw") + "</button>"
                 + themeToggle() + "<a class=\"icon-button\" href=\"" + safePath + "\" title=\"Close trace\" aria-label=\"Close trace\">" + icon("x") + "</a></div></nav>"
@@ -93,6 +94,7 @@ public final class TraceHtmlRenderer {
                 + summaryItem("Tokens", trace.getTotalTokens() + " (" + trace.getInputTokens() + " in / " + trace.getOutputTokens() + " out)")
                 + summaryItem("Retries", String.valueOf(trace.getRetryCount()))
                 + summaryItem("Iteration Limit", String.valueOf(trace.getMaxIterations())) + "</div></section>"
+                + mcpInventory(trace)
                 + alert(trace.getError(), "error-banner", "Execution error")
                 + alert(trace.getPersistenceError(), "warning-banner", "Persistence warning")
                 + "<section class=\"trace-layout\"><div class=\"timeline-card\"><header class=\"card-header\"><div><h2>Trace Timeline</h2><p>"
@@ -158,6 +160,7 @@ public final class TraceHtmlRenderer {
                 + "function formatMs(v){v=Number(v||0);return v<1000?v+' ms':(v/1000).toFixed(2)+' s'}function sizeOf(v){if(v==null)return '0 B';const n=new TextEncoder().encode(JSON.stringify(v)).length;return n<1024?n+' B':(n/1024).toFixed(1)+' KB'}"
                 + "function showTab(id,b){document.querySelectorAll('.detail-tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab-panel').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById('tab-'+id).classList.add('active')}"
                 + "function copyText(v){navigator.clipboard&&navigator.clipboard.writeText(v)}function copyPanel(id){copyText(document.getElementById(id).textContent)}function closeDrawer(){const d=document.getElementById('detailDrawer');d.classList.remove('open');d.setAttribute('aria-hidden','true');document.querySelectorAll('[data-span-index]').forEach(x=>x.classList.remove('selected'))}function collapseTree(){document.querySelectorAll('.span-row:not(.root-row)').forEach(x=>x.classList.toggle('compact'))}function switchView(id,b){document.querySelectorAll('.trace-view').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.view-toggle button').forEach(x=>x.classList.remove('active'));document.getElementById(id+'View').classList.add('active');b.classList.add('active');document.querySelector('.collapse-button').hidden=id==='table'}function activateRow(e,i,row){if(e.key==='Enter'||e.key===' '){e.preventDefault();selectSpan(i,row)}}document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer()});"
+                + "async function stopExecution(button){if(!confirm('Stop this running agent task?'))return;button.disabled=true;try{const r=await fetch(location.pathname+'?executionId='+encodeURIComponent(trace.executionId)+'&action=cancel',{method:'POST'});if(!r.ok)button.disabled=false;setTimeout(()=>location.reload(),350)}catch(e){button.disabled=false}}"
                 + (running ? "setTimeout(()=>location.reload(),2000);" : "");
     }
 
@@ -198,10 +201,11 @@ public final class TraceHtmlRenderer {
                 + "h1{font-size:28px;font-weight:650;letter-spacing:-.02em}h2{font-size:17px;font-weight:600}h3{color:var(--muted);font-weight:600}"
                 + ".summary-title p,.card-header p,.index-title p,.summary-item span,.span-label small,.kv span,.run-row small{color:var(--muted)}"
                 + ".status{border:0;background:var(--secondary);font-size:11px;letter-spacing:.01em;padding:5px 9px}.status .lucide,.status-mark .lucide{width:13px;height:13px}"
-                + ".status.completed{color:var(--success);background:var(--success-bg)}.status.running{color:var(--running);background:var(--running-bg)}.status.failed{color:var(--failure);background:var(--failure-bg)}.status.input-required{color:var(--warning);background:var(--warning-bg)}"
+                + ".status.completed{color:var(--success);background:var(--success-bg)}.status.running{color:var(--running);background:var(--running-bg)}.status.failed,.status.canceled{color:var(--failure);background:var(--failure-bg)}.status.input-required{color:var(--warning);background:var(--warning-bg)}"
                 + ".section-tabs .active,.detail-tabs button.active{border-color:var(--primary);color:var(--foreground)}.section-tabs button,.detail-tabs button{color:var(--muted)}"
                 + ".trace-layout{grid-template-columns:minmax(720px,1.35fr) minmax(390px,.65fr);gap:16px}.card-header{gap:18px}.view-actions,.view-toggle{display:flex;align-items:center;gap:8px}.view-toggle{background:var(--secondary);border-radius:10px;padding:3px}"
                 + ".loop-diagram{min-height:190px;padding:20px;border-bottom:1px solid var(--border);overflow:auto;background:color-mix(in srgb,var(--card) 96%,var(--secondary))}.loop-diagram svg{display:block;min-width:680px;max-width:none;height:auto;margin:auto}.diagram-unavailable{display:grid;place-items:center;min-height:150px;color:var(--muted)}"
+                + ".mcp-inventory{margin-top:16px;padding:16px 18px}.mcp-inventory h2{margin-bottom:12px}.mcp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.mcp-server{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--card)}.mcp-server strong,.mcp-server small{display:block}.mcp-server small{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tool-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}.tool-chip{font-size:11px;padding:4px 7px;border-radius:999px;background:var(--secondary);color:var(--secondary-foreground)}"
                 + ".view-toggle button{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;color:var(--muted);border-radius:8px;padding:7px 10px;cursor:pointer;white-space:nowrap}.view-toggle button.active{background:var(--card);color:var(--foreground);box-shadow:0 1px 3px rgba(0,0,0,.10)}"
                 + ".trace-view{display:none}.trace-view.active{display:block}.scale{color:var(--muted)}.span-row{color:var(--foreground);border-color:var(--border-soft)}.span-row:hover,.span-row.selected{background:var(--selected)}.span-row.selected{box-shadow:inset 3px 0 var(--primary)}"
                 + ".status-mark{display:inline-grid;place-items:center;color:var(--muted);flex:0 0 auto}.status-mark.completed{color:var(--success)}.status-mark.running{color:var(--running)}.status-mark.failed{color:var(--failure)}.status-mark.input-required{color:var(--warning)}"
@@ -235,7 +239,7 @@ public final class TraceHtmlRenderer {
 
     private static String statusIcon(String status) {
         String css = statusClass(status);
-        String iconName = "completed".equals(css) ? "circle-check" : "failed".equals(css) ? "circle-x"
+        String iconName = "completed".equals(css) ? "circle-check" : ("failed".equals(css) || "canceled".equals(css)) ? "circle-x"
                 : "input-required".equals(css) ? "circle-alert" : "running".equals(css) ? "loader-circle" : "circle";
         return "<span class=\"status-mark " + css + "\">" + icon(iconName) + "</span>";
     }
@@ -278,6 +282,7 @@ public final class TraceHtmlRenderer {
             case "repeat-2": paths = "<path d=\"m2 9 3-3 3 3\"/><path d=\"M5 6h11a4 4 0 0 1 4 4v1M22 15l-3 3-3-3\"/><path d=\"M19 18H8a4 4 0 0 1-4-4v-1\"/>"; break;
             case "minimize-2": paths = "<path d=\"m14 10 7-7M20 10h-6V4M3 21l7-7M4 14h6v6\"/>"; break;
             case "database": paths = "<ellipse cx=\"12\" cy=\"5\" rx=\"9\" ry=\"3\"/><path d=\"M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5\"/><path d=\"M3 12c0 1.7 4 3 9 3s9-1.3 9-3\"/>"; break;
+            case "square": paths = "<rect width=\"14\" height=\"14\" x=\"5\" y=\"5\" rx=\"2\"/>"; break;
             default: paths = "<path d=\"M22 12h-4l-3 9L9 3l-3 9H2\"/>";
         }
         return "<svg class=\"lucide lucide-" + escapeAttribute(name) + "\" viewBox=\"0 0 24 24\" aria-hidden=\"true\">" + paths + "</svg>";
@@ -294,6 +299,29 @@ public final class TraceHtmlRenderer {
     private static String summaryItem(String label, String value) {
         return "<div class=\"summary-item\"><span>" + escape(label) + "</span><strong title=\""
                 + escapeAttribute(value) + "\">" + escape(value) + "</strong></div>";
+    }
+
+    private static String mcpInventory(ExecutionTrace trace) {
+        Object raw = trace.getAttributes().get("mcpServers");
+        if (!(raw instanceof List) || ((List<?>) raw).isEmpty()) return "";
+        StringBuilder html = new StringBuilder("<section class=\"runs-card mcp-inventory\"><h2>Connected MCP Servers</h2><div class=\"mcp-grid\">");
+        for (Object entry : (List<?>) raw) {
+            if (!(entry instanceof Map)) continue;
+            Map<?, ?> server = (Map<?, ?>) entry;
+            html.append("<div class=\"mcp-server\"><strong>").append(escape(String.valueOf(server.get("name"))))
+                    .append("</strong><small title=\"").append(escapeAttribute(String.valueOf(server.get("url"))))
+                    .append("\">").append(escape(String.valueOf(server.get("url")))).append("</small><div class=\"tool-chips\">");
+            Object tools = server.get("tools");
+            if (tools instanceof List && !((List<?>) tools).isEmpty()) {
+                for (Object tool : (List<?>) tools) {
+                    html.append("<span class=\"tool-chip\">").append(escape(String.valueOf(tool))).append("</span>");
+                }
+            } else {
+                html.append("<span class=\"tool-chip\">No tools discovered</span>");
+            }
+            html.append("</div></div>");
+        }
+        return html.append("</div></section>").toString();
     }
 
     private static String alert(String value, String cssClass, String title) {
@@ -390,8 +418,8 @@ public final class TraceHtmlRenderer {
 
     private static String brandLogoPath(String reportPath) {
         String path = reportPath == null || reportPath.isBlank() ? "/traces" : reportPath;
-        int traces = path.lastIndexOf("/traces");
-        String base = traces >= 0 ? path.substring(0, traces) : "";
+        int slash = path.lastIndexOf('/');
+        String base = slash > 0 ? path.substring(0, slash) : "";
         return base + "/assets/agent-composer.svg";
     }
 

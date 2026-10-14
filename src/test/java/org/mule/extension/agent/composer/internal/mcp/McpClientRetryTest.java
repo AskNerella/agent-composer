@@ -24,6 +24,8 @@ public class McpClientRetryTest {
     private McpServerConfig config;
     private final AtomicInteger listAttempts = new AtomicInteger();
     private volatile boolean alwaysFail;
+    private volatile boolean failFirst = true;
+    private volatile boolean returnTool;
 
     @Before
     public void setUp() throws Exception {
@@ -58,6 +60,15 @@ public class McpClientRetryTest {
         }
     }
 
+    @Test
+    public void cachesSuccessfulToolDiscoveryAcrossClients() throws Exception {
+        failFirst = false;
+        returnTool = true;
+        assertEquals(1, new McpClient().listTools(config).size());
+        assertEquals(1, new McpClient().listTools(config).size());
+        assertEquals(1, listAttempts.get());
+    }
+
     private void handle(HttpExchange exchange) throws IOException {
         String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
         JsonObject payload = JsonParser.parseString(body).getAsJsonObject();
@@ -69,10 +80,13 @@ public class McpClientRetryTest {
             respond(exchange, 202, "");
         } else if ("tools/list".equals(method)) {
             int attempt = listAttempts.incrementAndGet();
-            if (alwaysFail || attempt == 1) {
+            if (alwaysFail || (failFirst && attempt == 1)) {
                 respond(exchange, 503, "temporary failure");
             } else {
-                respond(exchange, 200, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}");
+                String tools = returnTool
+                        ? "[{\"name\":\"lookup\",\"description\":\"Lookup\",\"inputSchema\":{}}]"
+                        : "[]";
+                respond(exchange, 200, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":" + tools + "}}");
             }
         } else {
             respond(exchange, 404, "unknown");

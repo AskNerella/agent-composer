@@ -23,7 +23,7 @@ Enhance the existing MuleSoft AI Agent connector into a production-ready agent f
 
 8. **Agent Evaluations:** Enhance existing evaluation support with scoring, rubrics, datasets, regression tests, and structured results.
 
-9. **Human Approval:** Require approval for sensitive tool actions using existing elicitation/resume mechanisms.
+9. **Human Approval:** Require explicit approval before sensitive tool actions.
 
 10. **Execution Guardrails:** Set limits for iterations, tokens, cost, elapsed time, retries, and parallel executions.
 
@@ -55,13 +55,6 @@ Enhance the existing MuleSoft AI Agent connector into a production-ready agent f
 ## Codex Instructions
 
 **Work one phase at a time.** Inspect existing code before changing anything.
-
-Maintain these lightweight progress files:
-
-- `docs/implementation/PLAN.md` — roadmap and completed features
-- `docs/implementation/PROGRESS.md` — current status, tests, and next steps
-
-Update them after each implementation phase so another Codex session can continue without relying on chat history.
 
 Write tests, verify the build, and preserve backward compatibility.
 

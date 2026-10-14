@@ -24,6 +24,7 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
@@ -47,6 +48,7 @@ public class McpClient {
     private static final String MCP_PROTOCOL_VERSION = "2025-11-25";
     private static final Type MAP_TYPE = new TypeToken<Map<String, Object>>() {}.getType();
     private static final HttpClient HTTP = HttpClient.newHttpClient();
+    private static final ConcurrentHashMap<String, List<ToolDefinition>> TOOL_CACHE = new ConcurrentHashMap<>();
 
     /** Monotonically increasing JSON-RPC request id. */
     private final AtomicLong idCounter = new AtomicLong(1);
@@ -71,6 +73,33 @@ public class McpClient {
      * definitions, each stamped with the server URL for later routing.
      */
     public List<ToolDefinition> listTools(McpServerConfig server) throws ModuleException {
+        String cacheKey = toolCacheKey(server);
+        List<ToolDefinition> cached = TOOL_CACHE.get(cacheKey);
+        if (cached != null) {
+            LOGGER.debug("Using cached MCP tools for '{}'", server.getName());
+            return cached;
+        }
+        List<ToolDefinition> tools = listToolsUncached(server);
+        // Do not make an empty or malformed discovery result sticky. This lets a
+        // temporarily unavailable server recover on the next agent/card refresh.
+        if (!tools.isEmpty()) {
+            tools = Collections.unmodifiableList(new ArrayList<>(tools));
+            TOOL_CACHE.put(cacheKey, tools);
+        }
+        return tools;
+    }
+
+    public static boolean hasCachedTools(McpServerConfig server) {
+        return TOOL_CACHE.containsKey(toolCacheKey(server));
+    }
+
+    private static String toolCacheKey(McpServerConfig server) {
+        return String.valueOf(server.getName()) + "|" + String.valueOf(server.getServerUrl()) + "|"
+                + String.join(",", server.getToolFilterList()) + "|auth="
+                + Objects.hashCode(server.getAuthToken());
+    }
+
+    private List<ToolDefinition> listToolsUncached(McpServerConfig server) throws ModuleException {
         try {
             JsonObject params = new JsonObject();
             String responseBody = sendRpc(server, "tools/list", params);

@@ -126,10 +126,9 @@ public class AgentComposerOperations {
             String executionId) {
         ExecutionTrace trace = ExecutionTraceStore.get(executionId,
                 objectStoreManager, config.getObjectStore());
-        String agentPath = config.getAgentPath();
-        if (agentPath == null || agentPath.trim().isEmpty()) agentPath = "/agent";
-        if (!agentPath.startsWith("/")) agentPath = "/" + agentPath;
-        return TraceHtmlRenderer.render(trace, agentPath + "/traces");
+        String tracesPath = config.getTracesPath();
+        if (!tracesPath.startsWith("/")) tracesPath = "/" + tracesPath;
+        return TraceHtmlRenderer.render(trace, tracesPath);
     }
 
     // ── Evaluate Agent ────────────────────────────────────────────────────────

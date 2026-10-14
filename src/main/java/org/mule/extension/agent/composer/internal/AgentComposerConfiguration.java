@@ -80,6 +80,13 @@ public class AgentComposerConfiguration {
   @Optional(defaultValue = "300")
   @Placement(order = 11)
   private int requestTimeoutSeconds;
+
+  @Parameter
+  @DisplayName("Traces Path")
+  @Summary("HTTP path for the execution trace console.")
+  @Optional(defaultValue = "/agent/traces")
+  @Placement(order = 12)
+  private String tracesPath;
   // ── Agent ─────────────────────────────────────────────────────────────────
 
   @Parameter
@@ -104,6 +111,13 @@ public class AgentComposerConfiguration {
   @Optional(defaultValue = "_defaultPersistentObjectStore")
   @Placement(tab = "Agent", order = 3)
   private String objectStore;
+
+  @Parameter
+  @DisplayName("Remember Conversation")
+  @Summary("Persist and reuse conversation history and solved responses. Disabled by default so each invocation starts fresh. MCP elicitation continuation state is still persisted while a call is paused.")
+  @Optional(defaultValue = "false")
+  @Placement(tab = "Agent", order = 4)
+  private boolean rememberConversation;
 
   // ── Agent Card ────────────────────────────────────────────────────────────
 
@@ -159,10 +173,12 @@ public class AgentComposerConfiguration {
   public String getHttpListenerConfig()       { return httpListenerConfig; }
   public String getAgentPath()                { return agentPath; }
   public int getRequestTimeoutSeconds()       { return requestTimeoutSeconds; }
+  public String getTracesPath()               { return tracesPath == null || tracesPath.isBlank() ? "/agent/traces" : tracesPath; }
   public String getAgentName()                { return agentName; }
   public String getAgentDescription()         { return agentDescription; }
   public String getAgentVersion()             { return agentVersion; }
   public List<AgentSkillConfig> getSkills()   { return skills; }
   public boolean isIncludeMcpToolsAsSkills()  { return includeMcpToolsAsSkills; }
+  public boolean isRememberConversation()     { return rememberConversation; }
   public LlmProviderConfig getLlmProvider()   { return llmProvider; }
 }
