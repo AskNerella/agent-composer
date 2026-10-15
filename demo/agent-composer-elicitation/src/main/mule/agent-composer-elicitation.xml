@@ -19,7 +19,7 @@ http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/
 		</agent-composer:llm-provider>
 		<agent-composer:instructions ><![CDATA[${file::instructions/tix.md}]]></agent-composer:instructions>
 		<agent-composer:mcp-servers >
-			<agent-composer:mcp-server-config name="Approval MCP" serverUrl="http://localhost:8081/mcp" retryCount="0" />
+			<agent-composer:mcp-server-config name="Approval MCP" serverUrl="http://localhost:8081/mcp" retryCount="0" toolsRequiringPermission="approval-request" />
 		</agent-composer:mcp-servers>
 	</agent-composer:config>
 	<mcp:server-config name="Service_Ticket_MCP_Server" doc:name="MCP Server" doc:id="c079ef00-7b0e-41d8-bc64-bd484c8d88f1" serverName="service-ticket-mcp" serverVersion="1.0.0" >

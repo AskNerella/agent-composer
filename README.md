@@ -12,7 +12,7 @@ Agent Composer is a Mule SDK connector for building ReAct agents without custom 
 <dependency>
   <groupId>com.k2</groupId>
   <artifactId>agent-composer</artifactId>
-  <version>1.1.0</version>
+  <version>1.1.18-SNAPSHOT</version>
   <classifier>mule-plugin</classifier>
 </dependency>
 ```
@@ -69,6 +69,7 @@ The **Max Iterations** value on Execute Agent is the authoritative outer-loop li
 - [Operations](docs/operation-reference/index.md)
 - [Agent Listener and trace console](docs/agent-listener.md)
 - [A2A support matrix](docs/a2a-support.md)
+- [Postman A2A test collection](docs/postman/Agent-Composer-A2A.postman_collection.json) and [local environment](docs/postman/Agent-Composer-A2A.postman_environment.json)
 - [MCP support](docs/mcp-support.md)
 - [ReAct runtime behavior](docs/react-engine.md)
 

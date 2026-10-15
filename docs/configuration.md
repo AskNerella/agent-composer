@@ -64,6 +64,7 @@ The endpoint must implement the OpenAI Responses request/response shape. Authent
 | Server URL | Yes | — | Streamable HTTP JSON-RPC endpoint. |
 | Auth Token | No | — | Optional bearer token. |
 | Tool Filter | No | Empty | Comma-separated allowlist; empty permits every tool. |
+| Tools Requiring Permission | No | Empty | Comma-separated exact tool names that pause for approval before every invocation. |
 | Retry Count | No | `0` | Retry count, clamped from 0 through 10. |
 
 Successful non-empty discovery results are shared across the deployed application. Empty or failed discovery is not cached, allowing recovery on a later request.

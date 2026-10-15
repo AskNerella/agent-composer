@@ -205,7 +205,7 @@ public final class TraceHtmlRenderer {
                 + ".section-tabs .active,.detail-tabs button.active{border-color:var(--primary);color:var(--foreground)}.section-tabs button,.detail-tabs button{color:var(--muted)}"
                 + ".trace-layout{grid-template-columns:minmax(720px,1.35fr) minmax(390px,.65fr);gap:16px}.card-header{gap:18px}.view-actions,.view-toggle{display:flex;align-items:center;gap:8px}.view-toggle{background:var(--secondary);border-radius:10px;padding:3px}"
                 + ".loop-diagram{min-height:190px;padding:20px;border-bottom:1px solid var(--border);overflow:auto;background:color-mix(in srgb,var(--card) 96%,var(--secondary))}.loop-diagram svg{display:block;min-width:680px;max-width:none;height:auto;margin:auto}.diagram-unavailable{display:grid;place-items:center;min-height:150px;color:var(--muted)}"
-                + ".mcp-inventory{margin-top:16px;padding:16px 18px}.mcp-inventory h2{margin-bottom:12px}.mcp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.mcp-server{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--card)}.mcp-server strong,.mcp-server small{display:block}.mcp-server small{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tool-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}.tool-chip{font-size:11px;padding:4px 7px;border-radius:999px;background:var(--secondary);color:var(--secondary-foreground)}"
+                + ".mcp-inventory{margin-top:16px;padding:16px 18px}.mcp-inventory h2{margin:0}.mcp-inventory-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}.mcp-controls{display:flex;gap:8px;align-items:center}.mcp-controls select,.mcp-controls input{height:38px;border:1px solid var(--input);border-radius:9px;background:var(--background);color:var(--foreground);padding:0 11px}.mcp-search{position:relative}.mcp-search .lucide{position:absolute;left:10px;top:10px;color:var(--muted)}.mcp-search input{padding-left:34px}.mcp-server{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--card)}.mcp-server[hidden]{display:none}.mcp-server strong,.mcp-server small{display:block}.mcp-server small{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tool-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}.tool-chip{font-size:11px;padding:4px 7px;border-radius:999px;background:var(--secondary);color:var(--secondary-foreground)}.mcp-empty{display:none;color:var(--muted);padding:10px 0}.mcp-empty.visible{display:block}"
                 + ".view-toggle button{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;color:var(--muted);border-radius:8px;padding:7px 10px;cursor:pointer;white-space:nowrap}.view-toggle button.active{background:var(--card);color:var(--foreground);box-shadow:0 1px 3px rgba(0,0,0,.10)}"
                 + ".trace-view{display:none}.trace-view.active{display:block}.scale{color:var(--muted)}.span-row{color:var(--foreground);border-color:var(--border-soft)}.span-row:hover,.span-row.selected{background:var(--selected)}.span-row.selected{box-shadow:inset 3px 0 var(--primary)}"
                 + ".status-mark{display:inline-grid;place-items:center;color:var(--muted);flex:0 0 auto}.status-mark.completed{color:var(--success)}.status-mark.running{color:var(--running)}.status-mark.failed{color:var(--failure)}.status-mark.input-required{color:var(--warning)}"
@@ -221,7 +221,7 @@ public final class TraceHtmlRenderer {
                 + ".brand{display:inline-flex;align-items:center;gap:10px;color:var(--foreground);text-decoration:none;white-space:nowrap}.brand img{width:30px;height:30px;object-fit:contain}.brand strong{font-size:16px;letter-spacing:-.01em}.breadcrumb-link{color:var(--muted);text-decoration:none}.breadcrumb-link:hover{color:var(--foreground)}.topbar>code{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.topbar>.lucide{color:var(--muted)}"
                 + ".trace-layout{display:block;margin-top:18px}.timeline-card{width:100%}.detail-drawer{display:flex;flex-direction:column;position:fixed;z-index:30;top:68px;right:0;bottom:0;width:min(560px,42vw);border-radius:0;border-width:0 0 0 1px;transform:translateX(102%);transition:transform .22s ease;box-shadow:-18px 0 45px rgba(0,0,0,.16);overflow:hidden}.detail-drawer.open{transform:translateX(0)}.drawer-actions{display:flex;align-items:center;gap:10px}.drawer-close{width:34px;height:34px}.detail-drawer .tab-panel{max-height:none;min-height:0}.detail-drawer .tab-panel.active{flex:1;overflow:auto}.section-tabs{display:none}"
                 + "@media(max-width:1250px){.trace-layout{display:block}.detail-card{position:fixed}.span-table-wrap{max-height:none}.detail-drawer{width:min(560px,52vw)}}"
-                + "@media(max-width:760px){main{padding:12px}.brand strong,.breadcrumb-link,.topbar>i,.topbar>code,.topbar>.lucide{display:none}.topbar{padding:0 12px}.top-actions{gap:6px}.icon-button{width:36px;height:36px}.card-header{align-items:flex-start;flex-direction:column}.view-actions{width:100%;justify-content:space-between}.collapse-button{display:none}.view-toggle{width:100%}.view-toggle button{flex:1;justify-content:center}.theme-toggle{display:grid}.summary-grid{grid-template-columns:1fr 1fr}.filters{flex-direction:column}.search-field{width:100%}.detail-drawer{top:68px;width:100%;margin:0}.detail-header{gap:10px}.detail-tabs{padding:0 6px}}";
+                + "@media(max-width:760px){main{padding:12px}.brand strong,.breadcrumb-link,.topbar>i,.topbar>code,.topbar>.lucide{display:none}.topbar{padding:0 12px}.top-actions{gap:6px}.icon-button{width:36px;height:36px}.card-header{align-items:flex-start;flex-direction:column}.view-actions{width:100%;justify-content:space-between}.collapse-button{display:none}.view-toggle{width:100%}.view-toggle button{flex:1;justify-content:center}.theme-toggle{display:grid}.summary-grid{grid-template-columns:1fr 1fr}.filters{flex-direction:column}.search-field{width:100%}.detail-drawer{top:68px;width:100%;margin:0}.detail-header{gap:10px}.detail-tabs{padding:0 6px}.mcp-inventory-head,.mcp-controls{align-items:stretch;flex-direction:column}.mcp-controls select,.mcp-search,.mcp-search input{width:100%}}";
     }
 
     private static String themeBootstrap() {
@@ -304,24 +304,41 @@ public final class TraceHtmlRenderer {
     private static String mcpInventory(ExecutionTrace trace) {
         Object raw = trace.getAttributes().get("mcpServers");
         if (!(raw instanceof List) || ((List<?>) raw).isEmpty()) return "";
-        StringBuilder html = new StringBuilder("<section class=\"runs-card mcp-inventory\"><h2>Connected MCP Servers</h2><div class=\"mcp-grid\">");
-        for (Object entry : (List<?>) raw) {
+        List<?> servers = (List<?>) raw;
+        StringBuilder html = new StringBuilder("<section class=\"runs-card mcp-inventory\"><div class=\"mcp-inventory-head\"><h2>Connected MCP Servers</h2><div class=\"mcp-controls\"><select id=\"mcpServerSelect\" onchange=\"filterMcpTools()\" aria-label=\"Select MCP server\">");
+        int optionIndex = 0;
+        for (Object entry : servers) {
             if (!(entry instanceof Map)) continue;
             Map<?, ?> server = (Map<?, ?>) entry;
-            html.append("<div class=\"mcp-server\"><strong>").append(escape(String.valueOf(server.get("name"))))
+            html.append("<option value=\"").append(optionIndex++).append("\">")
+                    .append(escape(String.valueOf(server.get("name")))).append("</option>");
+        }
+        html.append("</select><label class=\"mcp-search\">").append(icon("search"))
+                .append("<input id=\"mcpToolSearch\" type=\"search\" placeholder=\"Search tools...\" oninput=\"filterMcpTools()\" aria-label=\"Search MCP tools\"></label></div></div><div class=\"mcp-servers\">");
+        int serverIndex = 0;
+        for (Object entry : servers) {
+            if (!(entry instanceof Map)) continue;
+            Map<?, ?> server = (Map<?, ?>) entry;
+            html.append("<div class=\"mcp-server\" data-mcp-server=\"").append(serverIndex)
+                    .append("\"").append(serverIndex == 0 ? "" : " hidden").append("><strong>")
+                    .append(escape(String.valueOf(server.get("name"))))
                     .append("</strong><small title=\"").append(escapeAttribute(String.valueOf(server.get("url"))))
                     .append("\">").append(escape(String.valueOf(server.get("url")))).append("</small><div class=\"tool-chips\">");
             Object tools = server.get("tools");
             if (tools instanceof List && !((List<?>) tools).isEmpty()) {
                 for (Object tool : (List<?>) tools) {
-                    html.append("<span class=\"tool-chip\">").append(escape(String.valueOf(tool))).append("</span>");
+                    String name = String.valueOf(tool);
+                    html.append("<span class=\"tool-chip\" data-tool=\"")
+                            .append(escapeAttribute(name.toLowerCase())).append("\">")
+                            .append(escape(name)).append("</span>");
                 }
             } else {
-                html.append("<span class=\"tool-chip\">No tools discovered</span>");
+                html.append("<span class=\"tool-chip\" data-tool=\"\">No tools discovered</span>");
             }
-            html.append("</div></div>");
+            html.append("</div><div class=\"mcp-empty\">No matching tools</div></div>");
+            serverIndex++;
         }
-        return html.append("</div></section>").toString();
+        return html.append("</div><script>function filterMcpTools(){const s=document.getElementById('mcpServerSelect');const q=(document.getElementById('mcpToolSearch').value||'').toLowerCase();document.querySelectorAll('[data-mcp-server]').forEach(p=>{const active=p.dataset.mcpServer===s.value;p.hidden=!active;if(!active)return;let shown=0;p.querySelectorAll('[data-tool]').forEach(t=>{const match=!q||t.dataset.tool.includes(q);t.hidden=!match;if(match)shown++});p.querySelector('.mcp-empty').classList.toggle('visible',shown===0)})}filterMcpTools();</script></section>").toString();
     }
 
     private static String alert(String value, String cssClass, String title) {

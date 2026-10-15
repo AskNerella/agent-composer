@@ -14,6 +14,7 @@ import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 import org.mule.extension.agent.composer.internal.model.McpToolResult;
 import org.mule.extension.agent.composer.internal.model.PendingElicitationState;
+import org.mule.extension.agent.composer.internal.model.PendingToolPermissionState;
 import org.mule.extension.agent.composer.internal.model.ToolCall;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
 import org.mule.extension.agent.composer.internal.tracing.ExecutionTraceContext;
@@ -40,8 +41,10 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 import java.net.URI;
 import java.time.LocalDate;
@@ -81,6 +84,7 @@ public class ReactEngine {
      * never starve common-pool work elsewhere in the Mule runtime. Daemon threads avoid blocking JVM shutdown.
      */
     private static final ExecutorService MCP_IO_EXECUTOR = Executors.newCachedThreadPool(daemonThreadFactory("agent-composer-mcp-io"));
+    private static final ConcurrentHashMap<String, ReentrantLock> CONVERSATION_LOCKS = new ConcurrentHashMap<>();
 
     /** Verbs that indicate a create/update/delete intent — responses to these are not cached. */
     private static final List<String> MUTATION_VERBS = Arrays.asList(
@@ -177,6 +181,13 @@ public class ReactEngine {
         ExecutionCancellationRegistry.register(invocationTrace.getExecutionId());
         ExecutionTraceContext previousTrace = traceContext.get();
         traceContext.set(invocationTrace);
+        String lockKey = conversationId != null ? conversationId : "<no-conversation>";
+        ReentrantLock conversationLock = CONVERSATION_LOCKS.computeIfAbsent(lockKey, ignored -> new ReentrantLock());
+        conversationLock.lock();
+        // A2A knows the task/context identifiers before the trace execution ID is
+        // returned. Register the conversation key after acquiring the per-context
+        // lock so a queued duplicate invocation cannot replace the active alias.
+        ExecutionCancellationRegistry.register(conversationId);
         try {
             AgentResponse response = runInternal(config, userMessage, conversationId, maxIterations, callback);
             response.setExecutionId(invocationTrace.getExecutionId());
@@ -208,7 +219,10 @@ public class ReactEngine {
             invocationTrace.fail(e);
             throw e;
         } finally {
+            conversationLock.unlock();
+            if (!conversationLock.hasQueuedThreads()) CONVERSATION_LOCKS.remove(lockKey, conversationLock);
             ExecutionCancellationRegistry.unregister(invocationTrace.getExecutionId());
+            ExecutionCancellationRegistry.unregister(conversationId);
             if (previousTrace != null) traceContext.set(previousTrace);
             else traceContext.remove();
         }
@@ -283,12 +297,46 @@ public class ReactEngine {
                     null, null, conversationLookup);
             resumedSession = hasConversationHistory(store, conversationId);
         }
+        PendingToolPermissionState pendingPermission = loadPendingPermission(store, conversationId);
         PendingElicitationState pendingState = loadPendingElicitation(store, conversationId);
+        if (pendingPermission == null && looksLikePermissionResponse(userMessage)) {
+            throw new IllegalArgumentException("No active tool permission request matches this response");
+        }
         List<LlmMessage> messages;
         int startIteration = 0;
         int toolFailureCount = 0;
 
-        if (pendingState != null) {
+        if (pendingPermission != null) {
+            resumedSession = true;
+            pendingPermission.setResumedSession(true);
+            String approvalInput = userMessage;
+            userMessage = pendingPermission.getRootUserTask();
+            maxIterations = Math.max(maxIterations, pendingPermission.getMaxIterations());
+            startIteration = pendingPermission.getActualIterations();
+            toolFailureCount = pendingPermission.getFailureCount();
+            toolCallRecords.addAll(pendingPermission.getToolCallRecords());
+            Map<String, Object> resumeInput = new LinkedHashMap<>();
+            resumeInput.put("inputKind", "tool_permission");
+            resumeInput.put("originExecutionId", pendingPermission.getOriginExecutionId());
+            resumeInput.put("queuedPermissions", pendingPermission.getQueue().size());
+            SpanScope resumeSpan = startTraceSpan("TOOL_PERMISSION", "Resume tool permission",
+                    null, startIteration, resumeInput);
+            ExecutionTraceContext currentTrace = traceContext.get();
+            if (currentTrace != null) {
+                currentTrace.attribute("originExecutionId", pendingPermission.getOriginExecutionId());
+                currentTrace.attribute("permissionRequestId",
+                        pendingPermission.getQueue().get(0).getPermissionRequestId());
+            }
+            ResumeResult resume = resumePendingPermission(store, conversationId, pendingPermission,
+                    approvalInput, config, skills, mcpTools, mcpServers, callback, spanId(resumeSpan));
+            if (resume.response != null) {
+                traceInputRequired(resumeSpan, resume.response);
+                return resume.response;
+            }
+            traceSuccess(resumeSpan, Collections.singletonMap("status", "resumed"));
+            messages = resume.messages;
+            toolFailureCount = pendingPermission.getFailureCount();
+        } else if (pendingState != null) {
             Map<String, Object> pendingOutput = new LinkedHashMap<>();
             pendingOutput.put("source", "pending-elicitation");
             pendingOutput.put("found", true);
@@ -420,6 +468,7 @@ public class ReactEngine {
 
                     LOGGER.info("[Iteration {}] Stopping early: grounded final answer is available.", iteration + 1);
                     traceSuccess(iterationSpan, Collections.singletonMap("finalAnswer", currentThought));
+                    emitIterationComplete(callback, iteration + 1, currentThought);
                     break;
                 }
 
@@ -428,6 +477,7 @@ public class ReactEngine {
                         "Provide the final answer to the user in text using the available tool results. "
                                 + "Do not call additional tools unless more information is truly required."));
                 saveHistory(store, conversationId, messages);
+                emitIterationComplete(callback, iteration + 1, currentThought);
                 traceSuccess(iterationSpan, Collections.singletonMap("action", "request_text_answer"));
                 continue;
             }
@@ -459,6 +509,7 @@ public class ReactEngine {
                 inputRequired.setReturnReason("input required");
                 inputRequired.setToolCalls(toolCallRecords);
                 traceInputRequired(iterationSpan, Collections.singletonMap("question", question));
+                emitIterationComplete(callback, iteration + 1, question);
                 return inputRequired;
             }
 
@@ -492,6 +543,7 @@ public class ReactEngine {
 
                 // Collect results, fire response callbacks, record tool calls, append tool_result messages
                 List<PendingElicitationState.Continuation> pausedContinuations = new ArrayList<>();
+                List<PendingToolPermissionState.Continuation> permissionContinuations = new ArrayList<>();
                 for (int t = 0; t < toolCalls.size(); t++) {
                     ToolCall tc = toolCalls.get(t);
                     ExecutionOutcome outcome;
@@ -501,6 +553,12 @@ public class ReactEngine {
                         outcome = new ExecutionOutcome("Error: " + e.getMessage(), null, true, null, null);
                     }
                     toolCallRecords.addAll(outcome.nestedRecords);
+
+                    if (outcome.permission != null) {
+                        permissionContinuations.add(outcome.permission);
+                        messages.add(new LlmMessage("tool_result", "Waiting for tool permission.", tc.getId(), tc.getName()));
+                        continue;
+                    }
 
                     if (outcome.elicitation != null) {
                         pausedContinuations.add(buildContinuation(
@@ -529,12 +587,30 @@ public class ReactEngine {
                     messages.add(new LlmMessage("tool_result", obsForContext, tc.getId(), tc.getName()));
                 }
 
+                if (!permissionContinuations.isEmpty()) {
+                    saveHistory(store, conversationId, messages);
+                    if (!pausedContinuations.isEmpty()) {
+                        savePendingElicitation(store, conversationId, buildPendingState(userMessage,
+                                maxIterations, actualIterations, toolFailureCount, resumedSession,
+                                pausedContinuations));
+                    }
+                    PendingToolPermissionState state = buildPendingPermissionState(userMessage,
+                            maxIterations, actualIterations, toolFailureCount, resumedSession,
+                            messages, permissionContinuations);
+                    savePendingPermission(store, conversationId, state);
+                    traceInputRequired(iterationSpan, permissionTraceData(permissionContinuations.get(0)));
+                    emitIterationComplete(callback, iteration + 1,
+                            "Waiting for permission to execute " + permissionContinuations.get(0).getToolCall().getName());
+                    return buildPermissionResponse(state, conversationId, null);
+                }
+
                 if (!pausedContinuations.isEmpty()) {
                     saveHistory(store, conversationId, messages);
                     PendingElicitationState state = buildPendingState(userMessage, maxIterations,
                             actualIterations, toolFailureCount, resumedSession, pausedContinuations);
                     savePendingElicitation(store, conversationId, state);
                     traceInputRequired(iterationSpan, Collections.singletonMap("elicitationCount", pausedContinuations.size()));
+                    emitIterationComplete(callback, iteration + 1, "Waiting for user input");
                     return buildElicitationResponse(state, conversationId, null);
                 }
 
@@ -554,6 +630,20 @@ public class ReactEngine {
                         currentThought, iteration + 1, maxIterations - iteration, callback, spanId(iterationSpan));
                 toolCallRecords.addAll(outcome.nestedRecords);
 
+                if (outcome.permission != null) {
+                    messages.add(new LlmMessage("tool_result", "Waiting for tool permission.",
+                            toolCall.getId(), toolCall.getName()));
+                    saveHistory(store, conversationId, messages);
+                    PendingToolPermissionState state = buildPendingPermissionState(userMessage,
+                            maxIterations, actualIterations, toolFailureCount, resumedSession,
+                            messages, Collections.singletonList(outcome.permission));
+                    savePendingPermission(store, conversationId, state);
+                    traceInputRequired(iterationSpan, permissionTraceData(outcome.permission));
+                    emitIterationComplete(callback, iteration + 1,
+                            "Waiting for permission to execute " + outcome.permission.getToolCall().getName());
+                    return buildPermissionResponse(state, conversationId, null);
+                }
+
                 if (outcome.elicitation != null) {
                     messages.add(new LlmMessage("tool_result", "Waiting for user input (elicitation).", toolCall.getId(), toolCall.getName()));
                     saveHistory(store, conversationId, messages);
@@ -564,6 +654,7 @@ public class ReactEngine {
                             Collections.singletonList(continuation));
                     savePendingElicitation(store, conversationId, state);
                     traceInputRequired(iterationSpan, Collections.singletonMap("tool", toolCall.getName()));
+                    emitIterationComplete(callback, iteration + 1, "Waiting for user input");
                     return buildElicitationResponse(state, conversationId, null);
                 }
 
@@ -602,6 +693,7 @@ public class ReactEngine {
 
             saveHistory(store, conversationId, messages);
             traceSuccess(iterationSpan, Collections.singletonMap("toolCalls", toolCalls.size()));
+            emitIterationComplete(callback, iteration + 1, currentThought);
         }
 
         if (finalAnswer == null) {
@@ -766,6 +858,7 @@ public class ReactEngine {
         /** Non-null when the MCP server paused this call with an elicitation/create request. */
         final McpToolResult.ElicitationRequest elicitation;
         final PendingElicitationState.SkillState skillState;
+        final PendingToolPermissionState.Continuation permission;
 
         ExecutionOutcome(String observation, String serverName, boolean failed, String uiResourceUri, String uiHtml) {
             this.observation = observation;
@@ -775,6 +868,7 @@ public class ReactEngine {
             this.uiHtml = uiHtml;
             this.elicitation = null;
             this.skillState = null;
+            this.permission = null;
             this.nestedRecords = Collections.emptyList();
         }
 
@@ -788,6 +882,7 @@ public class ReactEngine {
             this.uiHtml = null;
             this.elicitation = elicitation;
             this.skillState = skillState;
+            this.permission = null;
             this.nestedRecords = nestedRecords != null ? nestedRecords : Collections.emptyList();
         }
 
@@ -801,6 +896,7 @@ public class ReactEngine {
             this.uiHtml = uiHtml;
             this.elicitation = null;
             this.skillState = null;
+            this.permission = null;
             this.nestedRecords = nestedRecords != null ? nestedRecords : Collections.emptyList();
         }
 
@@ -808,6 +904,24 @@ public class ReactEngine {
                                        PendingElicitationState.SkillState skillState,
                                        List<AgentResponse.ToolCallRecord> nestedRecords) {
             return new ExecutionOutcome(elicitation, skillState, nestedRecords);
+        }
+
+        private ExecutionOutcome(PendingToolPermissionState.Continuation permission,
+                                 List<AgentResponse.ToolCallRecord> nestedRecords) {
+            this.observation = null;
+            this.serverName = permission.getServerName();
+            this.failed = false;
+            this.uiResourceUri = null;
+            this.uiHtml = null;
+            this.elicitation = null;
+            this.skillState = null;
+            this.permission = permission;
+            this.nestedRecords = nestedRecords != null ? nestedRecords : Collections.emptyList();
+        }
+
+        static ExecutionOutcome permission(PendingToolPermissionState.Continuation permission,
+                                           List<AgentResponse.ToolCallRecord> nestedRecords) {
+            return new ExecutionOutcome(permission, nestedRecords);
         }
     }
 
@@ -819,6 +933,13 @@ public class ReactEngine {
                                PendingElicitationState.SkillState skillState) {
             this.request = request;
             this.skillState = skillState;
+        }
+    }
+
+    private static final class PermissionPauseSignal extends RuntimeException {
+        final PendingToolPermissionState.Continuation continuation;
+        PermissionPauseSignal(PendingToolPermissionState.Continuation continuation) {
+            this.continuation = continuation;
         }
     }
 
@@ -861,6 +982,12 @@ public class ReactEngine {
                         iteration, matchedSkill.getName(), pause.request.getRequestId());
                 traceInputRequired(toolSpan, pause.request);
                 return ExecutionOutcome.paused(pause.request, pause.skillState, nestedRecords);
+            } catch (PermissionPauseSignal pause) {
+                pause.continuation.setOuterToolCall(toolCall);
+                LOGGER.info("[Iteration {}] Skill '{}' paused for tool permission | requestId={}",
+                        iteration, matchedSkill.getName(), pause.continuation.getPermissionRequestId());
+                traceInputRequired(toolSpan, permissionTraceData(pause.continuation));
+                return ExecutionOutcome.permission(pause.continuation, nestedRecords);
             } catch (Exception e) {
                 LOGGER.warn("[Iteration {}] Skill '{}' failed: {}", iteration, matchedSkill.getName(), e.getMessage(), e);
                 traceError(toolSpan, e);
@@ -872,6 +999,12 @@ public class ReactEngine {
         LOGGER.info("[Iteration {}] >>> Using tool '{}' (server: {}) | args: {}",
                 iteration, toolCall.getName(), serverName != null ? serverName : "unknown", toolCall.getArguments());
         try {
+            PendingToolPermissionState.Continuation permission = permissionContinuation(
+                    toolCall, mcpTools, mcpServers, iteration, null);
+            if (permission != null) {
+                traceInputRequired(toolSpan, permissionTraceData(permission));
+                return ExecutionOutcome.permission(permission, Collections.emptyList());
+            }
             McpToolResult.CallOutcome outcome = executeTool(toolCall, mcpTools, mcpServers);
             if (outcome.isElicitationRequired()) {
                 LOGGER.info("[Iteration {}] Tool '{}' paused for user input (MCP elicitation) | requestId={}",
@@ -905,6 +1038,54 @@ public class ReactEngine {
 
         return mcpClient.callTool(server, toolCall.getName(), toolCall.getArguments(),
                 toolDef.getUiResourceUri());
+    }
+
+    private PendingToolPermissionState.Continuation permissionContinuation(
+            ToolCall call, List<ToolDefinition> tools, List<McpServerConfig> servers,
+            int parentIteration, PendingToolPermissionState.SkillState skillState) {
+        ToolDefinition definition = tools.stream()
+                .filter(tool -> tool.getName().equals(call.getName()))
+                .findFirst().orElse(null);
+        if (definition == null) return null;
+        McpServerConfig server = servers.stream()
+                .filter(candidate -> candidate.getServerUrl().equals(definition.getServerUrl()))
+                .findFirst().orElse(null);
+        if (server == null || !server.requiresPermission(call.getName())) return null;
+        PendingToolPermissionState.Continuation continuation = new PendingToolPermissionState.Continuation();
+        continuation.setPermissionRequestId(UUID.randomUUID().toString());
+        continuation.setServerName(server.getName());
+        continuation.setServerUrl(server.getServerUrl());
+        continuation.setToolCall(call);
+        continuation.setOuterToolCall(call);
+        continuation.setParentIteration(parentIteration);
+        continuation.setSkillState(skillState);
+        return continuation;
+    }
+
+    private Map<String, Object> permissionTraceData(PendingToolPermissionState.Continuation permission) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("inputKind", "tool_permission");
+        data.put("permissionRequestId", permission.getPermissionRequestId());
+        data.put("server", permission.getServerName());
+        data.put("tool", permission.getToolCall().getName());
+        data.put("arguments", permission.getToolCall().getArguments());
+        return data;
+    }
+
+    private McpToolResult.CallOutcome executeApprovedTool(
+            PendingToolPermissionState.Continuation permission,
+            List<ToolDefinition> tools, List<McpServerConfig> servers) throws Exception {
+        ToolCall call = permission.getToolCall();
+        ToolDefinition definition = tools.stream()
+                .filter(tool -> tool.getName().equals(call.getName())
+                        && permission.getServerUrl().equals(tool.getServerUrl()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Permission-gated tool is no longer available: " + call.getName()));
+        McpServerConfig server = servers.stream()
+                .filter(candidate -> permission.getServerUrl().equals(candidate.getServerUrl()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Permission-gated MCP server is no longer configured: " + permission.getServerName()));
+        return mcpClient.callTool(server, call.getName(), call.getArguments(), definition.getUiResourceUri());
     }
 
     private LlmResponse callLlmWithSingleRetry(LlmClient llmClient,
@@ -1097,6 +1278,20 @@ public class ReactEngine {
             SpanScope nestedToolSpan = startTraceSpan("MCP_TOOL", toolCall.getName(), parentSpanId,
                     parentIteration, toolCall.getArguments());
             try {
+                PendingToolPermissionState.SkillState permissionSkillState = new PendingToolPermissionState.SkillState();
+                permissionSkillState.setSkillName(skill.getName());
+                permissionSkillState.setTask(task);
+                permissionSkillState.setMessages(new ArrayList<>(skillMessages));
+                permissionSkillState.setNextStep(i + 1);
+                permissionSkillState.setMaxSteps(maxSkillIterations);
+                permissionSkillState.setConsecutiveTextResponses(consecutiveTextResponses);
+                permissionSkillState.setTokensSinceCompression(skillTokensSinceCompression);
+                PendingToolPermissionState.Continuation permission = permissionContinuation(
+                        toolCall, skillMcpTools, mcpServers, parentIteration, permissionSkillState);
+                if (permission != null) {
+                    traceInputRequired(nestedToolSpan, permissionTraceData(permission));
+                    throw new PermissionPauseSignal(permission);
+                }
                 McpToolResult.CallOutcome toolOutcome = executeTool(toolCall, skillMcpTools, mcpServers);
                 if (toolOutcome.isElicitationRequired()) {
                     PendingElicitationState.SkillState state = new PendingElicitationState.SkillState();
@@ -1121,6 +1316,8 @@ public class ReactEngine {
                 }
                 recordSink.add(skillRecord);
             } catch (ElicitationPauseSignal pause) {
+                throw pause;
+            } catch (PermissionPauseSignal pause) {
                 throw pause;
             } catch (Exception e) {
                 obs = "Tool execution failed: " + e.getMessage();
@@ -1287,6 +1484,7 @@ public class ReactEngine {
                         String name = s.getName() == null ? "" : s.getName();
                         String url = s.getServerUrl() == null ? "" : s.getServerUrl();
                         return name + "@" + url + "#" + String.join(",", s.getToolFilterList())
+                                + "#permissions=" + String.join(",", s.getToolsRequiringPermissionList())
                                 + "#retries=" + s.getRetryCount();
                     })
                     .collect(Collectors.joining(","));
@@ -1434,6 +1632,306 @@ public class ReactEngine {
         }
     }
 
+    // ── Tool permission continuation ───────────────────────────────────────
+
+    private static final String PERMISSION_STORE_PREFIX = "tool:permission:";
+
+    private static final class ParsedPermissionAnswer {
+        String action;
+        String requestId;
+        String error;
+    }
+
+    private PendingToolPermissionState buildPendingPermissionState(
+            String rootUserTask, int maxIterations, int actualIterations, int failureCount,
+            boolean resumedSession, List<LlmMessage> messages,
+            List<PendingToolPermissionState.Continuation> queue) {
+        PendingToolPermissionState state = new PendingToolPermissionState();
+        state.setRootUserTask(rootUserTask);
+        state.setMaxIterations(maxIterations);
+        state.setActualIterations(actualIterations);
+        state.setFailureCount(failureCount);
+        state.setResumedSession(resumedSession);
+        state.setMessages(messages);
+        state.setToolCallRecords(snapshotToolCallRecords());
+        state.setQueue(queue);
+        ExecutionTraceContext context = traceContext.get();
+        if (context != null) state.setOriginExecutionId(context.getExecutionId());
+        return state;
+    }
+
+    private ParsedPermissionAnswer parsePermissionAnswer(String raw,
+                                                          PendingToolPermissionState.Continuation active) {
+        ParsedPermissionAnswer answer = new ParsedPermissionAnswer();
+        try {
+            com.google.gson.JsonElement parsed = com.google.gson.JsonParser.parseString(
+                    raw != null ? raw.trim() : "");
+            if (!parsed.isJsonObject()) throw new IllegalArgumentException();
+            com.google.gson.JsonObject object = parsed.getAsJsonObject();
+            answer.action = object.has("action") ? object.get("action").getAsString() : null;
+            answer.requestId = object.has("permissionRequestId")
+                    ? object.get("permissionRequestId").getAsString() : null;
+        } catch (Exception e) {
+            answer.error = "Provide a JSON object with action and permissionRequestId.";
+            return answer;
+        }
+        if (!"approve".equals(answer.action) && !"deny".equals(answer.action)) {
+            answer.error = "Action must be 'approve' or 'deny'.";
+        } else if (answer.requestId == null || answer.requestId.trim().isEmpty()) {
+            answer.error = "permissionRequestId is required.";
+        } else if (!active.getPermissionRequestId().equals(answer.requestId)) {
+            answer.error = "permissionRequestId does not match the active request.";
+        }
+        return answer;
+    }
+
+    private boolean looksLikePermissionResponse(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return false;
+        try {
+            com.google.gson.JsonElement parsed = com.google.gson.JsonParser.parseString(raw.trim());
+            if (!parsed.isJsonObject()) return false;
+            com.google.gson.JsonObject object = parsed.getAsJsonObject();
+            if (!object.has("permissionRequestId") || !object.has("action")) return false;
+            String action = object.get("action").getAsString();
+            return "approve".equals(action) || "deny".equals(action);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private ResumeResult resumePendingPermission(
+            ObjectStore<Serializable> store, String conversationId,
+            PendingToolPermissionState state, String rawAnswer,
+            AgentComposerConfiguration config, List<AgentSkillConfig> skills,
+            List<ToolDefinition> tools, List<McpServerConfig> servers,
+            IterationCallback callback, String parentSpanId) {
+        if (state.getVersion() != PendingToolPermissionState.CURRENT_VERSION
+                || state.getQueue() == null || state.getQueue().isEmpty()) {
+            removePendingPermission(store, conversationId);
+            throw new IllegalStateException("Stored tool permission state is missing or uses an unsupported version");
+        }
+        List<LlmMessage> messages = state.getMessages() != null
+                ? new ArrayList<>(state.getMessages()) : new ArrayList<>();
+        PendingToolPermissionState.Continuation active = state.getQueue().get(0);
+        ParsedPermissionAnswer answer = parsePermissionAnswer(rawAnswer, active);
+        if (answer.error != null) {
+            savePendingPermission(store, conversationId, state);
+            return ResumeResult.waiting(buildPermissionResponse(state, conversationId, answer.error));
+        }
+
+        ToolCall call = active.getToolCall();
+        String observation;
+        McpToolResult result = null;
+        SpanScope toolSpan = startTraceSpan("TOOL_PERMISSION",
+                ("approve".equals(answer.action) ? "Approve " : "Deny ") + call.getName(),
+                parentSpanId, active.getParentIteration(), permissionTraceData(active));
+        if ("deny".equals(answer.action)) {
+            observation = "Tool call denied by user.";
+            traceSuccess(toolSpan, Collections.singletonMap("decision", "denied"));
+        } else {
+            try {
+                McpToolResult.CallOutcome outcome = executeApprovedTool(active, tools, servers);
+                if (outcome.isElicitationRequired()) {
+                    PendingElicitationState.SkillState elicitationSkill = active.isSkill()
+                            ? toElicitationSkillState(active.getSkillState()) : null;
+                    PendingElicitationState.Continuation continuation = buildContinuation(
+                            outcome.getElicitation(), active.getOuterToolCall(),
+                            active.getParentIteration(), elicitationSkill);
+                    PendingElicitationState elicitationState = buildPendingState(
+                            state.getRootUserTask(), state.getMaxIterations(), state.getActualIterations(),
+                            state.getFailureCount(), true, Collections.singletonList(continuation));
+                    saveHistory(store, conversationId, messages);
+                    savePendingElicitation(store, conversationId, elicitationState);
+                    removePendingPermission(store, conversationId);
+                    traceInputRequired(toolSpan, outcome.getElicitation());
+                    return ResumeResult.waiting(buildElicitationResponse(elicitationState, conversationId, null));
+                }
+                result = outcome.getResult();
+                observation = result.getTextContent();
+                traceSuccess(toolSpan, result);
+            } catch (Exception e) {
+                observation = "Tool execution failed after approval: " + e.getMessage();
+                state.setFailureCount(state.getFailureCount() + 1);
+                traceError(toolSpan, e);
+            }
+        }
+
+        if (active.isSkill()) {
+            PendingToolPermissionState.SkillState permissionSkill = active.getSkillState();
+            AgentResponse.ToolCallRecord nestedRecord = new AgentResponse.ToolCallRecord(
+                    permissionSkill.getSkillName(), call.getName(), call.getArguments(),
+                    observation, active.getParentIteration());
+            if (result != null && result.hasUiResource()) {
+                nestedRecord.setUiResourceUri(result.getUiResourceUri());
+                nestedRecord.setUiHtml(result.getUiHtml());
+            }
+            toolCallRecords.add(nestedRecord);
+            permissionSkill.getMessages().add(new LlmMessage("tool_result",
+                    compactToolObservation(call.getName(), observation), call.getId(), call.getName()));
+            if (callback != null) callback.onEvent(AgentIterationEvent.toolResult(
+                    active.getParentIteration(), call.getName(), call.getArguments(), observation,
+                    "skill:" + permissionSkill.getSkillName()));
+            SpanScope skillSpan = startTraceSpan("SKILL", "Resume skill " + permissionSkill.getSkillName(),
+                    parentSpanId, active.getParentIteration(),
+                    Collections.singletonMap("nextStep", permissionSkill.getNextStep()));
+            try {
+                SkillResumeResult resumed = continueSkill(toElicitationSkillState(permissionSkill),
+                        tools, servers, config, active.getParentIteration(), callback, spanId(skillSpan));
+                if (resumed.permission != null) {
+                    resumed.permission.setOuterToolCall(active.getOuterToolCall());
+                    state.getQueue().set(0, resumed.permission);
+                    state.setMessages(messages);
+                    state.setToolCallRecords(snapshotToolCallRecords());
+                    savePendingPermission(store, conversationId, state);
+                    traceInputRequired(skillSpan, permissionTraceData(resumed.permission));
+                    return ResumeResult.waiting(buildPermissionResponse(state, conversationId, null));
+                }
+                if (resumed.elicitation != null) {
+                    PendingElicitationState.Continuation continuation = buildContinuation(
+                            resumed.elicitation, active.getOuterToolCall(), active.getParentIteration(), resumed.state);
+                    PendingElicitationState elicitationState = buildPendingState(
+                            state.getRootUserTask(), state.getMaxIterations(), state.getActualIterations(),
+                            state.getFailureCount(), true, Collections.singletonList(continuation));
+                    savePendingElicitation(store, conversationId, elicitationState);
+                    removePendingPermission(store, conversationId);
+                    traceInputRequired(skillSpan, resumed.elicitation);
+                    return ResumeResult.waiting(buildElicitationResponse(elicitationState, conversationId, null));
+                }
+                observation = resumed.answer;
+                replaceToolResult(messages, active.getOuterToolCall(), observation);
+                toolCallRecords.add(new AgentResponse.ToolCallRecord(
+                        "skill:" + permissionSkill.getSkillName(), active.getOuterToolCall().getName(),
+                        active.getOuterToolCall().getArguments(), observation, active.getParentIteration()));
+                traceSuccess(skillSpan, observation);
+            } catch (Exception e) {
+                observation = "Skill execution failed after tool permission: " + e.getMessage();
+                state.setFailureCount(state.getFailureCount() + 1);
+                replaceToolResult(messages, active.getOuterToolCall(), observation);
+                traceError(skillSpan, e);
+            }
+        } else {
+            replaceToolResult(messages, active.getOuterToolCall(), observation);
+            AgentResponse.ToolCallRecord record = new AgentResponse.ToolCallRecord(
+                    active.getServerName(), call.getName(), call.getArguments(),
+                    observation, active.getParentIteration());
+            if (result != null && result.hasUiResource()) {
+                record.setUiResourceUri(result.getUiResourceUri());
+                record.setUiHtml(result.getUiHtml());
+            }
+            toolCallRecords.add(record);
+            saveFullToolOutput(store, conversationId, call, observation);
+            if (callback != null) callback.onEvent(AgentIterationEvent.toolResult(
+                    active.getParentIteration(), call.getName(), call.getArguments(), observation,
+                    active.getServerName()));
+        }
+
+        state.getQueue().remove(0);
+        state.setMessages(messages);
+        state.setToolCallRecords(snapshotToolCallRecords());
+        saveHistory(store, conversationId, messages);
+        if (!state.getQueue().isEmpty()) {
+            savePendingPermission(store, conversationId, state);
+            return ResumeResult.waiting(buildPermissionResponse(state, conversationId, null));
+        }
+        removePendingPermission(store, conversationId);
+        PendingElicitationState pendingElicitation = loadPendingElicitation(store, conversationId);
+        if (pendingElicitation != null) {
+            return ResumeResult.waiting(buildElicitationResponse(pendingElicitation, conversationId, null));
+        }
+        return ResumeResult.completed(messages);
+    }
+
+    private PendingElicitationState.SkillState toElicitationSkillState(
+            PendingToolPermissionState.SkillState source) {
+        PendingElicitationState.SkillState target = new PendingElicitationState.SkillState();
+        target.setSkillName(source.getSkillName());
+        target.setTask(source.getTask());
+        target.setMessages(source.getMessages());
+        target.setNextStep(source.getNextStep());
+        target.setMaxSteps(source.getMaxSteps());
+        target.setConsecutiveTextResponses(source.getConsecutiveTextResponses());
+        target.setTokensSinceCompression(source.getTokensSinceCompression());
+        return target;
+    }
+
+    private AgentResponse buildPermissionResponse(PendingToolPermissionState state,
+                                                   String conversationId, String validationError) {
+        PendingToolPermissionState.Continuation active = state.getQueue().get(0);
+        ToolCall call = active.getToolCall();
+        String prompt = "Approve tool '" + call.getName() + "' on MCP server '"
+                + active.getServerName() + "'?";
+        if (validationError != null) prompt = validationError + " " + prompt;
+        AgentResponse response = new AgentResponse(state.getRootUserTask(), prompt,
+                state.getMaxIterations(), state.getActualIterations(), false, conversationId);
+        response.setRequiresInput(true);
+        response.setInputKind("tool_permission");
+        response.setInputRequest(prompt);
+        response.setPermissionRequestId(active.getPermissionRequestId());
+        response.setPermissionServerName(active.getServerName());
+        response.setPermissionToolName(call.getName());
+        response.setPermissionArguments(call.getArguments());
+        response.setResponseSchema(toolPermissionResponseSchema());
+        response.setResumedSession(state.isResumedSession());
+        response.setFailureCount(state.getFailureCount());
+        response.setReturnReason("input required");
+        response.setToolCalls(snapshotToolCallRecords());
+        return response;
+    }
+
+    private static Map<String, Object> toolPermissionResponseSchema() {
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("required", java.util.Arrays.asList(
+                "inputKind", "permissionRequestId", "action"));
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("inputKind", Collections.singletonMap("const", "tool_permission"));
+        properties.put("permissionRequestId", Collections.singletonMap("type", "string"));
+        Map<String, Object> action = new LinkedHashMap<>();
+        action.put("type", "string");
+        action.put("enum", java.util.Arrays.asList("approve", "deny"));
+        properties.put("action", action);
+        schema.put("properties", properties);
+        schema.put("additionalProperties", false);
+        return schema;
+    }
+
+    private void emitIterationComplete(IterationCallback callback, int iteration, String result) {
+        if (callback != null) {
+            callback.onEvent(AgentIterationEvent.iterationComplete(iteration, result));
+        }
+    }
+
+    private void savePendingPermission(ObjectStore<Serializable> store, String conversationId,
+                                       PendingToolPermissionState state) {
+        String key = PERMISSION_STORE_PREFIX + conversationId;
+        try {
+            if (store.contains(key)) store.remove(key);
+            store.store(key, GSON.toJson(state));
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not persist tool permission state for '" + conversationId + "'", e);
+        }
+    }
+
+    private PendingToolPermissionState loadPendingPermission(ObjectStore<Serializable> store,
+                                                              String conversationId) {
+        String key = PERMISSION_STORE_PREFIX + conversationId;
+        try {
+            if (!store.contains(key)) return null;
+            return GSON.fromJson((String) store.retrieve(key), PendingToolPermissionState.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not load tool permission state for '" + conversationId + "'", e);
+        }
+    }
+
+    private void removePendingPermission(ObjectStore<Serializable> store, String conversationId) {
+        String key = PERMISSION_STORE_PREFIX + conversationId;
+        try {
+            if (store.contains(key)) store.remove(key);
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not remove tool permission state for '" + conversationId + "'", e);
+        }
+    }
+
     // ── MCP elicitation continuation ────────────────────────────────────────
 
     private static final String ELICITATION_STORE_PREFIX = "mcp:elicitation:";
@@ -1461,6 +1959,7 @@ public class ReactEngine {
         String answer;
         McpToolResult.ElicitationRequest elicitation;
         PendingElicitationState.SkillState state;
+        PendingToolPermissionState.Continuation permission;
     }
 
     private PendingElicitationState.Continuation buildContinuation(
@@ -1741,6 +2240,22 @@ public class ReactEngine {
             SpanScope toolSpan = startTraceSpan("MCP_TOOL", call.getName(), parentSpanId,
                     parentIteration, call.getArguments());
             try {
+                PendingToolPermissionState.SkillState permissionState = new PendingToolPermissionState.SkillState();
+                permissionState.setSkillName(skill.getName());
+                permissionState.setTask(state.getTask());
+                permissionState.setMessages(new ArrayList<>(skillMessages));
+                permissionState.setNextStep(i + 1);
+                permissionState.setMaxSteps(state.getMaxSteps());
+                permissionState.setConsecutiveTextResponses(consecutiveText);
+                permissionState.setTokensSinceCompression(tokenCount);
+                PendingToolPermissionState.Continuation permission = permissionContinuation(
+                        call, skillTools, mcpServers, parentIteration, permissionState);
+                if (permission != null) {
+                    SkillResumeResult paused = new SkillResumeResult();
+                    paused.permission = permission;
+                    traceInputRequired(toolSpan, permissionTraceData(permission));
+                    return paused;
+                }
                 McpToolResult.CallOutcome toolOutcome = executeTool(call, skillTools, mcpServers);
                 if (toolOutcome.isElicitationRequired()) {
                     state.setMessages(skillMessages);
@@ -2187,6 +2702,23 @@ public class ReactEngine {
             result.put("pendingElicitation", null);
         }
 
+        PendingToolPermissionState pendingPermission = loadPendingPermission(store, sessionId);
+        if (pendingPermission != null && pendingPermission.getQueue() != null
+                && !pendingPermission.getQueue().isEmpty()) {
+            PendingToolPermissionState.Continuation active = pendingPermission.getQueue().get(0);
+            Map<String, Object> summary = new LinkedHashMap<>();
+            summary.put("inputKind", "tool_permission");
+            summary.put("permissionRequestId", active.getPermissionRequestId());
+            summary.put("serverName", active.getServerName());
+            summary.put("toolName", active.getToolCall().getName());
+            summary.put("arguments", active.getToolCall().getArguments());
+            summary.put("responseSchema", toolPermissionResponseSchema());
+            summary.put("queuedRequests", pendingPermission.getQueue().size());
+            result.put("pendingToolPermission", summary);
+        } else {
+            result.put("pendingToolPermission", null);
+        }
+
         // Solved / cached responses scoped to this session
         List<java.util.Map<String, Object>> solvedEntries = new ArrayList<>();
         try {
@@ -2213,7 +2745,8 @@ public class ReactEngine {
         }
 
         result.put("solvedResponses", solvedEntries);
-        result.put("found", !history.isEmpty() || !solvedEntries.isEmpty() || pending != null);
+        result.put("found", !history.isEmpty() || !solvedEntries.isEmpty()
+                || pending != null || pendingPermission != null);
         return result;
     }
 
@@ -2238,6 +2771,11 @@ public class ReactEngine {
             if (store.contains(pendingKey)) {
                 store.remove(pendingKey);
                 removed.add(pendingKey);
+            }
+            String permissionKey = PERMISSION_STORE_PREFIX + sessionId;
+            if (store.contains(permissionKey)) {
+                store.remove(permissionKey);
+                removed.add(permissionKey);
             }
             String scopedPrefix = "resolved::" + sessionId + "::";
             for (String key : allKeys) {
@@ -2270,6 +2808,19 @@ public class ReactEngine {
                                 removed.add(linkedSession);
                             } catch (Exception e) {
                                 LOGGER.warn("Could not remove history for session '{}': {}", linkedSession, e.getMessage());
+                            }
+                        }
+                        if (linkedSession != null && !linkedSession.trim().isEmpty()) {
+                            for (String pendingPrefix : Arrays.asList(ELICITATION_STORE_PREFIX, PERMISSION_STORE_PREFIX)) {
+                                String linkedPending = pendingPrefix + linkedSession;
+                                if (!removed.contains(linkedPending) && store.contains(linkedPending)) {
+                                    try {
+                                        store.remove(linkedPending);
+                                        removed.add(linkedPending);
+                                    } catch (Exception e) {
+                                        LOGGER.warn("Could not remove pending state '{}': {}", linkedPending, e.getMessage());
+                                    }
+                                }
                             }
                         }
                         try {
