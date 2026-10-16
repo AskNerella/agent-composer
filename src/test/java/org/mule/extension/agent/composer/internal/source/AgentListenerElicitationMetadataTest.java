@@ -20,6 +20,21 @@ import static org.mockito.Mockito.*;
 public class AgentListenerElicitationMetadataTest {
 
     @Test
+    public void recognizesVersionSpecificTaskListingAndSubscriptionMethods() throws Exception {
+        Method list = AgentListenerSource.class.getDeclaredMethod(
+                "isTaskListRequest", String.class, String.class);
+        Method subscribe = AgentListenerSource.class.getDeclaredMethod(
+                "isTaskSubscribeRequest", String.class, String.class);
+        list.setAccessible(true);
+        subscribe.setAccessible(true);
+
+        assertEquals(Boolean.TRUE, list.invoke(null, "ListTasks", "1.0"));
+        assertEquals(Boolean.FALSE, list.invoke(null, "tasks/list", "0.3"));
+        assertEquals(Boolean.TRUE, subscribe.invoke(null, "tasks/resubscribe", "0.3"));
+        assertEquals(Boolean.TRUE, subscribe.invoke(null, "SubscribeToTask", "1.0"));
+    }
+
+    @Test
     public void inputRequiredTaskContainsTextAndStructuredDataParts() throws Exception {
         Method buildTask = AgentListenerSource.class.getDeclaredMethod("buildTask",
                 String.class, String.class, String.class, String.class, String.class, String.class);
@@ -228,6 +243,58 @@ public class AgentListenerElicitationMetadataTest {
         assertFalse(values.containsKey("tool:permission:ctx-1"));
         assertFalse(values.containsKey("mcp:elicitation:ctx-1"));
         assertTrue(values.containsKey("conversation:ctx-1"));
+    }
+
+    @Test
+    public void expiredPermissionCheckpointMarksTaskExpiredAndRemovesContinuation() throws Exception {
+        Map<String, Serializable> values = new LinkedHashMap<>();
+        values.put("tool:permission:ctx-expired",
+                "{\"expiresAtEpochMs\":" + (System.currentTimeMillis() - 1000) + "}");
+        org.mule.runtime.api.store.ObjectStore<Serializable> store = mock(org.mule.runtime.api.store.ObjectStore.class);
+        when(store.contains(anyString())).thenAnswer(invocation -> values.containsKey(invocation.getArgument(0)));
+        when(store.retrieve(anyString())).thenAnswer(invocation -> values.get(invocation.getArgument(0)));
+        doAnswer(invocation -> values.remove(invocation.getArgument(0))).when(store).remove(anyString());
+        doAnswer(invocation -> {
+            values.put(invocation.getArgument(0), invocation.getArgument(1));
+            return null;
+        }).when(store).store(anyString(), any(Serializable.class));
+
+        AgentListenerSource source = new AgentListenerSource();
+        Method expire = AgentListenerSource.class.getDeclaredMethod(
+                "expirePermissionTaskIfNeeded", JsonObject.class,
+                org.mule.runtime.api.store.ObjectStore.class);
+        expire.setAccessible(true);
+        JsonObject task = new JsonObject();
+        task.addProperty("id", "task-expired");
+        task.addProperty("contextId", "ctx-expired");
+        JsonObject status = new JsonObject();
+        status.addProperty("state", "input-required");
+        task.add("status", status);
+
+        JsonObject expired = (JsonObject) expire.invoke(source, task, store);
+
+        assertEquals("expired", expired.getAsJsonObject("status").get("state").getAsString());
+        assertTrue(values.containsKey("tool:permission:ctx-expired"));
+        assertTrue(values.containsKey("a2a:task:task-expired"));
+    }
+
+    @Test
+    public void expiredIsATerminalTaskState() throws Exception {
+        Method terminal = AgentListenerSource.class.getDeclaredMethod("isTerminalState", String.class);
+        terminal.setAccessible(true);
+        assertEquals(Boolean.TRUE, terminal.invoke(null, "expired"));
+        assertEquals(Boolean.FALSE, terminal.invoke(null, "input-required"));
+    }
+
+    @Test
+    public void activePermissionCheckpointCanRecoverAStaleTerminalSnapshot() throws Exception {
+        Method accepts = AgentListenerSource.class.getDeclaredMethod(
+                "canAcceptInput", String.class, boolean.class);
+        accepts.setAccessible(true);
+        assertEquals(Boolean.TRUE, accepts.invoke(null, "input-required", false));
+        assertEquals(Boolean.TRUE, accepts.invoke(null, "completed", true));
+        assertEquals(Boolean.FALSE, accepts.invoke(null, "completed", false));
+        assertEquals(Boolean.FALSE, accepts.invoke(null, "expired", false));
     }
 
     private static void setField(Object target, String name, Object value) throws Exception {

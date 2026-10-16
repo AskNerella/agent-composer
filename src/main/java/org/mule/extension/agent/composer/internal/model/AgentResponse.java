@@ -39,6 +39,7 @@ public class AgentResponse {
     private String permissionServerName;
     private String permissionToolName;
     private Map<String, Object> permissionArguments;
+    private Long permissionExpiresAtEpochMs;
     /** JSON Schema for the structured permission decision expected from the caller. */
     private Map<String, Object> responseSchema;
     /** Unique identifier for the execution trace produced by this invocation. */
@@ -81,6 +82,7 @@ public class AgentResponse {
     public String getPermissionServerName() { return permissionServerName; }
     public String getPermissionToolName() { return permissionToolName; }
     public Map<String, Object> getPermissionArguments() { return permissionArguments; }
+    public Long getPermissionExpiresAtEpochMs() { return permissionExpiresAtEpochMs; }
     public Map<String, Object> getResponseSchema() { return responseSchema; }
     public String getExecutionId() { return executionId; }
     public String getTraceReportPath() { return traceReportPath; }
@@ -108,6 +110,7 @@ public class AgentResponse {
     public void setPermissionServerName(String value) { this.permissionServerName = value; }
     public void setPermissionToolName(String value) { this.permissionToolName = value; }
     public void setPermissionArguments(Map<String, Object> value) { this.permissionArguments = value; }
+    public void setPermissionExpiresAtEpochMs(Long value) { this.permissionExpiresAtEpochMs = value; }
     public void setResponseSchema(Map<String, Object> value) { this.responseSchema = value; }
     public void setExecutionId(String executionId) { this.executionId = executionId; }
     public void setTraceReportPath(String traceReportPath) { this.traceReportPath = traceReportPath; }

@@ -7,8 +7,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -73,6 +75,74 @@ public final class ExecutionTraceStore {
         }
     }
 
+    /**
+     * Loads an execution together with every earlier/later execution that belongs to the same
+     * conversation. Permission and elicitation resumes create a new execution checkpoint; the
+     * trace report presents those checkpoints as one continuous timeline.
+     */
+    public static ExecutionTrace getCorrelated(String executionId, ObjectStoreManager manager,
+                                               String objectStoreName) {
+        ExecutionTrace selected = get(executionId, manager, objectStoreName);
+        if (selected == null || selected.getConversationId() == null
+                || selected.getConversationId().trim().isEmpty()) {
+            return selected;
+        }
+        List<ExecutionTrace> correlated = new ArrayList<>();
+        for (ExecutionTrace trace : list(manager, objectStoreName, 200)) {
+            if (selected.getConversationId().equals(trace.getConversationId())) correlated.add(trace);
+        }
+        return combine(correlated);
+    }
+
+    static ExecutionTrace combine(List<ExecutionTrace> traces) {
+        if (traces == null || traces.isEmpty()) return null;
+        if (traces.size() == 1) return traces.get(0);
+
+        List<ExecutionTrace> ordered = new ArrayList<>(traces);
+        ordered.sort(Comparator.comparingLong(ExecutionTrace::getStartedAtEpochMs));
+        ExecutionTrace first = ordered.get(0);
+        ExecutionTrace latest = ordered.get(ordered.size() - 1);
+        ExecutionTrace combined = new ExecutionTrace();
+        combined.setVersion(ExecutionTrace.CURRENT_VERSION);
+        combined.setExecutionId(latest.getExecutionId());
+        combined.setConversationId(latest.getConversationId());
+        combined.setUserTask(first.getUserTask());
+        combined.setProvider(latest.getProvider());
+        combined.setModelName(latest.getModelName());
+        combined.setMaxIterations(latest.getMaxIterations());
+        combined.setStatus(latest.getStatus());
+        combined.setStartedAt(first.getStartedAt());
+        combined.setStartedAtEpochMs(first.getStartedAtEpochMs());
+        combined.setEndedAt(latest.getEndedAt());
+
+        long end = ordered.stream().mapToLong(ExecutionTrace::getEndedAtEpochMs).max().orElse(0L);
+        combined.setEndedAtEpochMs(end);
+        combined.setDurationMs(end > first.getStartedAtEpochMs()
+                ? end - first.getStartedAtEpochMs()
+                : ordered.stream().mapToLong(ExecutionTrace::getDurationMs).sum());
+        combined.setInputTokens(ordered.stream().mapToInt(ExecutionTrace::getInputTokens).sum());
+        combined.setOutputTokens(ordered.stream().mapToInt(ExecutionTrace::getOutputTokens).sum());
+        combined.setRetryCount(ordered.stream().mapToInt(ExecutionTrace::getRetryCount).sum());
+        combined.setErrorCount(ordered.stream().mapToInt(ExecutionTrace::getErrorCount).sum());
+        combined.setError(latest.getError());
+        combined.setPersistenceError(latest.getPersistenceError());
+
+        Map<String, Object> attributes = new LinkedHashMap<>();
+        List<String> executionIds = new ArrayList<>();
+        List<TraceSpan> spans = new ArrayList<>();
+        for (ExecutionTrace trace : ordered) {
+            attributes.putAll(trace.getAttributes());
+            executionIds.add(trace.getExecutionId());
+            spans.addAll(trace.snapshotSpans());
+        }
+        attributes.put("executionIds", executionIds);
+        attributes.put("executionCount", ordered.size());
+        spans.sort(Comparator.comparingLong(TraceSpan::getStartedAtEpochMs));
+        combined.setAttributes(attributes);
+        combined.setSpans(spans);
+        return combined;
+    }
+
     public static List<ExecutionTrace> list(ObjectStoreManager manager, String objectStoreName,
                                             int limit) {
         int safeLimit = Math.max(1, Math.min(limit, 200));
@@ -106,6 +176,82 @@ public final class ExecutionTraceStore {
 
     public static String toJson(ExecutionTrace trace) {
         return TraceRedactor.toRedactedJson(trace);
+    }
+
+    /** Marks a pending permission trace as expired so the report immediately removes its actions. */
+    public static void expirePermission(String conversationId, long waitMs,
+                                        ObjectStoreManager manager, String objectStoreName) {
+        if (conversationId == null || conversationId.trim().isEmpty()) return;
+        for (ExecutionTrace trace : list(manager, objectStoreName, 200)) {
+            if (!conversationId.equals(trace.getConversationId())
+                    || !ExecutionTraceContext.STATUS_INPUT_REQUIRED.equals(trace.getStatus())) continue;
+            long now = System.currentTimeMillis();
+            trace.setStatus("EXPIRED");
+            trace.setEndedAtEpochMs(now);
+            trace.setEndedAt(Instant.ofEpochMilli(now).toString());
+            trace.setDurationMs(Math.max(trace.getDurationMs(), now - trace.getStartedAtEpochMs()));
+            Map<String, Object> expired = new LinkedHashMap<>();
+            expired.put("inputKind", "tool_permission");
+            expired.put("decision", "expired");
+            expired.put("approvalWaitMs", Math.max(0L, waitMs));
+            Object previous = trace.getAttributes().get("result");
+            if (previous instanceof Map) expired.putAll((Map<String, Object>) previous);
+            expired.put("decision", "expired");
+            expired.put("approvalWaitMs", Math.max(0L, waitMs));
+            trace.getAttributes().put("result", expired);
+            for (TraceSpan span : trace.getSpans()) {
+                if (ExecutionTraceContext.STATUS_INPUT_REQUIRED.equals(span.getStatus())) {
+                    span.setStatus("EXPIRED");
+                    span.setOutput(expired);
+                }
+            }
+            try {
+                ObjectStore<Serializable> store = manager != null
+                        ? manager.getObjectStore(objectStoreName) : null;
+                persist(trace, store, objectStoreName);
+            } catch (Exception e) {
+                LOGGER.warn("Could not persist expired permission trace '{}': {}",
+                        trace.getExecutionId(), e.getMessage(), e);
+            }
+        }
+    }
+
+    /** Adds transport metadata to an existing trace and checkpoints it immediately. */
+    public static void attribute(String executionId, String key, Object value,
+                                 ObjectStoreManager manager, String objectStoreName) {
+        ExecutionTrace trace = get(executionId, manager, objectStoreName);
+        if (trace == null || key == null) return;
+        trace.getAttributes().put(key, TraceRedactor.redact(value));
+        try {
+            ObjectStore<Serializable> store = manager != null
+                    ? manager.getObjectStore(objectStoreName) : null;
+            persist(trace, store, objectStoreName);
+        } catch (Exception e) {
+            LOGGER.warn("Could not checkpoint trace metadata for '{}': {}", executionId, e.getMessage(), e);
+        }
+    }
+
+    /** Removes all retained traces in the configured namespace. */
+    public static int clear(ObjectStoreManager manager, String objectStoreName) {
+        int removed = 0;
+        String scopePrefix = normalizeNamespace(objectStoreName) + "::";
+        for (String scoped : new ArrayList<>(ORDER)) {
+            if (!scoped.startsWith(scopePrefix)) continue;
+            ORDER.remove(scoped);
+            if (LIVE.remove(scoped) != null) removed++;
+        }
+        if (manager == null) return removed;
+        try {
+            ObjectStore<Serializable> store = manager.getObjectStore(objectStoreName);
+            for (String key : new ArrayList<>(store.allKeys())) {
+                if (!key.startsWith(KEY_PREFIX)) continue;
+                store.remove(key);
+                removed++;
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Could not clear persisted execution traces: {}", e.getMessage(), e);
+        }
+        return removed;
     }
 
     private static String scopedId(String objectStoreName, String executionId) {

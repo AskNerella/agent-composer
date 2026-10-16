@@ -11,6 +11,7 @@
 | Agent Path | No | `/agent` | A2A JSON-RPC endpoint. |
 | Request Timeout | No | `300` seconds | How long Agent Listener waits for the Mule flow. |
 | Traces Path | No | `/agent/traces` | HTML and JSON execution trace endpoint. |
+| Tool Permission Wait Time (seconds) | No | `900` | How long an approval may remain pending before the A2A task becomes `expired`; `0` waits indefinitely. |
 
 ## Agent attributes
 

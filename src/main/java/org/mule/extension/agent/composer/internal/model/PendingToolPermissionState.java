@@ -7,7 +7,7 @@ import java.util.Map;
 
 /** Durable continuation for an agent turn paused before a permission-gated MCP tool call. */
 public class PendingToolPermissionState {
-    public static final int CURRENT_VERSION = 1;
+    public static final int CURRENT_VERSION = 2;
 
     private int version = CURRENT_VERSION;
     private String rootUserTask;
@@ -16,6 +16,8 @@ public class PendingToolPermissionState {
     private int failureCount;
     private boolean resumedSession;
     private String originExecutionId;
+    private long createdAtEpochMs;
+    private long expiresAtEpochMs;
     private List<LlmMessage> messages = new ArrayList<>();
     private List<AgentResponse.ToolCallRecord> toolCallRecords = new ArrayList<>();
     private List<Continuation> queue = new ArrayList<>();
@@ -34,6 +36,13 @@ public class PendingToolPermissionState {
     public void setResumedSession(boolean resumedSession) { this.resumedSession = resumedSession; }
     public String getOriginExecutionId() { return originExecutionId; }
     public void setOriginExecutionId(String originExecutionId) { this.originExecutionId = originExecutionId; }
+    public long getCreatedAtEpochMs() { return createdAtEpochMs; }
+    public void setCreatedAtEpochMs(long value) { this.createdAtEpochMs = value; }
+    public long getExpiresAtEpochMs() { return expiresAtEpochMs; }
+    public void setExpiresAtEpochMs(long value) { this.expiresAtEpochMs = value; }
+    public boolean isExpired(long nowEpochMs) {
+        return expiresAtEpochMs > 0 && nowEpochMs >= expiresAtEpochMs;
+    }
     public List<LlmMessage> getMessages() { return messages; }
     public void setMessages(List<LlmMessage> messages) { this.messages = messages != null ? new ArrayList<>(messages) : new ArrayList<>(); }
     public List<AgentResponse.ToolCallRecord> getToolCallRecords() { return toolCallRecords; }

@@ -55,6 +55,11 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Message source that attaches to an existing {@code <http:listener-config\>\} global element
@@ -94,6 +99,14 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private static final String TASK_STORE_PREFIX = "a2a:task:";
     private static final String CARD_SUFFIX = "/.well-known/agent-card.json";
     private static final String LEGACY_CARD_SUFFIX = "/.well-known/agent.json";
+    private static final ConcurrentHashMap<String, Object> TASK_TRANSITION_LOCKS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, ScheduledFuture<?>> TASK_EXPIRATIONS = new ConcurrentHashMap<>();
+    private static final ScheduledExecutorService TASK_EXPIRATION_EXECUTOR =
+            Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "agent-composer-task-expiration");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     @Config
     private AgentComposerConfiguration config;
@@ -111,6 +124,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     private RequestHandlerManager legacyCardHandlerManager;
     private RequestHandlerManager traceReportHandlerManager;
     private RequestHandlerManager brandAssetHandlerManager;
+    private volatile byte[] agentCardBytes;
 
     @Override
     public void onStart(SourceCallback<String, AgentListenerAttributes> sourceCallback) throws MuleException {
@@ -123,10 +137,6 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                             + configName + "'. Ensure this name matches an <http:listener-config> in your Mule app.", e));
         }
 
-        // Build agent card once at startup — pass httpServer so the URL is absolute
-        String agentCardJson = AgentCardBuilder.build(config, httpServer);
-        byte[] cardBytes  = agentCardJson.getBytes(StandardCharsets.UTF_8);
-
         String normalizedPath = config.getAgentPath().startsWith("/")
                 ? config.getAgentPath() : "/" + config.getAgentPath();
         String normalizedTracePath = config.getTracesPath().startsWith("/")
@@ -135,8 +145,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         // ── GET {agentPath}/.well-known/agent-card.json  +  {agentPath}/.well-known/agent.json ──
         String scopedCardPath = normalizedPath + CARD_SUFFIX;
         String legacyCardPath = normalizedPath + LEGACY_CARD_SUFFIX;
-        cardHandlerManager = addCardHandler(scopedCardPath, cardBytes);
-        scopedCardHandlerManager = addCardHandler(legacyCardPath, cardBytes);
+        cardHandlerManager = addCardHandler(scopedCardPath);
+        scopedCardHandlerManager = addCardHandler(legacyCardPath);
         traceReportHandlerManager = addTraceReportHandler(normalizedTracePath);
         int traceSlash = normalizedTracePath.lastIndexOf('/');
         String traceBasePath = traceSlash > 0 ? normalizedTracePath.substring(0, traceSlash) : "";
@@ -203,6 +213,16 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                     return;
                 }
 
+                if (isTaskListRequest(methodName, a2aVersion)) {
+                    handleTaskListRequest(responseCallback, body, isJsonRpc, rpcIdJson, a2aVersion);
+                    return;
+                }
+
+                if (isTaskSubscribeRequest(methodName, a2aVersion)) {
+                    handleTaskSubscribeRequest(responseCallback, body, isJsonRpc, rpcIdJson, a2aVersion);
+                    return;
+                }
+
                 if (methodName != null && !isMessageSendRequest(methodName, a2aVersion)
                         && !isStreamingRequest(methodName, a2aVersion)) {
                     sendProtocolError(responseCallback, 400, -32601,
@@ -232,7 +252,8 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                                 "message.contextId does not match the referenced task.", isJsonRpc, rpcIdJson);
                         return;
                     }
-                    if (isTerminalState(extractTaskState(existingTask))) {
+                    if (isTerminalState(extractTaskState(existingTask))
+                            && !hasPendingPermissionCheckpoint(existingContextId)) {
                         sendProtocolError(responseCallback, 400, -32004,
                                 "Messages cannot be sent to a task in a terminal state.", isJsonRpc, rpcIdJson);
                         return;
@@ -242,6 +263,21 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 String contextId = resolveContextId(requestContextId, taskId);
                 String flowBody = normalizeMessageForFlow(body, contextId, taskId);
 
+                if (requestedTaskId != null) {
+                    synchronized (taskTransitionLock(taskId)) {
+                        JsonObject current = loadTask(taskId);
+                        String state = extractTaskState(current);
+                        if (!canAcceptInput(state, hasPendingPermissionCheckpoint(contextId))) {
+                            sendProtocolError(responseCallback, 409, -32004,
+                                    "Task is not currently accepting an input message.", isJsonRpc, rpcIdJson);
+                            return;
+                        }
+                        persistTask(buildTask(taskId, contextId, "submitted", null, null, null));
+                    }
+                } else {
+                    persistTask(buildTask(taskId, contextId, "submitted", null, null, null));
+                }
+
                 AgentListenerAttributes attributes = new AgentListenerAttributes(
                         method,
                         requestCtx.getRequest().getPath(),
@@ -250,8 +286,6 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                         requestId);
 
                 // Store HTTP callback in context so @OnSuccess / @OnError can send the response
-                persistTask(buildTask(taskId, contextId, "submitted", null, null, null));
-
                 // ── Streaming: message/stream (0.3) or SendStreamingMessage (1.0) ──
                 // The Mule flow remains authoritative so Execute Agent's maxIterations
                 // and all other operation parameters apply identically to both transports.
@@ -295,6 +329,9 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
     @Override
     public void onStop() {
         StreamingEventRegistry.clear();
+        TaskSubscriptionRegistry.clear();
+        TASK_TRANSITION_LOCKS.clear();
+        agentCardBytes = null;
         if (agentHandlerManager != null) {
             agentHandlerManager.stop();
         }
@@ -444,11 +481,23 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
 
     // ── A2A + card helpers ────────────────────────────────────────────────────
 
-    private RequestHandlerManager addCardHandler(String path, byte[] cardBytes) {
+    private RequestHandlerManager addCardHandler(String path) {
         return httpServer.addRequestHandler(path, (requestCtx, responseCallback) -> {
             if (!"GET".equalsIgnoreCase(requestCtx.getRequest().getMethod())) {
                 sendProtocolError(responseCallback, 405, -32005, "Method Not Allowed", false, null);
                 return;
+            }
+            // Build lazily after all application sources have started. This avoids probing an MCP
+            // server hosted by the same Mule application before its listener is available.
+            byte[] cardBytes = agentCardBytes;
+            if (cardBytes == null) {
+                synchronized (this) {
+                    cardBytes = agentCardBytes;
+                    if (cardBytes == null) {
+                        cardBytes = AgentCardBuilder.build(config, httpServer).getBytes(StandardCharsets.UTF_8);
+                        agentCardBytes = cardBytes;
+                    }
+                }
             }
             sendResponseBytes(responseCallback, 200, cardBytes);
         });
@@ -480,6 +529,13 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             String method = requestCtx.getRequest().getMethod();
             String executionId = requestCtx.getRequest().getQueryParams().get("executionId");
             if ("POST".equalsIgnoreCase(method)
+                    && "clear".equalsIgnoreCase(requestCtx.getRequest().getQueryParams().get("action"))) {
+                int removed = ExecutionTraceStore.clear(objectStoreManager, config.getObjectStore());
+                sendResponseWithContentType(responseCallback, 200,
+                        "{\"cleared\":" + removed + "}", "application/json; charset=UTF-8");
+                return;
+            }
+            if ("POST".equalsIgnoreCase(method)
                     && "cancel".equalsIgnoreCase(requestCtx.getRequest().getQueryParams().get("action"))) {
                 boolean stopped = ExecutionCancellationRegistry.cancel(executionId);
                 sendResponseWithContentType(responseCallback, stopped ? 202 : 409,
@@ -505,7 +561,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 }
                 return;
             }
-            ExecutionTrace trace = ExecutionTraceStore.get(executionId,
+            ExecutionTrace trace = ExecutionTraceStore.getCorrelated(executionId,
                     objectStoreManager, config.getObjectStore());
             if (trace == null) {
                 if (json) {
@@ -563,29 +619,134 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
             return;
         }
 
-        JsonObject existingTask = loadTask(taskId);
-        if (existingTask == null) {
-            sendProtocolError(responseCallback, 404, -32001, "Task not found.", isJsonRpc, rpcIdJson);
-            return;
+        JsonObject canceledTask;
+        String contextId;
+        synchronized (taskTransitionLock(taskId)) {
+            JsonObject existingTask = loadTask(taskId);
+            if (existingTask == null) {
+                sendProtocolError(responseCallback, 404, -32001, "Task not found.", isJsonRpc, rpcIdJson);
+                return;
+            }
+            String currentState = extractTaskState(existingTask);
+            if (isTerminalState(currentState)) {
+                sendProtocolError(responseCallback, 409, -32002,
+                        "Task cannot be canceled from state '" + currentState + "'.", isJsonRpc, rpcIdJson);
+                return;
+            }
+            contextId = extractTaskContextId(existingTask, taskId);
+            canceledTask = buildTask(taskId, contextId,
+                    "canceled", "Task canceled by client request.", null, null);
+            if (existingTask.has("history")) {
+                canceledTask.add("history", existingTask.get("history").deepCopy());
+            }
+            persistTask(canceledTask);
         }
-
-        String currentState = extractTaskState(existingTask);
-        if (isTerminalState(currentState)) {
-            sendProtocolError(responseCallback, 409, -32002,
-                    "Task cannot be canceled from state '" + currentState + "'.", isJsonRpc, rpcIdJson);
-            return;
-        }
-
-        JsonObject canceledTask = buildTask(taskId, extractTaskContextId(existingTask, taskId),
-                "canceled", "Task canceled by client request.", null, null);
-        if (existingTask.has("history")) {
-            canceledTask.add("history", existingTask.get("history").deepCopy());
-        }
-        String contextId = extractTaskContextId(existingTask, taskId);
-        persistTask(canceledTask);
         ExecutionCancellationRegistry.cancel(contextId);
         removePendingInputState(contextId);
         sendResponse(responseCallback, 200, wrapDirectTaskResponse(canceledTask, isJsonRpc, rpcIdJson, a2aVersion));
+    }
+
+    private void handleTaskListRequest(HttpResponseReadyCallback responseCallback, String body, boolean isJsonRpc,
+                                       String rpcIdJson, String a2aVersion) {
+        if (!isA2aV1(a2aVersion)) {
+            sendProtocolError(responseCallback, 400, -32601,
+                    "Task listing is available in A2A 1.0 only.", isJsonRpc, rpcIdJson);
+            return;
+        }
+        JsonObject root = parseJsonObject(body);
+        JsonObject params = root != null && root.has("params") && root.get("params").isJsonObject()
+                ? root.getAsJsonObject("params") : new JsonObject();
+        String requestedContext = stringValue(params, "contextId");
+        String requestedStatus = stringValue(params, "status");
+        int pageSize = intValue(params, "pageSize", 50, 1, 100);
+        int offset = intValue(params, "pageToken", 0, 0, Integer.MAX_VALUE);
+        JsonArray tasks = new JsonArray();
+        int matched = 0;
+        int nextOffset = -1;
+        try {
+            ObjectStore<Serializable> store = objectStoreManager.getObjectStore(config.getObjectStore());
+            java.util.List<JsonObject> snapshots = new java.util.ArrayList<>();
+            for (String key : store.allKeys()) {
+                if (!key.startsWith(TASK_STORE_PREFIX)) continue;
+                JsonObject task = loadTask(key.substring(TASK_STORE_PREFIX.length()));
+                if (task != null) snapshots.add(task);
+            }
+            snapshots.sort((left, right) -> valueOrEmpty(stringValue(right, "lastModified"))
+                    .compareTo(valueOrEmpty(stringValue(left, "lastModified"))));
+            for (JsonObject task : snapshots) {
+                if (requestedContext != null && !requestedContext.equals(extractTaskContextId(task, null))) continue;
+                if (requestedStatus != null && !requestedStatus.equalsIgnoreCase(extractTaskState(task))) continue;
+                if (matched++ < offset) continue;
+                if (tasks.size() >= pageSize) { nextOffset = matched - 1; break; }
+                tasks.add(toWireResult(task, null, a2aVersion));
+            }
+        } catch (Exception e) {
+            sendProtocolError(responseCallback, 500, -32000,
+                    "Could not list tasks.", isJsonRpc, rpcIdJson);
+            return;
+        }
+        JsonObject result = new JsonObject();
+        result.add("tasks", tasks);
+        if (nextOffset >= 0) result.addProperty("nextPageToken", String.valueOf(nextOffset));
+        sendResponse(responseCallback, 200, wrapResult(result, null, isJsonRpc, rpcIdJson, a2aVersion));
+    }
+
+    private void handleTaskSubscribeRequest(HttpResponseReadyCallback responseCallback, String body,
+                                             boolean isJsonRpc, String rpcIdJson, String a2aVersion) {
+        String taskId = extractTaskOperationId(body);
+        JsonObject task = loadTask(taskId);
+        if (task == null) {
+            sendProtocolError(responseCallback, 404, -32001, "Task not found.", isJsonRpc, rpcIdJson);
+            return;
+        }
+        if (isTerminalState(extractTaskState(task))) {
+            sendProtocolError(responseCallback, 409, -32002,
+                    "Cannot subscribe to a task in a terminal state.", isJsonRpc, rpcIdJson);
+            return;
+        }
+        try {
+            PipedOutputStream out = new PipedOutputStream();
+            PipedInputStream in = new PipedInputStream(out, 131072);
+            AtomicBoolean closed = new AtomicBoolean(false);
+            final Runnable[] unregister = new Runnable[1];
+            unregister[0] = TaskSubscriptionRegistry.register(taskId, payload -> {
+                if (closed.get()) return;
+                try {
+                    JsonObject update = JsonParser.parseString(payload).getAsJsonObject();
+                    synchronized (out) {
+                        out.write(buildTaskSseEvent(update, isJsonRpc, rpcIdJson, a2aVersion)
+                                .getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                    }
+                    if (isTerminalState(extractTaskState(update)) && closed.compareAndSet(false, true)) {
+                        unregister[0].run();
+                        out.close();
+                    }
+                } catch (Exception e) {
+                    if (closed.compareAndSet(false, true)) unregister[0].run();
+                    try { out.close(); } catch (Exception ignored) {}
+                }
+            });
+            out.write(buildTaskSseEvent(task, isJsonRpc, rpcIdJson, a2aVersion)
+                    .getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            HttpResponse response = HttpResponse.builder().statusCode(200)
+                    .addHeader("Content-Type", "text/event-stream; charset=UTF-8")
+                    .addHeader("Cache-Control", "no-cache, no-transform")
+                    .addHeader("Connection", "keep-alive")
+                    .addHeader("X-Accel-Buffering", "no")
+                    .entity(new InputStreamHttpEntity(in)).build();
+            responseCallback.responseReady(response, new org.mule.runtime.http.api.server.async.ResponseStatusCallback() {
+                @Override public void responseSendFailure(Throwable throwable) {
+                    if (closed.compareAndSet(false, true)) unregister[0].run();
+                    try { out.close(); } catch (Exception ignored) {}
+                }
+                @Override public void responseSendSuccessfully() { }
+            });
+        } catch (Exception e) {
+            sendProtocolError(responseCallback, 500, -32000,
+                    "Could not establish task subscription.", isJsonRpc, rpcIdJson);
+        }
     }
 
     private void removePendingInputState(String contextId) {
@@ -774,13 +935,74 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         try {
             ObjectStore<Serializable> store = objectStoreManager.getObjectStore(config.getObjectStore());
             String key = taskStoreKey(task.get("id").getAsString());
-            if (store.contains(key)) {
-                store.remove(key);
+            synchronized (store) {
+                JsonObject previous = null;
+                if (store.contains(key)) {
+                    previous = JsonParser.parseString((String) store.retrieve(key)).getAsJsonObject();
+                }
+                if (previous != null && isTerminalState(extractTaskState(previous))
+                        && !extractTaskState(previous).equals(extractTaskState(task))
+                        && !("submitted".equals(extractTaskState(task))
+                        && hasPendingPermissionCheckpoint(extractTaskContextId(previous, null), store))) {
+                    LOGGER.debug("Ignoring invalid A2A task transition {} -> {} for {}",
+                            extractTaskState(previous), extractTaskState(task), task.get("id").getAsString());
+                    return;
+                }
+                String createdAt = previous != null && previous.has("createdAt")
+                        ? previous.get("createdAt").getAsString() : nowUtc();
+                task.addProperty("createdAt", createdAt);
+                task.addProperty("lastModified", nowUtc());
+                if (store.contains(key)) store.remove(key);
+                store.store(key, task.toString());
             }
-            store.store(key, task.toString());
+            TaskSubscriptionRegistry.publish(task.get("id").getAsString(), task.toString());
+            if (isTerminalState(extractTaskState(task))) {
+                TASK_TRANSITION_LOCKS.remove(task.get("id").getAsString());
+                ScheduledFuture<?> expiration = TASK_EXPIRATIONS.remove(task.get("id").getAsString());
+                if (expiration != null) expiration.cancel(false);
+            } else {
+                schedulePermissionExpiration(task);
+            }
         } catch (Exception e) {
             LOGGER.warn("Could not persist A2A task snapshot: {}", e.getMessage());
         }
+    }
+
+    private void schedulePermissionExpiration(JsonObject task) {
+        Long expiresAt = permissionExpiration(task);
+        if (expiresAt == null || task == null || !task.has("id")) return;
+        String taskId = task.get("id").getAsString();
+        ScheduledFuture<?> previous = TASK_EXPIRATIONS.remove(taskId);
+        if (previous != null) previous.cancel(false);
+        long delay = Math.max(0L, expiresAt - System.currentTimeMillis());
+        ScheduledFuture<?> scheduled = TASK_EXPIRATION_EXECUTOR.schedule(() -> {
+            try {
+                loadTask(taskId);
+            } finally {
+                TASK_EXPIRATIONS.remove(taskId);
+            }
+        }, delay, TimeUnit.MILLISECONDS);
+        TASK_EXPIRATIONS.put(taskId, scheduled);
+    }
+
+    private static Long permissionExpiration(JsonObject task) {
+        if (task == null || !"input-required".equals(extractTaskState(task))) return null;
+        try {
+            JsonArray parts = task.getAsJsonObject("status").getAsJsonObject("message")
+                    .getAsJsonArray("parts");
+            for (JsonElement element : parts) {
+                if (!element.isJsonObject()) continue;
+                JsonObject part = element.getAsJsonObject();
+                if (!part.has("data") || !part.get("data").isJsonObject()) continue;
+                JsonObject data = part.getAsJsonObject("data");
+                if ("tool_permission".equals(stringValue(data, "inputKind"))
+                        && data.has("permissionExpiresAtEpochMs")
+                        && !data.get("permissionExpiresAtEpochMs").isJsonNull()) {
+                    return data.get("permissionExpiresAtEpochMs").getAsLong();
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 
     private JsonObject loadTask(String taskId) {
@@ -794,15 +1016,100 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
                 return null;
             }
             String payload = (String) store.retrieve(key);
-            return JsonParser.parseString(payload).getAsJsonObject();
+            return expirePermissionTaskIfNeeded(JsonParser.parseString(payload).getAsJsonObject(), store);
         } catch (Exception e) {
             LOGGER.warn("Could not load A2A task '{}' from store: {}", taskId, e.getMessage());
             return null;
         }
     }
 
+    private boolean hasActivePendingPermission(String contextId) {
+        try {
+            ObjectStore<Serializable> store = objectStoreManager.getObjectStore(config.getObjectStore());
+            return hasActivePendingPermission(contextId, store);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean hasPendingPermissionCheckpoint(String contextId) {
+        try {
+            ObjectStore<Serializable> store = objectStoreManager.getObjectStore(config.getObjectStore());
+            return hasPendingPermissionCheckpoint(contextId, store);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean hasPendingPermissionCheckpoint(String contextId, ObjectStore<Serializable> store) {
+        if (contextId == null || contextId.trim().isEmpty() || store == null) return false;
+        try {
+            return store.contains("tool:permission:" + contextId);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean hasActivePendingPermission(String contextId, ObjectStore<Serializable> store) {
+        if (contextId == null || contextId.trim().isEmpty() || store == null) return false;
+        try {
+            String key = "tool:permission:" + contextId;
+            if (!store.contains(key)) return false;
+            JsonObject pending = JsonParser.parseString((String) store.retrieve(key)).getAsJsonObject();
+            long expiresAt = pending.has("expiresAtEpochMs")
+                    ? pending.get("expiresAtEpochMs").getAsLong() : 0L;
+            return expiresAt <= 0 || System.currentTimeMillis() < expiresAt;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /** Lazily materializes permission expiration whenever a task is read or addressed. */
+    private JsonObject expirePermissionTaskIfNeeded(JsonObject task, ObjectStore<Serializable> store) {
+        if (task == null || store == null) return task;
+        String contextId = extractTaskContextId(task, null);
+        if (contextId == null) return task;
+        String permissionKey = "tool:permission:" + contextId;
+        try {
+            synchronized (store) {
+                if (!store.contains(permissionKey)) return task;
+                JsonObject pending = JsonParser.parseString((String) store.retrieve(permissionKey)).getAsJsonObject();
+                long expiresAt = pending.has("expiresAtEpochMs")
+                        ? pending.get("expiresAtEpochMs").getAsLong() : 0L;
+                long createdAt = pending.has("createdAtEpochMs")
+                        ? pending.get("createdAtEpochMs").getAsLong() : expiresAt;
+                if (expiresAt <= 0 || System.currentTimeMillis() < expiresAt) return task;
+
+                String taskId = task.get("id").getAsString();
+                JsonObject expired = buildTask(taskId, contextId, "expired",
+                        "Tool permission request expired while waiting for customer approval.", null, null);
+                if (task.has("createdAt")) expired.add("createdAt", task.get("createdAt").deepCopy());
+                if (task.has("history")) expired.add("history", task.get("history").deepCopy());
+                if (task.has("metadata")) expired.add("metadata", task.get("metadata").deepCopy());
+                expired.addProperty("lastModified", nowUtc());
+                String taskKey = taskStoreKey(taskId);
+                if (store.contains(taskKey)) store.remove(taskKey);
+                store.store(taskKey, expired.toString());
+                if (objectStoreManager != null && config != null) {
+                    ExecutionTraceStore.expirePermission(contextId,
+                            Math.max(0L, expiresAt - createdAt), objectStoreManager, config.getObjectStore());
+                }
+                TaskSubscriptionRegistry.publish(taskId, expired.toString());
+                return expired;
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Could not expire tool permission task '{}': {}",
+                    task.has("id") ? task.get("id").getAsString() : "unknown", e.getMessage());
+            return task;
+        }
+    }
+
     private static String taskStoreKey(String taskId) {
         return TASK_STORE_PREFIX + taskId;
+    }
+
+    private static Object taskTransitionLock(String taskId) {
+        return TASK_TRANSITION_LOCKS.computeIfAbsent(taskId, ignored -> new Object());
     }
 
     private static String stringifyPayload(TypedValue<Object> payload) {
@@ -894,9 +1201,38 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return isA2aV1(a2aVersion) ? "CancelTask".equals(methodName) : "tasks/cancel".equals(methodName);
     }
 
+    private static boolean isTaskListRequest(String methodName, String a2aVersion) {
+        return isA2aV1(a2aVersion) && "ListTasks".equals(methodName);
+    }
+
+    private static boolean isTaskSubscribeRequest(String methodName, String a2aVersion) {
+        return isA2aV1(a2aVersion)
+                ? "SubscribeToTask".equals(methodName)
+                : "tasks/resubscribe".equals(methodName);
+    }
+
     private static boolean isMessageSendRequest(String methodName, String a2aVersion) {
         if (methodName == null) return true;
         return isA2aV1(a2aVersion) ? "SendMessage".equals(methodName) : "message/send".equals(methodName);
+    }
+
+    private static String stringValue(JsonObject object, String field) {
+        return object != null && object.has(field) && !object.get(field).isJsonNull()
+                ? object.get(field).getAsString() : null;
+    }
+
+    private static int intValue(JsonObject object, String field, int fallback, int minimum, int maximum) {
+        try {
+            int value = object != null && object.has(field)
+                    ? Integer.parseInt(object.get(field).getAsString()) : fallback;
+            return Math.max(minimum, Math.min(maximum, value));
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
+    private static String valueOrEmpty(String value) {
+        return value != null ? value : "";
     }
 
     private static String validateMessageRequest(JsonObject root, String a2aVersion) {
@@ -1140,6 +1476,7 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         copyIfPresent(agentResponse, data, "permissionServerName");
         copyIfPresent(agentResponse, data, "permissionToolName");
         copyIfPresent(agentResponse, data, "permissionArguments");
+        copyIfPresent(agentResponse, data, "permissionExpiresAtEpochMs");
         copyIfPresent(agentResponse, data, "responseSchema");
         copyIfPresent(agentResponse, data, "executionId");
         copyIfPresent(agentResponse, data, "traceReportPath");
@@ -1149,13 +1486,23 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         parts.add(part);
     }
 
-    private static void addTraceMetadata(JsonObject task, JsonObject agentResponse) {
+    private void addTraceMetadata(JsonObject task, JsonObject agentResponse) {
         if (task == null || agentResponse == null) return;
         JsonObject metadata = task.has("metadata") && task.get("metadata").isJsonObject()
                 ? task.getAsJsonObject("metadata") : new JsonObject();
         copyIfPresent(agentResponse, metadata, "executionId");
         copyIfPresent(agentResponse, metadata, "traceReportPath");
         if (metadata.size() > 0) task.add("metadata", metadata);
+        if (agentResponse.has("executionId") && !agentResponse.get("executionId").isJsonNull()) {
+            String executionId = agentResponse.get("executionId").getAsString();
+            ExecutionTraceStore.attribute(executionId, "a2aTaskId",
+                    task.has("id") ? task.get("id").getAsString() : null,
+                    objectStoreManager, config.getObjectStore());
+            ExecutionTraceStore.attribute(executionId, "a2aContextId",
+                    extractTaskContextId(task, null), objectStoreManager, config.getObjectStore());
+            ExecutionTraceStore.attribute(executionId, "agentPath", config.getAgentPath(),
+                    objectStoreManager, config.getObjectStore());
+        }
     }
 
     private static void copyIfPresent(JsonObject source, JsonObject target, String field) {
@@ -1492,7 +1839,14 @@ public class AgentListenerSource extends Source<String, AgentListenerAttributes>
         return "completed".equals(state)
                 || "failed".equals(state)
                 || "canceled".equals(state)
-                || "rejected".equals(state);
+                || "rejected".equals(state)
+                || "expired".equals(state);
+    }
+
+    private static boolean canAcceptInput(String state, boolean activePermissionCheckpoint) {
+        return "input-required".equals(state)
+                || "auth-required".equals(state)
+                || (activePermissionCheckpoint && isTerminalState(state));
     }
 
     /** Reads the {@code A2A-Version} header, falling back to the query parameter; empty/absent means 0.3. */

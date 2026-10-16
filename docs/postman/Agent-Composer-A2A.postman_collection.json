@@ -24,6 +24,7 @@
     { "key": "taskId", "value": "" },
     { "key": "contextId", "value": "" },
     { "key": "permissionRequestId", "value": "" },
+    { "key": "permissionExpiresAtEpochMs", "value": "" },
     { "key": "taskState", "value": "" },
     { "key": "pushConfigId", "value": "test-push-config" },
     { "key": "webhookUrl", "value": "https://example.invalid/a2a-events" }
@@ -63,7 +64,8 @@
             "const parts = task?.status?.message?.parts || [];",
             "const data = parts.find(p => p.kind === 'data')?.data;",
             "if (data?.permissionRequestId) pm.environment.set('permissionRequestId', data.permissionRequestId);",
-            "pm.test('A2A 0.3 permission task is input-required', () => { pm.expect(task?.kind).to.eql('task'); pm.expect(task?.status?.state).to.eql('input-required'); pm.expect(data?.inputKind).to.eql('tool_permission'); pm.expect(data?.permissionRequestId).to.be.a('string').and.not.empty; });"
+            "if (data?.permissionExpiresAtEpochMs) pm.environment.set('permissionExpiresAtEpochMs', data.permissionExpiresAtEpochMs);",
+            "pm.test('A2A 0.3 permission task is input-required', () => { pm.expect(task?.kind).to.eql('task'); pm.expect(task?.status?.state).to.eql('input-required'); pm.expect(data?.inputKind).to.eql('tool_permission'); pm.expect(data?.permissionRequestId).to.be.a('string').and.not.empty; pm.expect(data?.responseSchema?.properties?.action?.enum).to.eql(['approve','deny']); });"
           ] } }],
           "request": {
             "method": "POST",
@@ -93,6 +95,7 @@
               "if (paused?.status?.state) pm.environment.set('taskState', paused.status.state);",
               "const data = (paused?.status?.message?.parts || []).find(p => p.kind === 'data')?.data;",
               "if (data?.permissionRequestId) pm.environment.set('permissionRequestId', data.permissionRequestId);",
+              "if (data?.permissionExpiresAtEpochMs) pm.environment.set('permissionExpiresAtEpochMs', data.permissionExpiresAtEpochMs);",
               "pm.test('Streaming task paused for permission', () => { pm.expect(paused?.taskId).to.eql(initial?.id); pm.expect(data?.inputKind).to.eql('tool_permission'); });"
             ] } }
           ],
@@ -115,6 +118,17 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "0.3" }],
             "body": { "mode": "raw", "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"{{$guid}}\",\n  \"method\": \"tasks/get\",\n  \"params\": { \"id\": \"{{taskId}}\", \"historyLength\": 10 }\n}" },
             "url": "{{baseUrl}}{{agentPath}}"
+          }
+        },
+        {
+          "name": "tasks/get - Verify Permission Expired",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const task = pm.response.json().result; pm.test('Permission wait elapsed and task is expired', () => pm.expect(task?.status?.state).to.eql('expired')); if (task?.status?.state) pm.environment.set('taskState', task.status.state);"] } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "0.3" }],
+            "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"tasks/get\",\"params\":{\"id\":\"{{taskId}}\"}}" },
+            "url": "{{baseUrl}}{{agentPath}}",
+            "description": "Set Tool Permission Wait Time to a short value, start a permission task, wait past permissionExpiresAtEpochMs, then run this request."
           }
         },
         {
@@ -147,7 +161,7 @@
         {
           "name": "tasks/cancel",
           "event": [
-            { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["if (!pm.environment.get('taskId')) throw new Error('Run Start Permission Task first.');", "if (['completed','failed','canceled','rejected'].includes(pm.environment.get('taskState'))) throw new Error('The selected task is terminal. Start a fresh permission task before testing cancel.');"] } },
+            { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["if (!pm.environment.get('taskId')) throw new Error('Run Start Permission Task first.');", "if (['completed','failed','canceled','rejected','expired'].includes(pm.environment.get('taskState'))) throw new Error('The selected task is terminal. Start a fresh permission task before testing cancel.');"] } },
             { "listen": "test", "script": { "type": "text/javascript", "exec": ["const task = pm.response.json().result; if (task?.status?.state) pm.environment.set('taskState', task.status.state);"] } }
           ],
           "request": {
@@ -157,14 +171,14 @@
             "url": "{{baseUrl}}{{agentPath}}",
             "description": "Cancels the current submitted, working, or input-required task. Rerun Start Permission Task before testing cancel if another action already completed the task."
           }
-        }
+        },
+        { "name": "tasks/resubscribe", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Accept", "value": "text/event-stream" }, { "key": "A2A-Version", "value": "0.3" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"tasks/resubscribe\",\"params\":{\"id\":\"{{taskId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}", "description": "Reconnects to a non-terminal task stream. Run a streaming start request first." } }
       ]
     },
     {
       "name": "A2A 0.3 - Unsupported Capability Probes",
       "description": "These official 0.3 operations are included for completeness. Agent Composer does not advertise their capabilities and currently returns Method not found.",
       "item": [
-        { "name": "tasks/resubscribe", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "0.3" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"tasks/resubscribe\",\"params\":{\"id\":\"{{taskId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
         { "name": "tasks/pushNotificationConfig/set", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "0.3" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"tasks/pushNotificationConfig/set\",\"params\":{\"taskId\":\"{{taskId}}\",\"pushNotificationConfig\":{\"id\":\"{{pushConfigId}}\",\"url\":\"{{webhookUrl}}\"}}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
         { "name": "tasks/pushNotificationConfig/get", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "0.3" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"tasks/pushNotificationConfig/get\",\"params\":{\"taskId\":\"{{taskId}}\",\"id\":\"{{pushConfigId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
         { "name": "tasks/pushNotificationConfig/list", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "0.3" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"tasks/pushNotificationConfig/list\",\"params\":{\"taskId\":\"{{taskId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
@@ -191,7 +205,8 @@
             "if (task?.status?.state) pm.environment.set('taskState', task.status.state);",
             "const data = (task?.status?.message?.parts || []).find(p => p.data)?.data;",
             "if (data?.permissionRequestId) pm.environment.set('permissionRequestId', data.permissionRequestId);",
-            "pm.test('A2A 1.0 permission task is input-required', () => { pm.expect(task?.id).to.be.a('string'); pm.expect(task?.status?.state).to.eql('TASK_STATE_INPUT_REQUIRED'); pm.expect(data?.inputKind).to.eql('tool_permission'); pm.expect(data?.permissionRequestId).to.be.a('string').and.not.empty; });"
+            "if (data?.permissionExpiresAtEpochMs) pm.environment.set('permissionExpiresAtEpochMs', data.permissionExpiresAtEpochMs);",
+            "pm.test('A2A 1.0 permission task is input-required', () => { pm.expect(task?.id).to.be.a('string'); pm.expect(task?.status?.state).to.eql('TASK_STATE_INPUT_REQUIRED'); pm.expect(data?.inputKind).to.eql('tool_permission'); pm.expect(data?.permissionRequestId).to.be.a('string').and.not.empty; pm.expect(data?.responseSchema?.properties?.action?.enum).to.eql(['approve','deny']); });"
           ] } }],
           "request": {
             "method": "POST",
@@ -217,6 +232,7 @@
               "if (paused?.status?.state) pm.environment.set('taskState', paused.status.state);",
               "const data = (paused?.status?.message?.parts || []).find(p => p.data)?.data;",
               "if (data?.permissionRequestId) pm.environment.set('permissionRequestId', data.permissionRequestId);",
+              "if (data?.permissionExpiresAtEpochMs) pm.environment.set('permissionExpiresAtEpochMs', data.permissionExpiresAtEpochMs);",
               "pm.test('Streaming task paused for permission', () => { pm.expect(paused?.taskId).to.eql(initial?.id); pm.expect(data?.inputKind).to.eql('tool_permission'); });"
             ] } }
           ],
@@ -234,6 +250,17 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "1.0" }],
             "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"GetTask\",\"params\":{\"id\":\"{{taskId}}\",\"historyLength\":10}}" },
             "url": "{{baseUrl}}{{agentPath}}"
+          }
+        },
+        {
+          "name": "GetTask - Verify Permission Expired",
+          "event": [{ "listen": "test", "script": { "type": "text/javascript", "exec": ["const task = pm.response.json().result; pm.test('Permission wait elapsed and task is expired', () => pm.expect(task?.status?.state).to.eql('TASK_STATE_EXPIRED')); if (task?.status?.state) pm.environment.set('taskState', task.status.state);"] } }],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "1.0" }],
+            "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"GetTask\",\"params\":{\"id\":\"{{taskId}}\"}}" },
+            "url": "{{baseUrl}}{{agentPath}}",
+            "description": "Set Tool Permission Wait Time to a short value, start a permission task, wait past permissionExpiresAtEpochMs, then run this request."
           }
         },
         {
@@ -265,7 +292,7 @@
         {
           "name": "CancelTask",
           "event": [
-            { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["if (!pm.environment.get('taskId')) throw new Error('Run Start Permission Task first.');", "if (['TASK_STATE_COMPLETED','TASK_STATE_FAILED','TASK_STATE_CANCELED','TASK_STATE_REJECTED'].includes(pm.environment.get('taskState'))) throw new Error('The selected task is terminal. Start a fresh permission task before testing cancel.');"] } },
+            { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["if (!pm.environment.get('taskId')) throw new Error('Run Start Permission Task first.');", "if (['TASK_STATE_COMPLETED','TASK_STATE_FAILED','TASK_STATE_CANCELED','TASK_STATE_REJECTED','TASK_STATE_EXPIRED'].includes(pm.environment.get('taskState'))) throw new Error('The selected task is terminal. Start a fresh permission task before testing cancel.');"] } },
             { "listen": "test", "script": { "type": "text/javascript", "exec": ["const task = pm.response.json().result; if (task?.status?.state) pm.environment.set('taskState', task.status.state);"] } }
           ],
           "request": {
@@ -274,15 +301,15 @@
             "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"CancelTask\",\"params\":{\"id\":\"{{taskId}}\"}}" },
             "url": "{{baseUrl}}{{agentPath}}"
           }
-        }
+        },
+        { "name": "ListTasks", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "1.0" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"ListTasks\",\"params\":{\"pageSize\":20}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
+        { "name": "SubscribeToTask", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Accept", "value": "text/event-stream" }, { "key": "A2A-Version", "value": "1.0" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"SubscribeToTask\",\"params\":{\"id\":\"{{taskId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}", "description": "Subscribes to a non-terminal task and receives its current snapshot plus later transitions." } }
       ]
     },
     {
       "name": "A2A 1.0 - Unsupported Capability Probes",
       "description": "Included to cover the complete 1.0 operation surface. These are not advertised by Agent Composer and currently return Method not found.",
       "item": [
-        { "name": "ListTasks", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "1.0" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"ListTasks\",\"params\":{\"pageSize\":20}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
-        { "name": "SubscribeToTask", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Accept", "value": "text/event-stream" }, { "key": "A2A-Version", "value": "1.0" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"SubscribeToTask\",\"params\":{\"id\":\"{{taskId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
         { "name": "CreateTaskPushNotificationConfig", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "1.0" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"CreateTaskPushNotificationConfig\",\"params\":{\"taskId\":\"{{taskId}}\",\"config\":{\"id\":\"{{pushConfigId}}\",\"url\":\"{{webhookUrl}}\"}}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
         { "name": "GetTaskPushNotificationConfig", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "1.0" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"GetTaskPushNotificationConfig\",\"params\":{\"taskId\":\"{{taskId}}\",\"id\":\"{{pushConfigId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}" } },
         { "name": "ListTaskPushNotificationConfigs", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "A2A-Version", "value": "1.0" }], "body": { "mode": "raw", "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"{{$guid}}\",\"method\":\"ListTaskPushNotificationConfigs\",\"params\":{\"taskId\":\"{{taskId}}\"}}" }, "url": "{{baseUrl}}{{agentPath}}" } },

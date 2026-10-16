@@ -596,7 +596,7 @@ public class ReactEngine {
                     }
                     PendingToolPermissionState state = buildPendingPermissionState(userMessage,
                             maxIterations, actualIterations, toolFailureCount, resumedSession,
-                            messages, permissionContinuations);
+                            messages, permissionContinuations, config.getToolPermissionWaitTimeSeconds());
                     savePendingPermission(store, conversationId, state);
                     traceInputRequired(iterationSpan, permissionTraceData(permissionContinuations.get(0)));
                     emitIterationComplete(callback, iteration + 1,
@@ -636,7 +636,8 @@ public class ReactEngine {
                     saveHistory(store, conversationId, messages);
                     PendingToolPermissionState state = buildPendingPermissionState(userMessage,
                             maxIterations, actualIterations, toolFailureCount, resumedSession,
-                            messages, Collections.singletonList(outcome.permission));
+                            messages, Collections.singletonList(outcome.permission),
+                            config.getToolPermissionWaitTimeSeconds());
                     savePendingPermission(store, conversationId, state);
                     traceInputRequired(iterationSpan, permissionTraceData(outcome.permission));
                     emitIterationComplete(callback, iteration + 1,
@@ -778,7 +779,12 @@ public class ReactEngine {
                 item.put("url", server.getServerUrl());
                 item.put("tools", tools.stream()
                         .filter(tool -> String.valueOf(server.getServerUrl()).equals(tool.getServerUrl()))
-                        .map(ToolDefinition::getName)
+                        .map(tool -> {
+                            Map<String, Object> toolInfo = new LinkedHashMap<>();
+                            toolInfo.put("name", tool.getName());
+                            toolInfo.put("description", tool.getDescription());
+                            return toolInfo;
+                        })
                         .collect(Collectors.toList()));
                 inventory.add(item);
             }
@@ -1645,7 +1651,7 @@ public class ReactEngine {
     private PendingToolPermissionState buildPendingPermissionState(
             String rootUserTask, int maxIterations, int actualIterations, int failureCount,
             boolean resumedSession, List<LlmMessage> messages,
-            List<PendingToolPermissionState.Continuation> queue) {
+            List<PendingToolPermissionState.Continuation> queue, int expirationSeconds) {
         PendingToolPermissionState state = new PendingToolPermissionState();
         state.setRootUserTask(rootUserTask);
         state.setMaxIterations(maxIterations);
@@ -1657,6 +1663,10 @@ public class ReactEngine {
         state.setQueue(queue);
         ExecutionTraceContext context = traceContext.get();
         if (context != null) state.setOriginExecutionId(context.getExecutionId());
+        long createdAt = System.currentTimeMillis();
+        state.setCreatedAtEpochMs(createdAt);
+        state.setExpiresAtEpochMs(expirationSeconds > 0
+                ? createdAt + (expirationSeconds * 1000L) : 0L);
         return state;
     }
 
@@ -1710,10 +1720,17 @@ public class ReactEngine {
             removePendingPermission(store, conversationId);
             throw new IllegalStateException("Stored tool permission state is missing or uses an unsupported version");
         }
+        boolean expired = state.isExpired(System.currentTimeMillis());
         List<LlmMessage> messages = state.getMessages() != null
                 ? new ArrayList<>(state.getMessages()) : new ArrayList<>();
         PendingToolPermissionState.Continuation active = state.getQueue().get(0);
-        ParsedPermissionAnswer answer = parsePermissionAnswer(rawAnswer, active);
+        ParsedPermissionAnswer answer = new ParsedPermissionAnswer();
+        if (expired) {
+            answer.action = "expired";
+            answer.requestId = active.getPermissionRequestId();
+        } else {
+            answer = parsePermissionAnswer(rawAnswer, active);
+        }
         if (answer.error != null) {
             savePendingPermission(store, conversationId, state);
             return ResumeResult.waiting(buildPermissionResponse(state, conversationId, answer.error));
@@ -1722,10 +1739,23 @@ public class ReactEngine {
         ToolCall call = active.getToolCall();
         String observation;
         McpToolResult result = null;
+        Map<String, Object> decisionTrace = permissionTraceData(active);
+        decisionTrace.put("decision", answer.action);
+        decisionTrace.put("approvalWaitMs", Math.max(0L,
+                System.currentTimeMillis() - state.getCreatedAtEpochMs()));
+        String decisionName = "approve".equals(answer.action) ? "Approve "
+                : "deny".equals(answer.action) ? "Deny " : "Tool permission call expired: ";
         SpanScope toolSpan = startTraceSpan("TOOL_PERMISSION",
-                ("approve".equals(answer.action) ? "Approve " : "Deny ") + call.getName(),
-                parentSpanId, active.getParentIteration(), permissionTraceData(active));
-        if ("deny".equals(answer.action)) {
+                decisionName + call.getName(),
+                parentSpanId, active.getParentIteration(), decisionTrace);
+        if ("expired".equals(answer.action)) {
+            observation = "Tool permission call expired before customer approval. The tool was not executed. "
+                    + "Continue with another approach, or stop if the task cannot be completed safely without this tool.";
+            Map<String, Object> expiredResult = new LinkedHashMap<>();
+            expiredResult.put("decision", "expired");
+            expiredResult.put("permissionRequestId", active.getPermissionRequestId());
+            traceSuccess(toolSpan, expiredResult);
+        } else if ("deny".equals(answer.action)) {
             observation = "Tool call denied by user.";
             traceSuccess(toolSpan, Collections.singletonMap("decision", "denied"));
         } else {
@@ -1870,6 +1900,8 @@ public class ReactEngine {
         response.setPermissionServerName(active.getServerName());
         response.setPermissionToolName(call.getName());
         response.setPermissionArguments(call.getArguments());
+        response.setPermissionExpiresAtEpochMs(state.getExpiresAtEpochMs() > 0
+                ? state.getExpiresAtEpochMs() : null);
         response.setResponseSchema(toolPermissionResponseSchema());
         response.setResumedSession(state.isResumedSession());
         response.setFailureCount(state.getFailureCount());

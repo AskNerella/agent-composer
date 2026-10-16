@@ -12,7 +12,7 @@ Agent Composer is a Mule SDK connector for building ReAct agents without custom 
 <dependency>
   <groupId>com.k2</groupId>
   <artifactId>agent-composer</artifactId>
-  <version>1.1.18-SNAPSHOT</version>
+  <version>1.1.28-SNAPSHOT</version>
   <classifier>mule-plugin</classifier>
 </dependency>
 ```
@@ -81,7 +81,7 @@ Agent Composer records each agent run as a execution trace. The report is availa
 http://<host>:<listener-port>/agent/traces
 ```
 
-The trace index lists recent executions. Select an execution to inspect its ReAct flow, iteration and tool-call waterfall, span table, request and response data, errors, timing, token metrics, and connected MCP server/tool inventory. Selecting a span opens its details in the fixed right-hand drawer without changing the height of the timeline.
+The trace index groups resumed executions by correlation ID, shows the user request, and filters immediately as text is entered. Select an execution to inspect its ReAct flow, iteration and tool-call waterfall, span table, request and response data, errors, timing, and token metrics. Selecting a span opens its details in the fixed right-hand drawer; the server icon opens the searchable MCP server/tool browser. Pending tool permissions can be approved or denied from the selected input-required trace using the standard A2A continuation flow.
 
 ![Agent Composer configurable trace report](docs/agent-composer-trace-ui.png)
 
@@ -97,6 +97,7 @@ Trace HTTP endpoints:
 | `GET` | `{tracesPath}?executionId=<id>` | Interactive report for one execution. |
 | `GET` | `{tracesPath}?executionId=<id>&format=json` | Redacted trace JSON. |
 | `POST` | `{tracesPath}?executionId=<id>&action=cancel` | Requests cancellation of a running execution. |
+| `POST` | `{tracesPath}?action=clear` | Clears all retained execution traces. |
 
 Execute Agent responses include `executionId` and `traceReportPath`, so applications can link directly to the relevant report. Configure a different route with **Traces Path** in the Agent Composer global configuration. See [Agent Listener and traces](docs/agent-listener.md) and [Trace operations](docs/operation-reference/traces.md) for the complete contract.
 
@@ -112,6 +113,7 @@ Execute Agent responses include `executionId` and `traceReportPath`, so applicat
 | MCP retry count | `0` |
 | Agent path | `/agent` |
 | Traces path | `/agent/traces` |
+| Tool permission wait time | `900` seconds (`0` waits indefinitely) |
 
 ## Security
 

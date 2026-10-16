@@ -23,6 +23,7 @@
     "permissionServerName": { "type": ["string", "null"], "description": "MCP server owning the permission-gated tool." },
     "permissionToolName": { "type": ["string", "null"], "description": "Permission-gated MCP tool name." },
     "permissionArguments": { "type": ["object", "null"], "description": "Exact proposed arguments for the permission-gated tool call." },
+    "permissionExpiresAtEpochMs": { "type": ["integer", "null"], "description": "Epoch-millisecond deadline for the active permission request; null means no expiration." },
     "responseSchema": { "type": ["object", "null"], "description": "JSON Schema describing the structured response expected for the active input request." },
     "executionId": { "type": ["string", "null"], "description": "Unique execution trace identifier." },
     "traceReportPath": { "type": ["string", "null"], "description": "Relative path to the live HTML trace report." },

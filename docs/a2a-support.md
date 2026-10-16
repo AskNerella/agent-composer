@@ -13,8 +13,8 @@ For permission and cancellation tests, first run the version's **Start Permissio
 | Streaming | `message/stream` | `SendStreamingMessage` | Flushed SSE updates for tool/skill activity and every completed ReAct iteration, followed by artifact and terminal status. |
 | Get task | `tasks/get` | `GetTask` | Optional history trimming. |
 | Cancel task | `tasks/cancel` | `CancelTask` | Marks the A2A task canceled. |
-| List tasks | Not in 0.3 | No | `ListTasks` is not currently implemented. |
-| Subscribe to existing task | No | No | `tasks/resubscribe` and `SubscribeToTask` are not advertised or implemented; use send-message streaming for a new or interrupted turn. |
+| List tasks | Not in 0.3 | `ListTasks` | Supports status/context filters and page size/token pagination. Results are scoped to the configured Object Store; deployments must enforce caller visibility at the Mule/API gateway layer. |
+| Subscribe to existing task | `tasks/resubscribe` | `SubscribeToTask` | Returns the current non-terminal task snapshot, streams later transitions, supports multiple subscribers, and closes at a terminal state. |
 | Text parts | Yes | Yes | Default input mode. |
 | Data parts | Yes | Yes | Structured task and artifact data. |
 | File parts | No | No | Not advertised as an input mode. |
@@ -61,6 +61,6 @@ The preceding `input-required` status contains a `responseSchema` beside the per
 
 For A2A 1.0, use `SendMessage`, send `A2A-Version: 1.0`, omit the 0.3 `kind` discriminators, and use the 1.0 role enum (`ROLE_USER`). A2A 1.0 send responses and stream events use their specified oneof envelopes (`task`, `message`, `statusUpdate`, or `artifactUpdate`).
 
-The listener rejects unknown task IDs, mismatched task/context pairs, and attempts to continue terminal tasks. Invalid permission decisions keep the task interrupted so the client can retry through another standard send-message request.
+The listener rejects unknown task IDs, mismatched task/context pairs, and attempts to continue terminal tasks. Invalid permission decisions keep the task interrupted so the client can retry through another standard send-message request. Permission decisions are scoped to the exact task, context, and immutable request ID; concurrent resumes are serialized, and completed decisions are idempotently rejected by the terminal-task guard. Permission checkpoints survive restart and expire after the configurable **Tool Permission Wait Time** (15 minutes by default). The next task read, list, subscription, or continuation materializes an elapsed checkpoint as task state `expired` (`TASK_STATE_EXPIRED` on the 1.0 wire format).
 
 Clarification replies follow the same operation and identifiers. They remain ordinary text parts rather than permission data.

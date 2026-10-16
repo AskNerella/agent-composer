@@ -92,6 +92,26 @@ public class ReactEngineToolPermissionTest {
     }
 
     @Test
+    public void expiredPermissionBecomesToolResultAndContinuesWithoutExecution() throws Exception {
+        Map<String, Serializable> memory = new LinkedHashMap<>();
+        ObjectStore<Serializable> store = mockStore(memory);
+        McpClient mcp = mock(McpClient.class);
+        ReactEngine engine = new ReactEngine(null, mcp);
+        PendingToolPermissionState state = state();
+        state.setCreatedAtEpochMs(System.currentTimeMillis() - 5000L);
+        state.setExpiresAtEpochMs(System.currentTimeMillis() - 1000L);
+        memory.put("tool:permission:conversation-1", new com.google.gson.Gson().toJson(state));
+
+        Object result = invoke(engine, store, state, "{}");
+
+        assertTrue(resultMessages(result).get(2).getContent().contains("Tool permission call expired"));
+        assertTrue(resultMessages(result).get(2).getContent().contains("Continue with another approach"));
+        assertFalse(memory.containsKey("tool:permission:conversation-1"));
+        verifyNoInteractions(mcp);
+        assertEquals(0, state.getFailureCount());
+    }
+
+    @Test
     public void mismatchedRequestIdRemainsPending() throws Exception {
         Map<String, Serializable> memory = new LinkedHashMap<>();
         ObjectStore<Serializable> store = mockStore(memory);
