@@ -1,0 +1,12 @@
+- Combine correlation ids inside the trace report.
+- Move the connected MCP Servers to header icon. On Click, show the side bar with tools and search capability.
+- Trace Report Filters are Not working. 
+- Search should be performed as text is being written.
+- Let's provide permission buttons inside the INPUT_REQUIRED tool call. On Clicking, the agent should continue.
+- Provide a way to clear all the traces.
+- On the traces page, include the user request.
+
+Features:
+- Ensure concurrency-safe task transitions, idempotent permission decisions, approval authorization, expiration, and checkpoint recovery.
+- Add task listing, subscription, and reconnectable event streams.
+- LLM based Memory checks.

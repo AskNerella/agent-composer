@@ -31,6 +31,7 @@ public class AgentComposerConfigurationTest {
         assertEquals("false", optionalDefault("includeMcpToolsAsSkills"));
         assertEquals("false", optionalDefault("rememberConversation"));
         assertEquals("/agent/traces", optionalDefault("tracesPath"));
+        assertEquals("900", optionalDefault("toolPermissionWaitTimeSeconds"));
 
         assertNull(field("provider").getAnnotation(Parameter.class));
         assertNull(field("modelName").getAnnotation(Parameter.class));

@@ -82,10 +82,17 @@ public class AgentComposerConfiguration {
   private int requestTimeoutSeconds;
 
   @Parameter
+  @DisplayName("Tool Permission Wait Time (seconds)")
+  @Summary("How long to wait for a tool approval before the A2A task expires. Set to 0 to wait indefinitely.")
+  @Optional(defaultValue = "900")
+  @Placement(order = 12)
+  private int toolPermissionWaitTimeSeconds;
+
+  @Parameter
   @DisplayName("Traces Path")
   @Summary("HTTP path for the execution trace console.")
   @Optional(defaultValue = "/agent/traces")
-  @Placement(order = 12)
+  @Placement(order = 13)
   private String tracesPath;
   // ── Agent ─────────────────────────────────────────────────────────────────
 
@@ -173,6 +180,7 @@ public class AgentComposerConfiguration {
   public String getHttpListenerConfig()       { return httpListenerConfig; }
   public String getAgentPath()                { return agentPath; }
   public int getRequestTimeoutSeconds()       { return requestTimeoutSeconds; }
+  public int getToolPermissionWaitTimeSeconds()  { return toolPermissionWaitTimeSeconds; }
   public String getTracesPath()               { return tracesPath == null || tracesPath.isBlank() ? "/agent/traces" : tracesPath; }
   public String getAgentName()                { return agentName; }
   public String getAgentDescription()         { return agentDescription; }

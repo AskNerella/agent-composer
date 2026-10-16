@@ -47,6 +47,10 @@
           "returnReason": { "type": "string" }
         }
       }
+    },
+    "pendingToolPermission": {
+      "type": ["object", "null"],
+      "description": "Summary of a tool invocation currently waiting for user approval."
     }
   }
 }

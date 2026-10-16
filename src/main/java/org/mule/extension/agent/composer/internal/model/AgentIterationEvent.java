@@ -14,7 +14,8 @@ public class AgentIterationEvent {
         SKILL_CALL, SKILL_RESULT,
         PARALLEL_BATCH,
         CLARIFICATION,
-        COMPRESSION
+        COMPRESSION,
+        ITERATION_COMPLETE
     }
 
     private final int iteration;
@@ -56,6 +57,11 @@ public class AgentIterationEvent {
 
     public static AgentIterationEvent compression(int iteration) {
         return new AgentIterationEvent(iteration, Kind.COMPRESSION, null, null, null, null);
+    }
+
+    public static AgentIterationEvent iterationComplete(int iteration, String result) {
+        return new AgentIterationEvent(iteration, Kind.ITERATION_COMPLETE,
+                "Iteration " + iteration, null, result, null);
     }
 
     public int getIteration() { return iteration; }

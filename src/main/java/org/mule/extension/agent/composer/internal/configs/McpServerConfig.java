@@ -41,10 +41,17 @@ public class McpServerConfig {
     private String toolFilters;
 
     @Parameter
+    @DisplayName("Tools Requiring Permission")
+    @Summary("Comma-separated exact tool names that require user approval before every invocation.")
+    @Optional
+    @Placement(order = 5)
+    private String toolsRequiringPermission;
+
+    @Parameter
     @DisplayName("Retry Count")
     @Summary("Number of retries after a failed MCP request (0-10). Default is 0 (no retry).")
     @Optional(defaultValue = "0")
-    @Placement(order = 5)
+    @Placement(order = 6)
     private int retryCount;
 
     public String getName() { return name; }
@@ -64,5 +71,19 @@ public class McpServerConfig {
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
                 .collect(Collectors.toList());
+    }
+
+    public List<String> getToolsRequiringPermissionList() {
+        if (toolsRequiringPermission == null || toolsRequiringPermission.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        return Arrays.stream(toolsRequiringPermission.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toList());
+    }
+
+    public boolean requiresPermission(String toolName) {
+        return toolName != null && getToolsRequiringPermissionList().contains(toolName);
     }
 }
