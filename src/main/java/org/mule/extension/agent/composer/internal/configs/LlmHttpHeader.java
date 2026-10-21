@@ -7,12 +7,12 @@ import org.mule.runtime.extension.api.annotation.param.display.Password;
 import org.mule.runtime.extension.api.annotation.param.display.Summary;
 import org.mule.sdk.api.annotation.param.Parameter;
 
-/** Header sent only to a configured custom LLM endpoint. */
-public class CustomHttpHeader {
+/** Additional HTTP header sent to an OpenAI-compatible or Omni Gateway endpoint. */
+public class LlmHttpHeader {
 
     @Parameter
     @DisplayName("Header Name")
-    @Summary("HTTP header name, for example x-client-id or Authorization.")
+    @Summary("HTTP header name, for example client_id or Authorization.")
     private String name;
 
     @Parameter

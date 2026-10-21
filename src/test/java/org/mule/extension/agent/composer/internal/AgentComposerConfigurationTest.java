@@ -2,8 +2,9 @@ package org.mule.extension.agent.composer.internal;
 
 import org.junit.Test;
 import org.mule.extension.agent.composer.internal.configs.AnthropicProviderConfig;
-import org.mule.extension.agent.composer.internal.configs.CustomLlmProviderConfig;
 import org.mule.extension.agent.composer.internal.configs.LlmProviderConfig;
+import org.mule.extension.agent.composer.internal.configs.OmniGatewayProviderConfig;
+import org.mule.extension.agent.composer.internal.configs.OpenAiCompatibleProviderConfig;
 import org.mule.extension.agent.composer.internal.configs.OpenAiProviderConfig;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 import org.mule.runtime.extension.api.annotation.param.Optional;
@@ -25,7 +26,8 @@ public class AgentComposerConfigurationTest {
         assertEquals(LlmProviderConfig.class, mapping.baseType());
         assertTrue(Arrays.asList(mapping.subTypes()).contains(OpenAiProviderConfig.class));
         assertTrue(Arrays.asList(mapping.subTypes()).contains(AnthropicProviderConfig.class));
-        assertTrue(Arrays.asList(mapping.subTypes()).contains(CustomLlmProviderConfig.class));
+        assertTrue(Arrays.asList(mapping.subTypes()).contains(OpenAiCompatibleProviderConfig.class));
+        assertTrue(Arrays.asList(mapping.subTypes()).contains(OmniGatewayProviderConfig.class));
 
         assertEquals("1.0", optionalDefault("temperature"));
         assertEquals("false", optionalDefault("includeMcpToolsAsSkills"));
@@ -37,8 +39,8 @@ public class AgentComposerConfigurationTest {
         assertNull(field("modelName").getAnnotation(Parameter.class));
         assertNull(field("anthropicVersion").getAnnotation(Parameter.class));
         assertNull(field("apiKey").getAnnotation(Parameter.class));
-        assertNull(field("customLlmEndpointUrl").getAnnotation(Parameter.class));
-        assertNull(field("customLlmHeaders").getAnnotation(Parameter.class));
+        assertNull(field("llmEndpointUrl").getAnnotation(Parameter.class));
+        assertNull(field("llmHeaders").getAnnotation(Parameter.class));
         assertNotNull(field("llmProvider").getAnnotation(Parameter.class));
         assertNull(field("llmProvider").getAnnotation(Optional.class));
 
@@ -48,6 +50,8 @@ public class AgentComposerConfigurationTest {
         assertTrue(modelValues.open());
         assertNull(OpenAiProviderConfig.class.getDeclaredField("apiKey").getAnnotation(Optional.class));
         assertNull(AnthropicProviderConfig.class.getDeclaredField("apiKey").getAnnotation(Optional.class));
+        assertNull(OpenAiCompatibleProviderConfig.class.getDeclaredField("modelName").getAnnotation(Optional.class));
+        assertNull(OmniGatewayProviderConfig.class.getDeclaredField("modelName").getAnnotation(Optional.class));
 
         AgentComposerConfiguration config = new AgentComposerConfiguration();
         OpenAiProviderConfig openAi = new OpenAiProviderConfig();

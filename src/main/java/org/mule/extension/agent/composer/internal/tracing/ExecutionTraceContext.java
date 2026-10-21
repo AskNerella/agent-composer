@@ -42,7 +42,7 @@ public final class ExecutionTraceContext {
         trace.setExecutionId(UUID.randomUUID().toString());
         trace.setConversationId(conversationId);
         trace.setUserTask(TraceRedactor.redactText(userTask));
-        trace.setProvider(config.getProvider() != null ? config.getProvider().name() : null);
+        trace.setProvider(providerDisplayName(config));
         trace.setModelName(config.getModelName());
         trace.setMaxIterations(maxIterations);
         trace.setStatus(STATUS_RUNNING);
@@ -61,6 +61,17 @@ public final class ExecutionTraceContext {
         ExecutionTraceContext context = new ExecutionTraceContext(trace, objectStore, config.getObjectStore());
         context.persist();
         return context;
+    }
+
+    private static String providerDisplayName(AgentComposerConfiguration config) {
+        if (config.getProvider() == null) return null;
+        switch (config.getProvider()) {
+            case OPENAI_COMPATIBLE: return "OpenAI Compatible Endpoint";
+            case OMNI_GATEWAY: return "Omni Gateway";
+            case ANTHROPIC: return "Anthropic";
+            case OPENAI:
+            default: return "OpenAI";
+        }
     }
 
     public ExecutionTrace getTrace() { return trace; }
@@ -199,6 +210,10 @@ public final class ExecutionTraceContext {
 
         public void error(Throwable error) {
             end(STATUS_FAILED, null, error);
+        }
+
+        public void error(Throwable error, Object output) {
+            end(STATUS_FAILED, output, error);
         }
 
         private void end(String status, Object output, Throwable error) {

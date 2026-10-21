@@ -4,6 +4,7 @@ import org.junit.After;
 import org.junit.Test;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
+import org.mule.extension.agent.composer.internal.llm.LlmHttpException;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 import org.mule.runtime.api.store.ObjectStore;
 import org.mule.runtime.api.store.ObjectStoreManager;
@@ -71,9 +72,16 @@ public class ExecutionTracingTest {
         AgentComposerConfiguration config = config("tenant-html");
         ExecutionTraceContext context = ExecutionTraceContext.start(
                 null, config, "<script>alert('x')</script>", "conversation-html", 5);
+        Map<String, Object> requestHeaders = new LinkedHashMap<>();
+        requestHeaders.put("client_id", "visible-client-id");
+        requestHeaders.put("client_secret", "never-render-secret");
+        Map<String, Object> requestMetadata = new LinkedHashMap<>();
+        requestMetadata.put("method", "POST");
+        requestMetadata.put("url", "https://gateway.example.test/v1/responses");
+        requestMetadata.put("headers", requestHeaders);
         ExecutionTraceContext.SpanScope span = context.startSpan(
                 "LLM", "Unsafe <name>", null, 1,
-                Collections.singletonMap("password", "never-render-me"));
+                Collections.singletonMap("password", "never-render-me"), requestMetadata);
         ExecutionTraceContext.SpanScope objectStore = context.startSpan(
                 "OBJECT_STORE", "Load conversation", null, null,
                 Collections.singletonMap("conversationId", "conversation-html"));
@@ -92,6 +100,9 @@ public class ExecutionTracingTest {
         assertTrue(runningHtml.contains("\\u003cscript"));
         assertFalse(runningHtml.contains("<script>alert('x')</script>"));
         assertFalse(runningHtml.contains("never-render-me"));
+        assertFalse(runningHtml.contains("never-render-secret"));
+        assertTrue(runningHtml.contains("visible-client-id"));
+        assertTrue(runningHtml.contains("https://gateway.example.test/v1/responses"));
         assertFalse(runningHtml.contains("Rerun"));
         assertFalse(runningHtml.contains("Edit &amp; Rerun"));
         assertFalse(runningHtml.contains("Replay"));
@@ -117,6 +128,10 @@ public class ExecutionTracingTest {
         assertTrue(runningHtml.contains("selectSpan("));
         assertTrue(runningHtml.contains("detailMetrics"));
         assertTrue(runningHtml.contains("detail-drawer"));
+        assertTrue(runningHtml.contains("id=\"requestUrl\""));
+        assertTrue(runningHtml.contains("id=\"requestHeaders\""));
+        assertTrue(runningHtml.contains("class=\"request-section\""));
+        assertTrue(runningHtml.contains("Redacted headers"));
         assertTrue(runningHtml.contains("class=\"detail-card detail-drawer open\""));
         assertFalse(runningHtml.contains("closeDrawer()"));
         assertTrue(runningHtml.contains("Span table"));
@@ -240,6 +255,24 @@ public class ExecutionTracingTest {
         assertFalse(json.contains("client-secret-value"));
         assertFalse(json.contains("abc.def-123"));
         assertTrue(json.contains("REDACTED"));
+    }
+
+    @Test
+    public void capturesUpstreamLlmErrorResponseAsSpanOutput() throws Exception {
+        ExecutionTraceContext context = ExecutionTraceContext.start(
+                null, config("tenant-http-error"), "Call model", "conversation-http-error", 5);
+        ExecutionTraceContext.SpanScope span = context.startSpan(
+                "LLM", "Agent reasoning", null, 1, Collections.singletonMap("input", "hello"));
+        LlmHttpException failure = new LlmHttpException("OpenAI", 400, "POST",
+                "https://gateway.example.test/responses", "{\"error\":\"missing model\"}");
+
+        span.error(failure, failure.toTraceOutput());
+        context.fail(failure);
+
+        TraceSpan recorded = context.getTrace().getSpans().get(0);
+        assertEquals(400.0d, ((Map<?, ?>) recorded.getOutput()).get("statusCode"));
+        assertTrue(ExecutionTraceStore.toJson(context.getTrace()).contains("missing model"));
+        assertTrue(TraceHtmlRenderer.render(context.getTrace(), "/agent/traces").contains("missing model"));
     }
 
     @Test

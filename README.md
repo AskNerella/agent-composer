@@ -1,6 +1,6 @@
 # Agent Composer for Mule 4
 
-Agent Composer is a Mule SDK connector for building ReAct agents without custom Java orchestration. It combines OpenAI, Anthropic, or a custom OpenAI Responses-compatible endpoint with MCP tools, skills, optional conversation memory, A2A HTTP endpoints, and execution traces.
+Agent Composer is a Mule SDK connector for building ReAct agents without custom Java orchestration. It combines OpenAI, Anthropic, OpenAI-compatible endpoints, or MuleSoft Omni Gateway Model Proxies with MCP tools, skills, optional conversation memory, A2A HTTP endpoints, and execution traces.
 
 ## Demo video
 
@@ -12,7 +12,7 @@ Agent Composer is a Mule SDK connector for building ReAct agents without custom 
 <dependency>
   <groupId>com.k2</groupId>
   <artifactId>agent-composer</artifactId>
-  <version>1.1.28-SNAPSHOT</version>
+  <version>1.1.32-SNAPSHOT</version>
   <classifier>mule-plugin</classifier>
 </dependency>
 ```
@@ -55,7 +55,7 @@ The **Max Iterations** value on Execute Agent is the authoritative outer-loop li
 
 ## Capabilities
 
-- Provider-specific OpenAI, Anthropic, and Custom LLM configuration.
+- Provider-specific OpenAI, Anthropic, OpenAI Compatible Endpoint, and Omni Gateway configuration.
 - Direct MCP tools and higher-level agent skills.
 - MCP Streamable HTTP tool discovery and execution.
 - A2A 0.3 and 1.0 JSON-RPC endpoints, including streaming.

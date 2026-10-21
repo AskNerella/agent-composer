@@ -6,8 +6,9 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
-import org.mule.extension.agent.composer.internal.configs.CustomHttpHeader;
-import org.mule.extension.agent.composer.internal.enums.LlmProvider;
+import org.mule.extension.agent.composer.internal.configs.LlmHttpHeader;
+import org.mule.extension.agent.composer.internal.configs.OmniGatewayProviderConfig;
+import org.mule.extension.agent.composer.internal.configs.OpenAiCompatibleProviderConfig;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 
@@ -31,6 +32,8 @@ public class CustomLlmClientTest {
     public void setUp() throws Exception {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/responses", this::handle);
+        server.createContext("/gateway/openai/v1/responses", this::handle);
+        server.createContext("/omni/model-proxy/responses", this::handle);
         server.start();
     }
 
@@ -42,17 +45,20 @@ public class CustomLlmClientTest {
     @Test
     public void customProviderUsesConfiguredEndpointAndHeaders() throws Exception {
         AgentComposerConfiguration config = new AgentComposerConfiguration();
-        setField(config, "provider", LlmProvider.CUSTOM);
-        setField(config, "modelName", "gateway-model");
-        setField(config, "apiKey", "gateway-token");
         setField(config, "maxTokens", 321);
         setField(config, "temperature", 0.2d);
-        setField(config, "customLlmEndpointUrl",
-                "http://127.0.0.1:" + server.getAddress().getPort() + "/responses");
-        CustomHttpHeader header = new CustomHttpHeader();
+        LlmHttpHeader header = new LlmHttpHeader();
         setField(header, "name", "X-Tenant-Id");
         setField(header, "value", "tenant-42");
-        setField(config, "customLlmHeaders", Collections.singletonList(header));
+        LlmHttpHeader authorization = new LlmHttpHeader();
+        setField(authorization, "name", "Authorization");
+        setField(authorization, "value", "Bearer gateway-token");
+        OpenAiCompatibleProviderConfig compatible = new OpenAiCompatibleProviderConfig();
+        setField(compatible, "modelName", "gateway-model");
+        setField(compatible, "endpointUrl",
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/responses");
+        setField(compatible, "headers", java.util.Arrays.asList(header, authorization));
+        setField(config, "llmProvider", compatible);
 
         LlmResponse response = LlmClientFactory.create(config).chat("Be concise",
                 Collections.singletonList(new LlmMessage("user", "hello")), Collections.emptyList());
@@ -64,8 +70,55 @@ public class CustomLlmClientTest {
         assertTrue(requestBody.get().contains("\"max_output_tokens\":321"));
     }
 
+    @Test
+    public void customProviderAppendsResponsesPathToBaseUrl() throws Exception {
+        AgentComposerConfiguration config = new AgentComposerConfiguration();
+        setField(config, "maxTokens", 321);
+        setField(config, "temperature", 1.0d);
+        OpenAiCompatibleProviderConfig compatible = new OpenAiCompatibleProviderConfig();
+        setField(compatible, "modelName", "gateway-model");
+        setField(compatible, "endpointUrl",
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/gateway/openai/");
+        setField(config, "llmProvider", compatible);
+
+        LlmClient client = LlmClientFactory.create(config);
+        LlmResponse response = client.chat("Be concise",
+                Collections.singletonList(new LlmMessage("user", "hello")), Collections.emptyList());
+
+        assertEquals("custom-ok", response.getContent());
+        assertEquals("http://127.0.0.1:" + server.getAddress().getPort()
+                + "/gateway/openai/v1/responses", client.requestMetadata().get("url"));
+    }
+
+    @Test
+    public void omniGatewayUsesModelProxyResponsesPathAndRequiredModel() throws Exception {
+        AgentComposerConfiguration config = new AgentComposerConfiguration();
+        setField(config, "maxTokens", 321);
+        setField(config, "temperature", 1.0d);
+        LlmHttpHeader clientId = new LlmHttpHeader();
+        setField(clientId, "name", "client_id");
+        setField(clientId, "value", "client-42");
+        OmniGatewayProviderConfig omni = new OmniGatewayProviderConfig();
+        setField(omni, "endpointUrl",
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/omni/model-proxy");
+        setField(omni, "headers", Collections.singletonList(clientId));
+        setField(omni, "modelName", "openai/gpt-5.2");
+        setField(config, "llmProvider", omni);
+
+        LlmClient client = LlmClientFactory.create(config);
+        LlmResponse response = client.chat("Be concise",
+                Collections.singletonList(new LlmMessage("user", "hello")), Collections.emptyList());
+
+        assertEquals("custom-ok", response.getContent());
+        assertEquals("http://127.0.0.1:" + server.getAddress().getPort()
+                + "/omni/model-proxy/responses", client.requestMetadata().get("url"));
+        assertEquals("client-42", tenantHeader.get());
+        assertTrue(requestBody.get().contains("\"model\":\"openai/gpt-5.2\""));
+    }
+
     private void handle(HttpExchange exchange) throws IOException {
-        tenantHeader.set(exchange.getRequestHeaders().getFirst("X-Tenant-Id"));
+        String tenant = exchange.getRequestHeaders().getFirst("X-Tenant-Id");
+        tenantHeader.set(tenant != null ? tenant : exchange.getRequestHeaders().getFirst("client_id"));
         authorizationHeader.set(exchange.getRequestHeaders().getFirst("Authorization"));
         requestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
         byte[] response = ("{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\","

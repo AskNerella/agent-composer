@@ -1,7 +1,7 @@
 package org.mule.extension.agent.composer.internal;
 
 import org.mule.extension.agent.composer.internal.configs.AgentSkillConfig;
-import org.mule.extension.agent.composer.internal.configs.CustomHttpHeader;
+import org.mule.extension.agent.composer.internal.configs.LlmHttpHeader;
 import org.mule.extension.agent.composer.internal.configs.LlmProviderConfig;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
@@ -31,7 +31,7 @@ public class AgentComposerConfiguration {
 
   @Parameter
   @DisplayName("LLM Provider")
-  @Summary("Select OpenAI, Anthropic, or a custom OpenAI Responses-compatible endpoint. Only relevant fields are displayed.")
+  @Summary("Select OpenAI, Anthropic, OpenAI Compatible, or MuleSoft Omni Gateway. Only relevant fields are displayed.")
   @Placement(order = 1)
   private LlmProviderConfig llmProvider;
 
@@ -41,8 +41,8 @@ public class AgentComposerConfiguration {
   private String modelName;
   private String anthropicVersion;
   private String apiKey;
-  private String customLlmEndpointUrl;
-  private List<CustomHttpHeader> customLlmHeaders;
+  private String llmEndpointUrl;
+  private List<LlmHttpHeader> llmHeaders;
 
   @Parameter
   @DisplayName("Max Output Tokens")
@@ -169,8 +169,8 @@ public class AgentComposerConfiguration {
   public LlmProvider getProvider()            { return llmProvider != null ? llmProvider.getProvider() : provider; }
   public String getModelName()                { return llmProvider != null ? llmProvider.getModelName() : modelName != null ? modelName : "gpt-4o"; }
   public String getApiKey()                   { return llmProvider != null ? llmProvider.getApiKey() : apiKey; }
-  public String getCustomLlmEndpointUrl()     { return llmProvider != null ? llmProvider.getCustomLlmEndpointUrl() : customLlmEndpointUrl; }
-  public List<CustomHttpHeader> getCustomLlmHeaders() { return llmProvider != null ? llmProvider.getCustomLlmHeaders() : customLlmHeaders; }
+  public String getLlmEndpointUrl()           { return llmProvider != null ? llmProvider.getEndpointUrl() : llmEndpointUrl; }
+  public List<LlmHttpHeader> getLlmHeaders()  { return llmProvider != null ? llmProvider.getHeaders() : llmHeaders; }
   public int getMaxTokens()                   { return maxTokens; }
   public double getTemperature()              { return temperature; }
   public String getAnthropicVersion()         { return llmProvider != null ? llmProvider.getAnthropicVersion() : anthropicVersion != null ? anthropicVersion : "2023-06-01"; }

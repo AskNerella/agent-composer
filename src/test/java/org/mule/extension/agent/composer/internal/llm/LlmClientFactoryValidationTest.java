@@ -2,6 +2,7 @@ package org.mule.extension.agent.composer.internal.llm;
 
 import org.junit.Test;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
+import org.mule.extension.agent.composer.internal.configs.OmniGatewayProviderConfig;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 
 import java.lang.reflect.Field;
@@ -21,6 +22,21 @@ public class LlmClientFactoryValidationTest {
         AgentComposerConfiguration config = new AgentComposerConfiguration();
         set(config, "provider", LlmProvider.OPENAI);
         expectError(config, "API Key is required for OPENAI");
+    }
+
+    @Test
+    public void rejectsMissingOmniGatewayUrlAndModel() throws Exception {
+        AgentComposerConfiguration missingUrl = new AgentComposerConfiguration();
+        OmniGatewayProviderConfig omniWithoutUrl = new OmniGatewayProviderConfig();
+        set(omniWithoutUrl, "modelName", "openai/gpt-5.2");
+        set(missingUrl, "llmProvider", omniWithoutUrl);
+        expectError(missingUrl, "URL is required for Omni Gateway");
+
+        AgentComposerConfiguration missingModel = new AgentComposerConfiguration();
+        OmniGatewayProviderConfig omniWithoutModel = new OmniGatewayProviderConfig();
+        set(omniWithoutModel, "endpointUrl", "https://gateway.example.com/proxy");
+        set(missingModel, "llmProvider", omniWithoutModel);
+        expectError(missingModel, "Model Name is required for Omni Gateway");
     }
 
     private static void expectError(AgentComposerConfiguration config, String expected) {

@@ -61,6 +61,9 @@ public class TraceHtmlRendererTest {
         assertFalse(html.contains("title=\"Copy identifier\""));
         assertTrue(html.contains("Waiting for Customer"));
         assertTrue(html.contains("id=\"mcpDrawer\""));
+        assertTrue(html.contains("aria-label=\"Close MCP servers\""));
+        assertFalse(html.contains("Back to Agent Run"));
+        assertTrue(html.contains("mcp-inventory-head .icon-button::after"));
         assertTrue(html.contains("Search tools..."));
         assertTrue(html.contains("class=\"tool-list-item\""));
         assertTrue(html.contains("Retrieve an issue by identifier"));
@@ -71,6 +74,8 @@ public class TraceHtmlRendererTest {
         assertTrue(html.contains("method:'message/send'"));
         assertTrue(html.contains("class=\"notification-count\">1"));
         assertTrue(html.contains("document.querySelectorAll('.notification-count').forEach(x=>x.remove())"));
+        assertTrue(html.contains("keepRequestSectionOpen()"));
+        assertTrue(html.contains("align-content:start;grid-auto-rows:max-content"));
         assertFalse(html.contains("<section class=\"runs-card mcp-inventory\""));
         assertFalse(html.contains(">Collapse</button>"));
     }

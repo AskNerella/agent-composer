@@ -7,6 +7,7 @@ import org.mule.extension.agent.composer.internal.configs.AgentSkillConfig;
 import org.mule.extension.agent.composer.internal.configs.McpServerConfig;
 import org.mule.extension.agent.composer.internal.llm.LlmClient;
 import org.mule.extension.agent.composer.internal.llm.LlmClientFactory;
+import org.mule.extension.agent.composer.internal.llm.LlmHttpException;
 import org.mule.extension.agent.composer.internal.mcp.McpClient;
 import org.mule.extension.agent.composer.internal.model.AgentIterationEvent;
 import org.mule.extension.agent.composer.internal.model.AgentResponse;
@@ -768,6 +769,14 @@ public class ReactEngine {
                 : null;
     }
 
+    private SpanScope startTraceSpan(String type, String name, String parentSpanId,
+                                     Integer iteration, Object input, Map<String, Object> attributes) {
+        ExecutionTraceContext context = traceContext.get();
+        return context != null
+                ? context.startSpan(type, name, parentSpanId, iteration, input, attributes)
+                : null;
+    }
+
     private void traceMcpInventory(List<McpServerConfig> servers, List<ToolDefinition> tools) {
         ExecutionTraceContext context = traceContext.get();
         if (context == null) return;
@@ -819,7 +828,12 @@ public class ReactEngine {
     }
 
     private static void traceError(SpanScope scope, Throwable error) {
-        if (scope != null) scope.error(error);
+        if (scope == null) return;
+        if (error instanceof LlmHttpException) {
+            scope.error(error, ((LlmHttpException) error).toTraceOutput());
+        } else {
+            scope.error(error);
+        }
     }
 
     // ── tool discovery ────────────────────────────────────────────────────────
@@ -1102,7 +1116,7 @@ public class ReactEngine {
                                                String parentSpanId,
                                                String spanName) throws Exception {
         SpanScope llmSpan = startTraceSpan("LLM", spanName, parentSpanId, iterationNumber,
-                ExecutionTraceContext.llmInput(instructions, messages, tools));
+                ExecutionTraceContext.llmInput(instructions, messages, tools), llmClient.requestMetadata());
         try {
             LlmResponse response = llmClient.chat(instructions, messages, tools);
             if (llmSpan != null) llmSpan.tokens(response);
@@ -1366,7 +1380,7 @@ public class ReactEngine {
                                           String parentSpanId,
                                           String spanName) throws Exception {
         SpanScope llmSpan = startTraceSpan("LLM", spanName, parentSpanId, iterationNumber,
-                ExecutionTraceContext.llmInput(instructions, messages, tools));
+                ExecutionTraceContext.llmInput(instructions, messages, tools), llmClient.requestMetadata());
         try {
             LlmResponse response = llmClient.chat(instructions, messages, tools);
             if (llmSpan != null) llmSpan.tokens(response);
@@ -1469,10 +1483,10 @@ public class ReactEngine {
           .append(config.getModelName() == null ? "" : config.getModelName().trim().toLowerCase()).append("|")
           .append(userMessage == null ? "" : userMessage.trim().toLowerCase()).append("|")
           .append(config.getInstructions() == null ? "" : config.getInstructions()).append("|")
-          .append("customEndpoint=").append(config.getCustomLlmEndpointUrl() == null
-                  ? "" : config.getCustomLlmEndpointUrl().trim()).append("|")
-          .append("customHeaders=").append(config.getCustomLlmHeaders() == null ? "" :
-                  config.getCustomLlmHeaders().stream()
+          .append("llmEndpoint=").append(config.getLlmEndpointUrl() == null
+                  ? "" : config.getLlmEndpointUrl().trim()).append("|")
+          .append("llmHeaders=").append(config.getLlmHeaders() == null ? "" :
+                  config.getLlmHeaders().stream()
                           .map(h -> String.valueOf(h.getName()) + "=" + String.valueOf(h.getValue()))
                           .collect(Collectors.joining(","))).append("|")
           .append("maxTokens=").append(config.getMaxTokens()).append("|")
