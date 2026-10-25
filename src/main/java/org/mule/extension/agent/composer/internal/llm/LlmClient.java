@@ -4,7 +4,9 @@ import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 import org.mule.extension.agent.composer.internal.model.ToolDefinition;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Abstraction over inference-provider APIs.
@@ -18,6 +20,11 @@ import java.util.List;
  * </ul>
  */
 public interface LlmClient {
+
+    /** Metadata describing the outbound inference request, persisted in redacted traces. */
+    default Map<String, Object> requestMetadata() {
+        return Collections.emptyMap();
+    }
 
     /**
      * Sends the conversation history to the LLM and returns the next response.

@@ -13,6 +13,7 @@ import org.mule.extension.agent.composer.internal.tracing.ExecutionTrace;
 import org.mule.extension.agent.composer.internal.tracing.ExecutionTraceStore;
 import org.mule.extension.agent.composer.internal.tracing.TraceHtmlRenderer;
 import org.mule.extension.agent.composer.internal.tracing.TraceRedactor;
+import org.mule.extension.agent.composer.internal.source.StreamingEventRegistry;
 import org.mule.runtime.api.store.ObjectStoreManager;
 import org.mule.runtime.extension.api.annotation.metadata.fixed.OutputJsonType;
 import org.mule.runtime.extension.api.annotation.param.Optional;
@@ -73,7 +74,8 @@ public class AgentComposerOperations {
         LOGGER.info("Execute Agent starting | conversationId='{}' maxIterations={}",
                 conversationId, effectiveMaxIterations);
         ReactEngine engine = new ReactEngine(objectStoreManager);
-        AgentResponse response = engine.run(config, userMessage, conversationId, effectiveMaxIterations);
+        AgentResponse response = engine.run(config, userMessage, conversationId, effectiveMaxIterations,
+                StreamingEventRegistry.callback(conversationId));
         return GSON.toJson(response);
     }
 

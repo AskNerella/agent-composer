@@ -18,6 +18,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -40,6 +41,19 @@ public class AnthropicLlmClient implements LlmClient {
 
     public AnthropicLlmClient(AgentComposerConfiguration config) {
         this.config = config;
+    }
+
+    @Override
+    public Map<String, Object> requestMetadata() {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("method", "POST");
+        metadata.put("url", MESSAGES_URL);
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/json");
+        headers.put("x-api-key", config.getApiKey());
+        headers.put("anthropic-version", config.getAnthropicVersion());
+        metadata.put("headers", headers);
+        return metadata;
     }
 
     @Override
@@ -144,7 +158,8 @@ public class AnthropicLlmClient implements LlmClient {
 
         HttpResponse<String> httpResponse = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
         if (httpResponse.statusCode() < 200 || httpResponse.statusCode() >= 300) {
-            throw new RuntimeException("Anthropic API error " + httpResponse.statusCode() + ": " + httpResponse.body());
+            throw new LlmHttpException("Anthropic", httpResponse.statusCode(), "POST", MESSAGES_URL,
+                    httpResponse.body());
         }
 
         JsonObject root = JsonParser.parseString(httpResponse.body()).getAsJsonObject();

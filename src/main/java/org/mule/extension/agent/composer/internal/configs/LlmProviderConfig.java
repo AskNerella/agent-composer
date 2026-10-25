@@ -16,7 +16,7 @@ public interface LlmProviderConfig {
 
     default String getAnthropicVersion() { return "2023-06-01"; }
 
-    default String getCustomLlmEndpointUrl() { return null; }
+    default String getEndpointUrl() { return null; }
 
-    default List<CustomHttpHeader> getCustomLlmHeaders() { return Collections.emptyList(); }
+    default List<LlmHttpHeader> getHeaders() { return Collections.emptyList(); }
 }

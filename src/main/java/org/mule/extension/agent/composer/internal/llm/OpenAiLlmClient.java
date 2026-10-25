@@ -7,7 +7,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
-import org.mule.extension.agent.composer.internal.configs.CustomHttpHeader;
+import org.mule.extension.agent.composer.internal.configs.LlmHttpHeader;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
 import org.mule.extension.agent.composer.internal.model.LlmMessage;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
@@ -16,9 +16,11 @@ import org.mule.extension.agent.composer.internal.model.ToolDefinition;
 
 import java.lang.reflect.Type;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -44,12 +46,34 @@ public class OpenAiLlmClient implements LlmClient {
     }
 
     @Override
+    public Map<String, Object> requestMetadata() {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("method", "POST");
+        metadata.put("url", resolveResponsesUrl());
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/json");
+        if (config.getApiKey() != null && !config.getApiKey().trim().isEmpty()) {
+            headers.put("Authorization", "Bearer " + config.getApiKey().trim());
+        }
+        if (usesConfiguredEndpoint() && config.getLlmHeaders() != null) {
+            for (LlmHttpHeader header : config.getLlmHeaders()) {
+                if (header == null || header.getName() == null || header.getName().trim().isEmpty()) continue;
+                headers.put(header.getName().trim(), header.getValue() != null ? header.getValue() : "");
+            }
+        }
+        metadata.put("headers", headers);
+        return metadata;
+    }
+
+    @Override
     public LlmResponse chat(String systemPrompt,
             List<LlmMessage> messages,
             List<ToolDefinition> tools) throws Exception {
 
         JsonObject body = new JsonObject();
-        body.addProperty("model", config.getModelName());
+        if (config.getModelName() != null && !config.getModelName().isBlank()) {
+            body.addProperty("model", config.getModelName().trim());
+        }
         body.addProperty("max_output_tokens", config.getMaxTokens());
         if (supportsTemperature(config.getModelName())) {
             body.addProperty("temperature", config.getTemperature());
@@ -269,38 +293,69 @@ public class OpenAiLlmClient implements LlmClient {
 
         HttpResponse<String> response = HTTP.send(builder.build(), HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new RuntimeException("OpenAI API error " + response.statusCode() + ": " + response.body());
+            throw new LlmHttpException("OpenAI", response.statusCode(), "POST", url, response.body());
         }
         return response.body();
     }
 
     private String resolveResponsesUrl() {
-        if (config.getProvider() != LlmProvider.CUSTOM) return RESPONSES_URL;
-        String endpoint = config.getCustomLlmEndpointUrl();
+        if (!usesConfiguredEndpoint()) return RESPONSES_URL;
+        String endpoint = config.getLlmEndpointUrl();
         if (endpoint == null || endpoint.trim().isEmpty()) {
             throw new IllegalArgumentException(
-                    "Custom LLM Endpoint URL is required when LLM Provider is CUSTOM");
+                    "URL is required when LLM Provider is " + config.getProvider());
         }
         URI uri = URI.create(endpoint.trim());
         String scheme = uri.getScheme();
         if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
-            throw new IllegalArgumentException("Custom LLM Endpoint URL must use http or https");
+            throw new IllegalArgumentException("LLM endpoint URL must use http or https");
+        }
+        String path = uri.getPath() != null ? uri.getPath() : "";
+        if (config.getProvider() == LlmProvider.OMNI_GATEWAY) {
+            if (path.endsWith("/responses")) return uri.toString();
+            return withPath(uri, stripTrailingSlash(path) + "/responses").toString();
+        }
+        if (path.endsWith("/")) {
+            return withPath(uri, path + "v1/responses").toString();
+        }
+        if (path.endsWith("/v1")) {
+            return withPath(uri, path + "/responses").toString();
         }
         return uri.toString();
+    }
+
+    private static URI withPath(URI uri, String path) {
+        try {
+            return new URI(uri.getScheme(), uri.getUserInfo(), uri.getHost(), uri.getPort(),
+                    path, uri.getQuery(), uri.getFragment());
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("Invalid LLM endpoint URL", e);
+        }
+    }
+
+    private static String stripTrailingSlash(String value) {
+        int end = value.length();
+        while (end > 0 && value.charAt(end - 1) == '/') end--;
+        return value.substring(0, end);
+    }
+
+    private boolean usesConfiguredEndpoint() {
+        return config.getProvider() == LlmProvider.OPENAI_COMPATIBLE
+                || config.getProvider() == LlmProvider.OMNI_GATEWAY;
     }
 
     private void applyAuthenticationAndCustomHeaders(HttpRequest.Builder builder) {
         if (config.getApiKey() != null && !config.getApiKey().trim().isEmpty()) {
             builder.setHeader("Authorization", "Bearer " + config.getApiKey().trim());
         }
-        if (config.getProvider() != LlmProvider.CUSTOM || config.getCustomLlmHeaders() == null) return;
-        for (CustomHttpHeader header : config.getCustomLlmHeaders()) {
+        if (!usesConfiguredEndpoint() || config.getLlmHeaders() == null) return;
+        for (LlmHttpHeader header : config.getLlmHeaders()) {
             if (header == null || header.getName() == null || header.getName().trim().isEmpty()) continue;
             String name = header.getName().trim();
             String value = header.getValue() != null ? header.getValue() : "";
             if (name.indexOf('\r') >= 0 || name.indexOf('\n') >= 0
                     || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
-                throw new IllegalArgumentException("Custom LLM headers cannot contain line breaks");
+                throw new IllegalArgumentException("LLM headers cannot contain line breaks");
             }
             builder.setHeader(name, value);
         }

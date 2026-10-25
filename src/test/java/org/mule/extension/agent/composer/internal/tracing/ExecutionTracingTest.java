@@ -4,6 +4,7 @@ import org.junit.After;
 import org.junit.Test;
 import org.mule.extension.agent.composer.internal.AgentComposerConfiguration;
 import org.mule.extension.agent.composer.internal.enums.LlmProvider;
+import org.mule.extension.agent.composer.internal.llm.LlmHttpException;
 import org.mule.extension.agent.composer.internal.model.LlmResponse;
 import org.mule.runtime.api.store.ObjectStore;
 import org.mule.runtime.api.store.ObjectStoreManager;
@@ -13,6 +14,7 @@ import java.io.Serializable;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.Arrays;
 import java.util.Map;
 
 import static org.junit.Assert.*;
@@ -70,29 +72,49 @@ public class ExecutionTracingTest {
         AgentComposerConfiguration config = config("tenant-html");
         ExecutionTraceContext context = ExecutionTraceContext.start(
                 null, config, "<script>alert('x')</script>", "conversation-html", 5);
+        Map<String, Object> requestHeaders = new LinkedHashMap<>();
+        requestHeaders.put("client_id", "visible-client-id");
+        requestHeaders.put("client_secret", "never-render-secret");
+        Map<String, Object> requestMetadata = new LinkedHashMap<>();
+        requestMetadata.put("method", "POST");
+        requestMetadata.put("url", "https://gateway.example.test/v1/responses");
+        requestMetadata.put("headers", requestHeaders);
         ExecutionTraceContext.SpanScope span = context.startSpan(
                 "LLM", "Unsafe <name>", null, 1,
-                Collections.singletonMap("password", "never-render-me"));
+                Collections.singletonMap("password", "never-render-me"), requestMetadata);
         ExecutionTraceContext.SpanScope objectStore = context.startSpan(
                 "OBJECT_STORE", "Load conversation", null, null,
                 Collections.singletonMap("conversationId", "conversation-html"));
         objectStore.success(Collections.singletonMap("source", "conversation-cache"));
+        Map<String, Object> serverOne = new LinkedHashMap<>();
+        serverOne.put("name", "Tickets");
+        serverOne.put("url", "http://tickets/mcp");
+        serverOne.put("tools", java.util.Arrays.asList("create_ticket", "delete_ticket"));
+        Map<String, Object> serverTwo = new LinkedHashMap<>();
+        serverTwo.put("name", "Slack");
+        serverTwo.put("url", "http://slack/mcp");
+        serverTwo.put("tools", Collections.singletonList("send_message"));
+        context.attribute("mcpServers", java.util.Arrays.asList(serverOne, serverTwo));
 
         String runningHtml = TraceHtmlRenderer.render(context.getTrace(), "/agent/traces");
         assertTrue(runningHtml.contains("\\u003cscript"));
         assertFalse(runningHtml.contains("<script>alert('x')</script>"));
         assertFalse(runningHtml.contains("never-render-me"));
+        assertFalse(runningHtml.contains("never-render-secret"));
+        assertTrue(runningHtml.contains("visible-client-id"));
+        assertTrue(runningHtml.contains("https://gateway.example.test/v1/responses"));
         assertFalse(runningHtml.contains("Rerun"));
         assertFalse(runningHtml.contains("Edit &amp; Rerun"));
         assertFalse(runningHtml.contains("Replay"));
         assertFalse(runningHtml.contains(">Logs<"));
         assertFalse(runningHtml.contains(">Metrics<"));
         assertFalse(runningHtml.contains(">Evaluations<"));
-        assertTrue(runningHtml.contains("setTimeout(()=>location.reload(),2000)"));
+        assertTrue(runningHtml.contains("setInterval(refreshLiveTrace,1000)"));
         assertTrue(runningHtml.contains("Export JSON"));
         assertTrue(runningHtml.contains("Agent Composer"));
         assertTrue(runningHtml.contains("/agent/assets/agent-composer.svg"));
-        assertTrue(runningHtml.contains("Correlation ID &middot; conversation-html"));
+        assertTrue(runningHtml.contains("Correlation / Trace IDs"));
+        assertTrue(runningHtml.contains("conversation-html / " + context.getExecutionId()));
         assertTrue(runningHtml.contains("id=\"loopDiagram\""));
         assertTrue(runningHtml.contains("mermaid@11"));
         assertTrue(runningHtml.contains("buildLoopDiagram"));
@@ -106,23 +128,107 @@ public class ExecutionTracingTest {
         assertTrue(runningHtml.contains("selectSpan("));
         assertTrue(runningHtml.contains("detailMetrics"));
         assertTrue(runningHtml.contains("detail-drawer"));
-        assertTrue(runningHtml.contains("closeDrawer()"));
+        assertTrue(runningHtml.contains("id=\"requestUrl\""));
+        assertTrue(runningHtml.contains("id=\"requestHeaders\""));
+        assertTrue(runningHtml.contains("class=\"request-section\""));
+        assertTrue(runningHtml.contains("Redacted headers"));
+        assertTrue(runningHtml.contains("class=\"detail-card detail-drawer open\""));
+        assertFalse(runningHtml.contains("closeDrawer()"));
         assertTrue(runningHtml.contains("Span table"));
         assertTrue(runningHtml.contains("<th>Status</th><th>Kind</th><th>Name</th><th>Input</th><th>Output</th><th>Error</th><th>Start Time</th><th>Latency</th>"));
         assertTrue(runningHtml.contains("agent-trace-theme"));
         assertTrue(runningHtml.contains("lucide-moon"));
         assertTrue(runningHtml.contains("--primary:#ff385c"));
+        assertTrue(runningHtml.contains("id=\"mcpServerSelect\""));
+        assertTrue(runningHtml.contains("id=\"mcpToolSearch\""));
+        assertTrue(runningHtml.contains("function filterMcpTools()"));
+        assertTrue(runningHtml.contains("data-mcp-server=\"0\""));
+        assertTrue(runningHtml.contains("data-mcp-server=\"1\" hidden"));
+        assertTrue(runningHtml.contains("No matching tools"));
 
         String indexHtml = TraceHtmlRenderer.renderIndex(
                 Collections.singletonList(context.getTrace()), "/agent/traces");
         assertFalse(indexHtml.contains("<span>Trace</span>"));
-        assertTrue(indexHtml.contains("<span>Correlation / Trace ID</span>"));
+        assertTrue(indexHtml.contains("<span>ID</span><span>Model</span>"));
         assertFalse(indexHtml.contains("<code>" + context.getExecutionId().substring(0, 8)));
 
         span.success("safe");
         context.finish(ExecutionTraceContext.STATUS_COMPLETED, "done");
         String completedHtml = TraceHtmlRenderer.render(context.getTrace(), "/agent/traces");
-        assertFalse(completedHtml.contains("setTimeout(()=>location.reload(),2000)"));
+        assertTrue(completedHtml.contains("if(trace.status==='RUNNING'||trace.status==='INPUT_REQUIRED')setInterval(refreshLiveTrace,1000)"));
+    }
+
+    @Test
+    public void combinesPermissionPauseAndResumeIntoOneTimeline() {
+        ExecutionTrace paused = trace("exec-pause", "conversation-resume", 100L, 150L,
+                ExecutionTraceContext.STATUS_INPUT_REQUIRED, "permission-check", 3, 2);
+        ExecutionTrace resumed = trace("exec-resume", "conversation-resume", 300L, 390L,
+                ExecutionTraceContext.STATUS_COMPLETED, "tool-result", 5, 4);
+
+        ExecutionTrace combined = ExecutionTraceStore.combine(Arrays.asList(resumed, paused));
+
+        assertEquals("exec-resume", combined.getExecutionId());
+        assertEquals(ExecutionTraceContext.STATUS_COMPLETED, combined.getStatus());
+        assertEquals(2, combined.getSpans().size());
+        assertEquals("permission-check", combined.getSpans().get(0).getName());
+        assertEquals("tool-result", combined.getSpans().get(1).getName());
+        assertEquals(8, combined.getInputTokens());
+        assertEquals(6, combined.getOutputTokens());
+        assertEquals(290L, combined.getDurationMs());
+        assertEquals(2, combined.getAttributes().get("executionCount"));
+        assertEquals(Arrays.asList("exec-pause", "exec-resume"), combined.getAttributes().get("executionIds"));
+    }
+
+    @Test
+    public void permissionExpirationUpdatesTraceAndRemovesPendingActions() throws Exception {
+        AgentComposerConfiguration config = config("tenant-expired-trace");
+        ExecutionTraceContext context = ExecutionTraceContext.start(
+                null, config, "Delete ticket", "conversation-expired", 5);
+        Map<String, Object> permission = new LinkedHashMap<>();
+        permission.put("inputKind", "tool_permission");
+        permission.put("permissionRequestId", "permission-expired");
+        ExecutionTraceContext.SpanScope wait = context.startSpan(
+                "ITERATION", "Iteration 1", null, 1, permission);
+        wait.inputRequired(permission);
+        context.finish(ExecutionTraceContext.STATUS_INPUT_REQUIRED, permission);
+
+        ExecutionTraceStore.expirePermission(
+                "conversation-expired", 3100L, null, "tenant-expired-trace");
+
+        ExecutionTrace expired = ExecutionTraceStore.get(
+                context.getExecutionId(), null, "tenant-expired-trace");
+        assertEquals("EXPIRED", expired.getStatus());
+        assertEquals("EXPIRED", expired.getSpans().get(0).getStatus());
+        String html = TraceHtmlRenderer.render(expired, "/agent/traces");
+        assertTrue(html.contains("Tool permission call expired"));
+        assertTrue(html.contains("3.10 s"));
+        assertTrue(html.contains("actions.hidden=!permission||!!decision"));
+    }
+
+    private static ExecutionTrace trace(String id, String conversationId, long started, long ended,
+                                        String status, String spanName, int inputTokens, int outputTokens) {
+        ExecutionTrace trace = new ExecutionTrace();
+        trace.setExecutionId(id);
+        trace.setConversationId(conversationId);
+        trace.setUserTask("root request");
+        trace.setProvider("OPENAI");
+        trace.setModelName("gpt-4o");
+        trace.setStatus(status);
+        trace.setStartedAtEpochMs(started);
+        trace.setEndedAtEpochMs(ended);
+        trace.setDurationMs(ended - started);
+        trace.setInputTokens(inputTokens);
+        trace.setOutputTokens(outputTokens);
+        TraceSpan span = new TraceSpan();
+        span.setSpanId(id + "-span");
+        span.setName(spanName);
+        span.setType("MCP_TOOL");
+        span.setStatus(status);
+        span.setStartedAtEpochMs(started);
+        span.setEndedAtEpochMs(ended);
+        span.setDurationMs(ended - started);
+        trace.setSpans(Collections.singletonList(span));
+        return trace;
     }
 
     @Test
@@ -131,7 +237,8 @@ public class ExecutionTracingTest {
         ExecutionTraceContext context = ExecutionTraceContext.start(null, config, "task", null, 5);
         String html = TraceHtmlRenderer.render(context.getTrace(), "/agent/traces");
 
-        assertTrue(html.contains("Trace ID &middot; " + context.getExecutionId()));
+        assertTrue(html.contains("Correlation / Trace IDs"));
+        assertTrue(html.contains(context.getExecutionId()));
         assertFalse(html.contains("Correlation ID &middot; null"));
         assertFalse(html.contains("<span>Trace ID</span><strong>" + context.getExecutionId()));
     }
@@ -148,6 +255,24 @@ public class ExecutionTracingTest {
         assertFalse(json.contains("client-secret-value"));
         assertFalse(json.contains("abc.def-123"));
         assertTrue(json.contains("REDACTED"));
+    }
+
+    @Test
+    public void capturesUpstreamLlmErrorResponseAsSpanOutput() throws Exception {
+        ExecutionTraceContext context = ExecutionTraceContext.start(
+                null, config("tenant-http-error"), "Call model", "conversation-http-error", 5);
+        ExecutionTraceContext.SpanScope span = context.startSpan(
+                "LLM", "Agent reasoning", null, 1, Collections.singletonMap("input", "hello"));
+        LlmHttpException failure = new LlmHttpException("OpenAI", 400, "POST",
+                "https://gateway.example.test/responses", "{\"error\":\"missing model\"}");
+
+        span.error(failure, failure.toTraceOutput());
+        context.fail(failure);
+
+        TraceSpan recorded = context.getTrace().getSpans().get(0);
+        assertEquals(400.0d, ((Map<?, ?>) recorded.getOutput()).get("statusCode"));
+        assertTrue(ExecutionTraceStore.toJson(context.getTrace()).contains("missing model"));
+        assertTrue(TraceHtmlRenderer.render(context.getTrace(), "/agent/traces").contains("missing model"));
     }
 
     @Test
